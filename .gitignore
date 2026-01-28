@@ -1,0 +1,46 @@
+# Build artifacts
+target/
+dist/
+*.AppImage
+*.dmg
+*.msi
+*.deb
+*.exe
+
+# Dependencies
+node_modules/
+
+# Environment and secrets
+.env
+.env.*
+secrets.json
+*.pem
+*.key
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Temp files
+*.tmp
+*.temp
+~
+
+# Auth keys
+AuthKey_*.p8
+*.p8
