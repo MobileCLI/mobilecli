@@ -58,6 +58,16 @@ pub enum ClientMessage {
         #[serde(default)]
         max_bytes: Option<usize>,
     },
+    /// Spawn a new session from mobile
+    SpawnSession {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
+        working_dir: Option<String>,
+    },
 }
 
 /// Messages sent from server to mobile client
@@ -129,6 +139,14 @@ pub enum ServerMessage {
         session_id: String,
         data: String, // base64 encoded
         total_bytes: usize,
+    },
+    /// Result of spawning a new session
+    SpawnResult {
+        success: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
 }
 

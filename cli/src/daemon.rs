@@ -479,7 +479,9 @@ async fn handle_pty_session(
                                             };
 
                                             // Check for waiting state patterns
+                                            tracing::debug!("Checking for wait event, cli_type: {:?}, buffer_len: {}", cli_type, output_buffer.len());
                                             if let Some(wait_event) = detect_wait_event(&output_buffer, cli_type) {
+                                                tracing::info!("Detected wait event: {:?} for session {}", wait_event.wait_type, session_id);
                                                 let should_notify = {
                                                     let mut st = state.write().await;
                                                     if let Some(session) = st.sessions.get_mut(&session_id) {
@@ -622,6 +624,176 @@ async fn handle_pty_session(
 
     tracing::info!("PTY session ended: {}", session_id);
     Ok(())
+}
+
+/// Spawn a new session from mobile request
+async fn spawn_session_from_mobile(
+    command: &str,
+    args: &[String],
+    name: Option<&str>,
+    working_dir: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Detect terminal emulator
+    let terminal = detect_terminal_emulator()?;
+
+    // Build the command to run inside the terminal
+    let session_name = name.unwrap_or(command);
+    let mut wrap_cmd = format!("mobilecli wrap --name '{}'", session_name.replace("'", "'\\''"));
+
+    if let Some(dir) = working_dir {
+        wrap_cmd.push_str(&format!(" --dir '{}'", dir.replace("'", "'\\''")));
+    }
+
+    wrap_cmd.push(' ');
+    wrap_cmd.push_str(command);
+
+    for arg in args {
+        wrap_cmd.push(' ');
+        wrap_cmd.push_str(&format!("'{}'", arg.replace("'", "'\\''")));
+    }
+
+    tracing::info!("Spawning session: {} via {}", wrap_cmd, terminal.name);
+
+    // Build terminal command based on detected emulator
+    let mut cmd = std::process::Command::new(&terminal.binary);
+
+    match terminal.name.as_str() {
+        "kitty" => {
+            cmd.args(["--", "sh", "-c", &wrap_cmd]);
+        }
+        "alacritty" => {
+            cmd.args(["-e", "sh", "-c", &wrap_cmd]);
+        }
+        "gnome-terminal" | "tilix" => {
+            cmd.args(["--", "sh", "-c", &wrap_cmd]);
+        }
+        "konsole" => {
+            cmd.args(["-e", "sh", "-c", &wrap_cmd]);
+        }
+        "xterm" | "urxvt" => {
+            cmd.args(["-e", "sh", "-c", &wrap_cmd]);
+        }
+        "wezterm" => {
+            cmd.args(["start", "--", "sh", "-c", &wrap_cmd]);
+        }
+        "iterm" => {
+            // macOS iTerm2 - use osascript to open a new window
+            let script = format!(
+                r#"tell application "iTerm"
+                    create window with default profile
+                    tell current session of current window
+                        write text "{}"
+                    end tell
+                end tell"#,
+                wrap_cmd.replace("\"", "\\\"")
+            );
+            cmd = std::process::Command::new("osascript");
+            cmd.args(["-e", &script]);
+        }
+        "terminal" => {
+            // macOS Terminal.app
+            let script = format!(
+                r#"tell application "Terminal"
+                    do script "{}"
+                    activate
+                end tell"#,
+                wrap_cmd.replace("\"", "\\\"")
+            );
+            cmd = std::process::Command::new("osascript");
+            cmd.args(["-e", &script]);
+        }
+        _ => {
+            // Generic fallback: try -e flag
+            cmd.args(["-e", "sh", "-c", &wrap_cmd]);
+        }
+    }
+
+    // Set working directory if specified
+    if let Some(dir) = working_dir {
+        cmd.current_dir(dir);
+    }
+
+    // Spawn detached
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                // Create new session to detach from parent
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+
+    Ok(())
+}
+
+/// Terminal emulator detection result
+struct TerminalInfo {
+    name: String,
+    binary: String,
+}
+
+/// Detect available terminal emulator
+fn detect_terminal_emulator() -> Result<TerminalInfo, Box<dyn std::error::Error + Send + Sync>> {
+    // Check for common terminal emulators in order of preference
+    let terminals = [
+        ("kitty", "kitty"),
+        ("alacritty", "alacritty"),
+        ("wezterm", "wezterm"),
+        ("gnome-terminal", "gnome-terminal"),
+        ("konsole", "konsole"),
+        ("tilix", "tilix"),
+        ("xterm", "xterm"),
+        ("urxvt", "urxvt"),
+    ];
+
+    // Check TERM_PROGRAM environment variable first (macOS)
+    if let Ok(term_program) = std::env::var("TERM_PROGRAM") {
+        match term_program.to_lowercase().as_str() {
+            "iterm.app" => {
+                return Ok(TerminalInfo {
+                    name: "iterm".to_string(),
+                    binary: "osascript".to_string(),
+                });
+            }
+            "apple_terminal" => {
+                return Ok(TerminalInfo {
+                    name: "terminal".to_string(),
+                    binary: "osascript".to_string(),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // Check which terminals are available
+    for (name, binary) in &terminals {
+        if which::which(binary).is_ok() {
+            return Ok(TerminalInfo {
+                name: name.to_string(),
+                binary: binary.to_string(),
+            });
+        }
+    }
+
+    // macOS fallback to Terminal.app
+    #[cfg(target_os = "macos")]
+    {
+        return Ok(TerminalInfo {
+            name: "terminal".to_string(),
+            binary: "osascript".to_string(),
+        });
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    Err("No supported terminal emulator found".into())
 }
 
 /// Process a message from mobile client
@@ -821,6 +993,27 @@ async fn process_client_msg(
                 session_id,
                 data,
                 total_bytes,
+            };
+            tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+        }
+        ClientMessage::SpawnSession {
+            command,
+            args,
+            name,
+            working_dir,
+        } => {
+            let result = spawn_session_from_mobile(&command, &args, name.as_deref(), working_dir.as_deref()).await;
+            let msg = match result {
+                Ok(()) => ServerMessage::SpawnResult {
+                    success: true,
+                    session_id: None, // Session ID comes via session_info when PTY registers
+                    error: None,
+                },
+                Err(e) => ServerMessage::SpawnResult {
+                    success: false,
+                    session_id: None,
+                    error: Some(e.to_string()),
+                },
             };
             tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
         }

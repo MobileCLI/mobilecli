@@ -251,6 +251,15 @@ fn is_tool_approval_prompt(text_lower: &str, model: ApprovalModel) -> bool {
         return false;
     }
 
+    // Claude Code specific patterns
+    if text_lower.contains("do you want to run")
+        || text_lower.contains("wants to use")
+        || text_lower.contains("1. yes, proceed")
+        || text_lower.contains("2. yes, and don't ask")
+    {
+        return true;
+    }
+
     // Explicit tool approval keywords
     if text_lower.contains("tool")
         && (text_lower.contains("allow")
