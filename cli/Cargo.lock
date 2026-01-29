@@ -995,6 +995,7 @@ dependencies = [
  "dirs-next",
  "futures-util",
  "hostname",
+ "libc",
  "local-ip-address",
  "nix 0.29.0",
  "portable-pty",
