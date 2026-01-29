@@ -629,8 +629,8 @@ async fn handle_pty_session(
 /// Validate command name - only allow known safe CLI commands
 fn is_allowed_command(command: &str) -> bool {
     const ALLOWED_COMMANDS: &[&str] = &[
-        "claude", "codex", "gemini", "opencode", "bash", "zsh", "sh",
-        "fish", "nu", "pwsh", "python", "python3", "node", "ruby",
+        "claude", "codex", "gemini", "opencode", "bash", "zsh", "sh", "fish", "nu", "pwsh",
+        "python", "python3", "node", "ruby",
     ];
     // Get base command name (handle paths like /usr/bin/bash)
     let base = std::path::Path::new(command)
@@ -643,7 +643,11 @@ fn is_allowed_command(command: &str) -> bool {
 /// Validate that a string is safe for shell interpolation
 /// Rejects newlines, null bytes, and other problematic characters
 fn is_shell_safe(s: &str) -> bool {
-    !s.contains('\n') && !s.contains('\r') && !s.contains('\0') && !s.contains('`') && !s.contains("$(")
+    !s.contains('\n')
+        && !s.contains('\r')
+        && !s.contains('\0')
+        && !s.contains('`')
+        && !s.contains("$(")
 }
 
 /// Spawn a new session from mobile request
@@ -691,7 +695,10 @@ async fn spawn_session_from_mobile(
 
     // Build the command to run inside the terminal
     let session_name = name.unwrap_or(command);
-    let mut wrap_cmd = format!("mobilecli wrap --name '{}'", session_name.replace("'", "'\\''"));
+    let mut wrap_cmd = format!(
+        "mobilecli wrap --name '{}'",
+        session_name.replace("'", "'\\''")
+    );
 
     if let Some(dir) = working_dir {
         wrap_cmd.push_str(&format!(" --dir '{}'", dir.replace("'", "'\\''")));
@@ -1057,7 +1064,9 @@ async fn process_client_msg(
             name,
             working_dir,
         } => {
-            let result = spawn_session_from_mobile(&command, &args, name.as_deref(), working_dir.as_deref()).await;
+            let result =
+                spawn_session_from_mobile(&command, &args, name.as_deref(), working_dir.as_deref())
+                    .await;
             let msg = match result {
                 Ok(()) => ServerMessage::SpawnResult {
                     success: true,
