@@ -626,6 +626,26 @@ async fn handle_pty_session(
     Ok(())
 }
 
+/// Validate command name - only allow known safe CLI commands
+fn is_allowed_command(command: &str) -> bool {
+    const ALLOWED_COMMANDS: &[&str] = &[
+        "claude", "codex", "gemini", "opencode", "bash", "zsh", "sh",
+        "fish", "nu", "pwsh", "python", "python3", "node", "ruby",
+    ];
+    // Get base command name (handle paths like /usr/bin/bash)
+    let base = std::path::Path::new(command)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(command);
+    ALLOWED_COMMANDS.contains(&base)
+}
+
+/// Validate that a string is safe for shell interpolation
+/// Rejects newlines, null bytes, and other problematic characters
+fn is_shell_safe(s: &str) -> bool {
+    !s.contains('\n') && !s.contains('\r') && !s.contains('\0') && !s.contains('`') && !s.contains("$(")
+}
+
 /// Spawn a new session from mobile request
 async fn spawn_session_from_mobile(
     command: &str,
@@ -633,6 +653,39 @@ async fn spawn_session_from_mobile(
     name: Option<&str>,
     working_dir: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Security: Validate command is in allowlist
+    if !is_allowed_command(command) {
+        return Err(format!("Command '{}' is not in the allowed list", command).into());
+    }
+
+    // Security: Validate all inputs are shell-safe (no injection)
+    if !is_shell_safe(command) {
+        return Err("Command contains unsafe characters".into());
+    }
+    for arg in args {
+        if !is_shell_safe(arg) {
+            return Err("Argument contains unsafe characters".into());
+        }
+    }
+    if let Some(n) = name {
+        if !is_shell_safe(n) {
+            return Err("Name contains unsafe characters".into());
+        }
+    }
+    if let Some(dir) = working_dir {
+        if !is_shell_safe(dir) {
+            return Err("Working directory contains unsafe characters".into());
+        }
+        // Security: Validate working directory exists and is a directory
+        let path = std::path::Path::new(dir);
+        if !path.is_absolute() {
+            return Err("Working directory must be an absolute path".into());
+        }
+        if !path.is_dir() {
+            return Err("Working directory does not exist or is not a directory".into());
+        }
+    }
+
     // Detect terminal emulator
     let terminal = detect_terminal_emulator()?;
 
@@ -720,7 +773,9 @@ async fn spawn_session_from_mobile(
         unsafe {
             cmd.pre_exec(|| {
                 // Create new session to detach from parent
-                libc::setsid();
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 Ok(())
             });
         }
