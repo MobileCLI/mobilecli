@@ -318,6 +318,9 @@ async fn handle_mobile_client(
     let watch_state = state.clone();
     tokio::spawn(async move {
         loop {
+            if *disconnect_rx.borrow() {
+                break;
+            }
             tokio::select! {
                 _ = disconnect_rx.changed() => {
                     if *disconnect_rx.borrow() {
@@ -347,6 +350,9 @@ async fn handle_mobile_client(
 
                     let mut new_entry = None;
                     if matches!(change.change_type, ChangeType::Created | ChangeType::Modified) {
+                        if *disconnect_rx.borrow() {
+                            break;
+                        }
                         if let Ok(entry) = fs.ops().get_file_info(&change.path).await {
                             new_entry = Some(entry);
                         }
