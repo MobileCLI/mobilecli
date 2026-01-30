@@ -337,7 +337,8 @@ impl FileOperations {
 
         let mut backup_path = None;
         if path.exists() {
-            let backup = sibling_with_suffix(&path, &format!("bak-{}", uuid::Uuid::new_v4()));
+            let backup = sibling_with_suffix(&path, "bak");
+            let _ = fs::remove_file(&backup).await;
             if let Err(e) = fs::rename(&path, &backup).await {
                 let _ = fs::remove_file(&temp_path).await;
                 return Err(FileSystemError::IoError {

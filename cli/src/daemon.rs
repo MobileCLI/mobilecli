@@ -301,6 +301,7 @@ async fn handle_mobile_client(
 
     let (client_tx, mut client_rx) = mpsc::unbounded_channel::<Message>();
     let watch_tx = client_tx.clone();
+    let (disconnect_tx, mut disconnect_rx) = tokio::sync::watch::channel(false);
 
     // Register client and get broadcast receiver
     let mut pty_rx = {
@@ -317,8 +318,18 @@ async fn handle_mobile_client(
     let watch_state = state.clone();
     tokio::spawn(async move {
         loop {
-            match file_watch_rx.recv().await {
-                Ok(change) => {
+            tokio::select! {
+                _ = disconnect_rx.changed() => {
+                    if *disconnect_rx.borrow() {
+                        break;
+                    }
+                }
+                result = file_watch_rx.recv() => {
+                    let change = match result {
+                        Ok(change) => change,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(_) => break,
+                    };
                     let fs = {
                         let st = watch_state.read().await;
                         if !st.mobile_clients.contains_key(&addr) {
@@ -340,6 +351,9 @@ async fn handle_mobile_client(
                             new_entry = Some(entry);
                         }
                     }
+                    if *disconnect_rx.borrow() {
+                        break;
+                    }
 
                     let msg = ServerMessage::FileChanged {
                         path: change.path.clone(),
@@ -352,8 +366,6 @@ async fn handle_mobile_client(
                         }
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(_) => break,
             }
         }
     });
@@ -428,10 +440,13 @@ async fn handle_mobile_client(
     }
 
     // Unregister
+    let _ = disconnect_tx.send(true);
+    {
+        let mut st = state.write().await;
+        st.mobile_clients.remove(&addr);
+        st.file_rate_limiters.remove(&addr);
+    }
     cleanup_client_state(&state, addr).await;
-    let mut st = state.write().await;
-    st.mobile_clients.remove(&addr);
-    st.file_rate_limiters.remove(&addr);
     tracing::info!("Mobile client disconnected: {}", addr);
     Ok(())
 }

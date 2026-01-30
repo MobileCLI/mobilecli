@@ -11,6 +11,7 @@ use super::config::FileSystemConfig;
 pub struct PathValidator {
     config: std::sync::Arc<FileSystemConfig>,
     jails: Vec<PathJail>,
+    symlink_cache: std::sync::Mutex<std::collections::HashMap<PathBuf, bool>>,
 }
 
 impl PathValidator {
@@ -20,7 +21,11 @@ impl PathValidator {
             .iter()
             .filter_map(|root| PathJail::new(root).ok())
             .collect();
-        Self { config, jails }
+        Self {
+            config,
+            jails,
+            symlink_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
     }
 
     /// Validate a path that must already exist
@@ -42,7 +47,7 @@ impl PathValidator {
         self.ensure_allowed(&canonical)?;
         self.ensure_not_denied(&canonical)?;
 
-        if !self.config.follow_symlinks && contains_symlink(&canonical) {
+        if !self.config.follow_symlinks && self.contains_symlink(&canonical) {
             return Err(FileSystemError::PermissionDenied {
                 path: canonical.display().to_string(),
                 reason: "Symlinked paths are not allowed".to_string(),
@@ -85,7 +90,7 @@ impl PathValidator {
         self.ensure_allowed(&canonical_ancestor)?;
         self.ensure_not_denied(&canonical_ancestor)?;
 
-        if !self.config.follow_symlinks && contains_symlink(&canonical_ancestor) {
+        if !self.config.follow_symlinks && self.contains_symlink(&canonical_ancestor) {
             return Err(FileSystemError::PermissionDenied {
                 path: canonical_ancestor.display().to_string(),
                 reason: "Symlinked paths are not allowed".to_string(),
@@ -150,6 +155,30 @@ impl PathValidator {
         }
         Ok(())
     }
+
+    fn contains_symlink(&self, path: &Path) -> bool {
+        let mut current = PathBuf::new();
+        for component in path.components() {
+            current.push(component.as_os_str());
+            if let Some(cached) = self.symlink_cache.lock().ok().and_then(|cache| cache.get(&current).cloned()) {
+                if cached {
+                    return true;
+                }
+                continue;
+            }
+            let is_symlink = match std::fs::symlink_metadata(&current) {
+                Ok(meta) => meta.file_type().is_symlink(),
+                Err(_) => false,
+            };
+            if let Ok(mut cache) = self.symlink_cache.lock() {
+                cache.insert(current.clone(), is_symlink);
+            }
+            if is_symlink {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 fn contains_parent_dir(path: &Path) -> bool {
@@ -164,15 +193,3 @@ fn find_existing_ancestor(path: &Path) -> Option<PathBuf> {
     path.ancestors().find(|p| p.exists()).map(|p| p.to_path_buf())
 }
 
-fn contains_symlink(path: &Path) -> bool {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        current.push(component.as_os_str());
-        if let Ok(meta) = std::fs::symlink_metadata(&current) {
-            if meta.file_type().is_symlink() {
-                return true;
-            }
-        }
-    }
-    false
-}
