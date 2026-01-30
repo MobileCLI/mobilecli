@@ -62,6 +62,10 @@ fn get_terminal_size() -> (u16, u16) {
     (80, 24)
 }
 
+fn get_terminal_size_opt() -> Option<(u16, u16)> {
+    term_size::dimensions().map(|(w, h)| (w as u16, h as u16))
+}
+
 /// Run a command wrapped with mobile streaming via daemon
 pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
     // Resolve the command path
@@ -277,11 +281,15 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                                         msg["cols"].as_u64(),
                                         msg["rows"].as_u64(),
                                     ) {
-                                        let (cols, rows) = if cols == 0 || rows == 0 {
+                                        let (mut cols, mut rows) = if cols == 0 || rows == 0 {
                                             get_terminal_size()
                                         } else {
                                             (cols as u16, rows as u16)
                                         };
+                                        if let Some((local_cols, local_rows)) = get_terminal_size_opt() {
+                                            cols = cols.min(local_cols);
+                                            rows = rows.min(local_rows);
+                                        }
                                         let _ = master.resize(PtySize {
                                             rows,
                                             cols,
