@@ -12,7 +12,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use colored::Colorize;
 use futures_util::{SinkExt, StreamExt};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
@@ -74,6 +74,33 @@ fn get_terminal_size_opt() -> Option<(u16, u16)> {
 #[cfg(not(unix))]
 fn get_terminal_size_opt() -> Option<(u16, u16)> {
     term_size::dimensions().map(|(w, h)| (w as u16, h as u16))
+}
+
+#[cfg(unix)]
+fn set_stdout_winsize(cols: u16, rows: u16) {
+    unsafe {
+        let ws = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let _ = libc::ioctl(libc::STDOUT_FILENO, libc::TIOCSWINSZ, &ws);
+    }
+}
+
+#[cfg(not(unix))]
+fn set_stdout_winsize(_cols: u16, _rows: u16) {}
+
+fn request_terminal_resize(cols: u16, rows: u16) {
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    let seq = format!("\x1b[8;{};{}t", rows, cols);
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(seq.as_bytes());
+    let _ = stdout.flush();
+    set_stdout_winsize(cols, rows);
 }
 
 /// Run a command wrapped with mobile streaming via daemon
@@ -242,6 +269,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
 
     // Main event loop
     let mut stdout = std::io::stdout();
+    let mut saved_local_size: Option<(u16, u16)> = None;
     let mut exit_code: i32 = 0;
 
     loop {
@@ -291,13 +319,23 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                                         msg["cols"].as_u64(),
                                         msg["rows"].as_u64(),
                                     ) {
-                                        let (cols, rows) = if let Some((local_cols, local_rows)) = get_terminal_size_opt() {
-                                            // Prefer local terminal size when attached to avoid prompt overlap.
-                                            (local_cols, local_rows)
-                                        } else if cols == 0 || rows == 0 {
-                                            get_terminal_size()
+                                        let (cols, rows) = if cols == 0 || rows == 0 {
+                                            // Mobile disconnected: restore local size if we captured it.
+                                            if let Some((local_cols, local_rows)) = saved_local_size.take() {
+                                                request_terminal_resize(local_cols, local_rows);
+                                                (local_cols, local_rows)
+                                            } else {
+                                                get_terminal_size()
+                                            }
                                         } else {
-                                            (cols as u16, rows as u16)
+                                            // Mobile active: resize PTY to mobile dimensions and request local terminal resize
+                                            if saved_local_size.is_none() {
+                                                saved_local_size = get_terminal_size_opt();
+                                            }
+                                            let cols = cols as u16;
+                                            let rows = rows as u16;
+                                            request_terminal_resize(cols, rows);
+                                            (cols, rows)
                                         };
                                         let _ = master.resize(PtySize {
                                             rows,
