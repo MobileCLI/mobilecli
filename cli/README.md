@@ -112,6 +112,7 @@ The WebSocket server uses a JSON protocol compatible with the MobileCLI mobile a
 - `pty_resize` - Resize terminal (cols, rows)
 - `get_sessions` - List available sessions
 - `rename_session` - Rename a session
+- `spawn_session` - Start a new terminal session from mobile
 - `ping` - Heartbeat
 
 ### Server → Client
@@ -122,6 +123,8 @@ The WebSocket server uses a JSON protocol compatible with the MobileCLI mobile a
 - `sessions` - List of sessions
 - `session_ended` - Session terminated
 - `session_renamed` - Rename confirmation
+- `spawn_result` - Result of spawn_session request
+- `waiting_for_input` - Tool approval or input prompt detected
 - `pong` - Heartbeat response
 
 ## Troubleshooting
