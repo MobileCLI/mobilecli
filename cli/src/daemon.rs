@@ -317,60 +317,68 @@ async fn handle_mobile_client(
     };
     let watch_state = state.clone();
     tokio::spawn(async move {
-        loop {
+        'watch: loop {
             if *disconnect_rx.borrow() {
                 break;
             }
-            tokio::select! {
+            let change = tokio::select! {
                 _ = disconnect_rx.changed() => {
                     if *disconnect_rx.borrow() {
-                        break;
+                        break 'watch;
                     }
+                    continue 'watch;
                 }
                 result = file_watch_rx.recv() => {
-                    let change = match result {
+                    match result {
                         Ok(change) => change,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(_) => break,
-                    };
-                    let fs = {
-                        let st = watch_state.read().await;
-                        if !st.mobile_clients.contains_key(&addr) {
-                            break;
-                        }
-                        let watched = match st.file_watch_subscriptions.get(&addr) {
-                            Some(paths) => paths,
-                            None => continue,
-                        };
-                        if !is_path_watched(&change.path, watched) {
-                            continue;
-                        }
-                        st.file_system.clone()
-                    };
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue 'watch,
+                        Err(_) => break 'watch,
+                    }
+                }
+            };
 
-                    let mut new_entry = None;
-                    if matches!(change.change_type, ChangeType::Created | ChangeType::Modified) {
-                        if *disconnect_rx.borrow() {
-                            break;
-                        }
-                        if let Ok(entry) = fs.ops().get_file_info(&change.path).await {
+            let fs = {
+                let st = watch_state.read().await;
+                if !st.mobile_clients.contains_key(&addr) {
+                    break 'watch;
+                }
+                let watched = match st.file_watch_subscriptions.get(&addr) {
+                    Some(paths) => paths,
+                    None => continue,
+                };
+                if !is_path_watched(&change.path, watched) {
+                    continue;
+                }
+                st.file_system.clone()
+            };
+
+            let mut new_entry = None;
+            if matches!(change.change_type, ChangeType::Created | ChangeType::Modified) {
+                let should_break = tokio::select! {
+                    _ = disconnect_rx.changed() => *disconnect_rx.borrow(),
+                    result = fs.ops().get_file_info(&change.path) => {
+                        if let Ok(entry) = result {
                             new_entry = Some(entry);
                         }
+                        false
                     }
-                    if *disconnect_rx.borrow() {
-                        break;
-                    }
+                };
+                if should_break {
+                    break;
+                }
+            }
+            if *disconnect_rx.borrow() {
+                break;
+            }
 
-                    let msg = ServerMessage::FileChanged {
-                        path: change.path.clone(),
-                        change_type: change.change_type.clone(),
-                        new_entry,
-                    };
-                    if let Ok(text) = serde_json::to_string(&msg) {
-                        if watch_tx.send(Message::Text(text)).is_err() {
-                            break;
-                        }
-                    }
+            let msg = ServerMessage::FileChanged {
+                path: change.path.clone(),
+                change_type: change.change_type.clone(),
+                new_entry,
+            };
+            if let Ok(text) = serde_json::to_string(&msg) {
+                if watch_tx.send(Message::Text(text)).is_err() {
+                    break;
                 }
             }
         }
