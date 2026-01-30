@@ -55,13 +55,23 @@ fn resolve_command(cmd: &str) -> Option<String> {
 
 /// Get terminal size from the current terminal
 fn get_terminal_size() -> (u16, u16) {
-    if let Some((w, h)) = term_size::dimensions() {
-        return (w as u16, h as u16);
-    }
-    // Default fallback
-    (80, 24)
+    get_terminal_size_opt().unwrap_or((80, 24))
 }
 
+#[cfg(unix)]
+fn get_terminal_size_opt() -> Option<(u16, u16)> {
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 {
+            if ws.ws_col > 0 && ws.ws_row > 0 {
+                return Some((ws.ws_col, ws.ws_row));
+            }
+        }
+    }
+    term_size::dimensions().map(|(w, h)| (w as u16, h as u16))
+}
+
+#[cfg(not(unix))]
 fn get_terminal_size_opt() -> Option<(u16, u16)> {
     term_size::dimensions().map(|(w, h)| (w as u16, h as u16))
 }
@@ -281,15 +291,14 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                                         msg["cols"].as_u64(),
                                         msg["rows"].as_u64(),
                                     ) {
-                                        let (mut cols, mut rows) = if cols == 0 || rows == 0 {
+                                        let (cols, rows) = if let Some((local_cols, local_rows)) = get_terminal_size_opt() {
+                                            // Prefer local terminal size when attached to avoid prompt overlap.
+                                            (local_cols, local_rows)
+                                        } else if cols == 0 || rows == 0 {
                                             get_terminal_size()
                                         } else {
                                             (cols as u16, rows as u16)
                                         };
-                                        if let Some((local_cols, local_rows)) = get_terminal_size_opt() {
-                                            cols = cols.min(local_cols);
-                                            rows = rows.min(local_rows);
-                                        }
                                         let _ = master.resize(PtySize {
                                             rows,
                                             cols,
