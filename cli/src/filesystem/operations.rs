@@ -6,6 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use crate::protocol::{
     FileContent, FileEncoding, FileEntry, FileSystemError, GitStatus, SortField, SortOrder,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
 use super::config::FileSystemConfig;
 use super::mime;
@@ -165,10 +166,10 @@ impl FileOperations {
                         (String::from_utf8_lossy(&buffer).to_string(), FileEncoding::Utf8)
                     }
                 } else {
-                    (base64::encode(&buffer), FileEncoding::Base64)
+                    (BASE64.encode(&buffer), FileEncoding::Base64)
                 }
             }
-            FileEncoding::Base64 => (base64::encode(&buffer), FileEncoding::Base64),
+            FileEncoding::Base64 => (BASE64.encode(&buffer), FileEncoding::Base64),
         };
 
         let modified = metadata
@@ -263,7 +264,7 @@ impl FileOperations {
         buffer.truncate(bytes_read);
 
         let checksum = format!("{:x}", md5::compute(&buffer));
-        let data = base64::encode(&buffer);
+        let data = BASE64.encode(&buffer);
         let is_last = chunk_index + 1 >= total_chunks;
 
         Ok((
@@ -302,7 +303,7 @@ impl FileOperations {
 
         let bytes = match encoding {
             FileEncoding::Utf8 => content.as_bytes().to_vec(),
-            FileEncoding::Base64 => base64::decode(content).map_err(|_| FileSystemError::InvalidEncoding {
+            FileEncoding::Base64 => BASE64.decode(content).map_err(|_| FileSystemError::InvalidEncoding {
                 path: path.display().to_string(),
             })?,
         };
@@ -334,16 +335,28 @@ impl FileOperations {
                 message: e.to_string(),
             })?;
 
-        if let Err(e) = fs::rename(&temp_path, &path).await {
-            // Windows cannot rename over existing files
-            if path.exists() {
-                let _ = fs::remove_file(&path).await;
-            }
-            fs::rename(&temp_path, &path)
+        let mut backup_path = None;
+        if path.exists() {
+            let backup = path.with_extension(format!("bak-{}", uuid::Uuid::new_v4()));
+            fs::rename(&path, &backup)
                 .await
-                .map_err(|e2| FileSystemError::IoError {
-                    message: format!("{}; {}", e, e2),
+                .map_err(|e| FileSystemError::IoError {
+                    message: format!("Failed to backup existing file: {}", e),
                 })?;
+            backup_path = Some(backup);
+        }
+
+        if let Err(e) = fs::rename(&temp_path, &path).await {
+            if let Some(ref backup) = backup_path {
+                let _ = fs::rename(backup, &path).await;
+            }
+            return Err(FileSystemError::IoError {
+                message: e.to_string(),
+            });
+        }
+
+        if let Some(backup) = backup_path {
+            let _ = fs::remove_file(backup).await;
         }
 
         Ok(())

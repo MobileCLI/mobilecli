@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use notify::{RecursiveMode, Watcher};
 use notify_debouncer_mini::{new_debouncer, DebouncedEvent, DebouncedEventKind, Debouncer};
 use tokio::sync::broadcast;
@@ -9,6 +9,7 @@ use crate::protocol::{ChangeType, FileChanged, FileSystemError};
 
 pub struct FileWatcher {
     watchers: DashMap<String, Debouncer<notify::RecommendedWatcher>>,
+    known_paths: std::sync::Arc<DashSet<String>>,
     event_tx: broadcast::Sender<FileChanged>,
     debounce_ms: u64,
 }
@@ -18,6 +19,7 @@ impl FileWatcher {
         let (event_tx, _) = broadcast::channel(1024);
         Self {
             watchers: DashMap::new(),
+            known_paths: std::sync::Arc::new(DashSet::new()),
             event_tx,
             debounce_ms,
         }
@@ -34,13 +36,21 @@ impl FileWatcher {
 
         let path_buf = PathBuf::from(path);
         let event_tx = self.event_tx.clone();
+        let known_paths = self.known_paths.clone();
+
+        known_paths.insert(path_buf.display().to_string());
+        if let Ok(entries) = std::fs::read_dir(&path_buf) {
+            for entry in entries.flatten() {
+                known_paths.insert(entry.path().display().to_string());
+            }
+        }
 
         let mut debouncer = new_debouncer(
             std::time::Duration::from_millis(self.debounce_ms),
             move |res: Result<Vec<DebouncedEvent>, Vec<notify::Error>>| {
                 if let Ok(events) = res {
                     for event in events {
-                        let change = classify_event(&event);
+                        let change = classify_event(&event, &known_paths);
                         let _ = event_tx.send(change);
                     }
                 }
@@ -67,25 +77,19 @@ impl FileWatcher {
     }
 }
 
-fn classify_event(event: &DebouncedEvent) -> FileChanged {
+fn classify_event(event: &DebouncedEvent, known_paths: &DashSet<String>) -> FileChanged {
     let path = event.path.display().to_string();
     let change_type = match event.kind {
         DebouncedEventKind::Any | DebouncedEventKind::AnyContinuous => {
             if event.path.exists() {
-                let is_recent = event
-                    .path
-                    .metadata()
-                    .ok()
-                    .and_then(|m| m.created().ok())
-                    .and_then(|t| t.elapsed().ok())
-                    .map(|d| d.as_secs() < 2)
-                    .unwrap_or(false);
-                if is_recent {
+                if !known_paths.contains(&path) {
+                    known_paths.insert(path.clone());
                     ChangeType::Created
                 } else {
                     ChangeType::Modified
                 }
             } else {
+                known_paths.remove(&path);
                 ChangeType::Deleted
             }
         }

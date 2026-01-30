@@ -423,8 +423,7 @@ async fn handle_mobile_client(
     }
 
     // Unregister
-    cleanup_mobile_views(&state, addr).await;
-    cleanup_file_watches(&state, addr).await;
+    cleanup_client_state(&state, addr).await;
     let mut st = state.write().await;
     st.mobile_clients.remove(&addr);
     st.file_rate_limiters.remove(&addr);
@@ -2011,58 +2010,58 @@ fn build_notification_text(
     (title_with_session, body)
 }
 
-async fn cleanup_mobile_views(state: &SharedState, addr: SocketAddr) {
-    let sessions_to_restore = {
+async fn cleanup_client_state(state: &SharedState, addr: SocketAddr) {
+    let (sessions_to_restore, to_unwatch) = {
         let mut st = state.write().await;
-        let sessions = match st.mobile_views.remove(&addr) {
-            Some(s) => s,
-            None => return,
-        };
-        let mut restore = Vec::new();
-        for session_id in sessions {
-            if let Some(count) = st.session_view_counts.get_mut(&session_id) {
-                if *count > 0 {
-                    *count -= 1;
-                }
-                if *count == 0 {
-                    st.session_view_counts.remove(&session_id);
-                    restore.push(session_id);
-                }
-            }
-        }
-        restore
-    };
 
-    for session_id in sessions_to_restore {
-        restore_pty_size(state, &session_id).await;
-    }
-}
-
-async fn cleanup_file_watches(state: &SharedState, addr: SocketAddr) {
-    let to_unwatch = {
-        let mut st = state.write().await;
-        let watched = match st.file_watch_subscriptions.remove(&addr) {
-            Some(paths) => paths,
-            None => return,
-        };
-        let mut to_unwatch = Vec::new();
-        for path in watched {
-            if let Some(count) = st.file_watch_counts.get_mut(&path) {
-                if *count > 0 {
-                    *count -= 1;
+        let sessions_to_restore = match st.mobile_views.remove(&addr) {
+            Some(sessions) => {
+                let mut restore = Vec::new();
+                for session_id in sessions {
+                    if let Some(count) = st.session_view_counts.get_mut(&session_id) {
+                        if *count > 0 {
+                            *count -= 1;
+                        }
+                        if *count == 0 {
+                            st.session_view_counts.remove(&session_id);
+                            restore.push(session_id);
+                        }
+                    }
                 }
-                if *count == 0 {
-                    st.file_watch_counts.remove(&path);
-                    to_unwatch.push(path);
-                }
+                restore
             }
-        }
-        to_unwatch
+            None => Vec::new(),
+        };
+
+        let to_unwatch = match st.file_watch_subscriptions.remove(&addr) {
+            Some(paths) => {
+                let mut to_unwatch = Vec::new();
+                for path in paths {
+                    if let Some(count) = st.file_watch_counts.get_mut(&path) {
+                        if *count > 0 {
+                            *count -= 1;
+                        }
+                        if *count == 0 {
+                            st.file_watch_counts.remove(&path);
+                            to_unwatch.push(path);
+                        }
+                    }
+                }
+                to_unwatch
+            }
+            None => Vec::new(),
+        };
+
+        (sessions_to_restore, to_unwatch)
     };
 
     let fs = { state.read().await.file_system.clone() };
     for path in to_unwatch {
         let _ = fs.watcher().unwatch(&path);
+    }
+
+    for session_id in sessions_to_restore {
+        restore_pty_size(state, &session_id).await;
     }
 }
 
