@@ -650,6 +650,112 @@ fn is_shell_safe(s: &str) -> bool {
         && !s.contains("$(")
 }
 
+/// POSIX-safe single-quote wrapper for shell tokens.
+fn shell_quote_posix(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn shell_base_name(shell: &str) -> String {
+    std::path::Path::new(shell)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(shell)
+        .to_lowercase()
+}
+
+fn shell_args_for_command(shell: &str, command: &str) -> Vec<String> {
+    let base = shell_base_name(shell);
+    let supports_login = matches!(
+        base.as_str(),
+        "bash" | "zsh" | "fish" | "ksh" | "tcsh" | "csh"
+    );
+    let mut args = Vec::with_capacity(3);
+    if supports_login {
+        args.push("-l".to_string());
+    }
+    args.push("-c".to_string());
+    args.push(command.to_string());
+    args
+}
+
+fn shell_command_line(shell: &str, args: &[String]) -> String {
+    let mut parts = Vec::with_capacity(args.len() + 1);
+    parts.push(shell_quote_posix(shell));
+    for arg in args {
+        parts.push(shell_quote_posix(arg));
+    }
+    parts.join(" ")
+}
+
+/// Build the shell command to run inside a terminal emulator.
+fn build_wrap_shell_command(
+    mobilecli_bin: &str,
+    session_name: &str,
+    command: &str,
+    args: &[String],
+    working_dir: Option<&str>,
+) -> String {
+    let mut tokens = Vec::new();
+    tokens.push(mobilecli_bin.to_string());
+    tokens.push("--name".to_string());
+    tokens.push(session_name.to_string());
+    if let Some(dir) = working_dir {
+        tokens.push("--dir".to_string());
+        tokens.push(dir.to_string());
+    }
+    tokens.push(command.to_string());
+    tokens.extend(args.iter().cloned());
+    tokens
+        .into_iter()
+        .map(|t| shell_quote_posix(&t))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(windows)]
+fn spawn_session_windows(
+    command: &str,
+    args: &[String],
+    name: Option<&str>,
+    working_dir: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::os::windows::process::CommandExt;
+
+    let session_name = name.unwrap_or(command);
+    let mobilecli_bin = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "mobilecli.exe".to_string());
+
+    let mut cmd = std::process::Command::new(&mobilecli_bin);
+    cmd.arg("--name").arg(session_name);
+    if let Some(dir) = working_dir {
+        cmd.arg("--dir").arg(dir);
+        cmd.current_dir(dir);
+    }
+    cmd.arg(command).args(args);
+
+    // Create a new console window so the session is visible and interactive.
+    const CREATE_NEW_CONSOLE: u32 = 0x00000010;
+    cmd.creation_flags(CREATE_NEW_CONSOLE);
+
+    cmd.spawn()?;
+    Ok(())
+}
+
 /// Spawn a new session from mobile request
 async fn spawn_session_from_mobile(
     command: &str,
@@ -690,27 +796,30 @@ async fn spawn_session_from_mobile(
         }
     }
 
+    #[cfg(windows)]
+    {
+        return spawn_session_windows(command, args, name, working_dir);
+    }
+
     // Detect terminal emulator
     let terminal = detect_terminal_emulator()?;
 
     // Build the command to run inside the terminal
     let session_name = name.unwrap_or(command);
-    let mut wrap_cmd = format!(
-        "mobilecli wrap --name '{}'",
-        session_name.replace("'", "'\\''")
-    );
-
-    if let Some(dir) = working_dir {
-        wrap_cmd.push_str(&format!(" --dir '{}'", dir.replace("'", "'\\''")));
-    }
-
-    wrap_cmd.push(' ');
-    wrap_cmd.push_str(command);
-
-    for arg in args {
-        wrap_cmd.push(' ');
-        wrap_cmd.push_str(&format!("'{}'", arg.replace("'", "'\\''")));
-    }
+    let mobilecli_bin = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "mobilecli".to_string());
+    let shell_candidate = platform::default_shell();
+    let shell = if std::path::Path::new(&shell_candidate).exists()
+        || which::which(&shell_candidate).is_ok()
+    {
+        shell_candidate
+    } else {
+        "/bin/sh".to_string()
+    };
+    let wrap_cmd = build_wrap_shell_command(&mobilecli_bin, session_name, command, args, working_dir);
+    let shell_args = shell_args_for_command(&shell, &wrap_cmd);
 
     tracing::info!("Spawning session: {} via {}", wrap_cmd, terminal.name);
 
@@ -719,25 +828,26 @@ async fn spawn_session_from_mobile(
 
     match terminal.name.as_str() {
         "kitty" => {
-            cmd.args(["--", "sh", "-c", &wrap_cmd]);
+            cmd.arg("--").arg(&shell).args(&shell_args);
         }
         "alacritty" => {
-            cmd.args(["-e", "sh", "-c", &wrap_cmd]);
+            cmd.arg("-e").arg(&shell).args(&shell_args);
         }
         "gnome-terminal" | "tilix" => {
-            cmd.args(["--", "sh", "-c", &wrap_cmd]);
+            cmd.arg("--").arg(&shell).args(&shell_args);
         }
         "konsole" => {
-            cmd.args(["-e", "sh", "-c", &wrap_cmd]);
+            cmd.arg("-e").arg(&shell).args(&shell_args);
         }
         "xterm" | "urxvt" => {
-            cmd.args(["-e", "sh", "-c", &wrap_cmd]);
+            cmd.arg("-e").arg(&shell).args(&shell_args);
         }
         "wezterm" => {
-            cmd.args(["start", "--", "sh", "-c", &wrap_cmd]);
+            cmd.args(["start", "--"]).arg(&shell).args(&shell_args);
         }
         "iterm" => {
             // macOS iTerm2 - use osascript to open a new window
+            let shell_cmd = shell_command_line(&shell, &shell_args);
             let script = format!(
                 r#"tell application "iTerm"
                     create window with default profile
@@ -745,26 +855,27 @@ async fn spawn_session_from_mobile(
                         write text "{}"
                     end tell
                 end tell"#,
-                wrap_cmd.replace("\"", "\\\"")
+                shell_cmd.replace('\\', "\\\\").replace('"', "\\\"")
             );
             cmd = std::process::Command::new("osascript");
             cmd.args(["-e", &script]);
         }
         "terminal" => {
             // macOS Terminal.app
+            let shell_cmd = shell_command_line(&shell, &shell_args);
             let script = format!(
                 r#"tell application "Terminal"
                     do script "{}"
                     activate
                 end tell"#,
-                wrap_cmd.replace("\"", "\\\"")
+                shell_cmd.replace('\\', "\\\\").replace('"', "\\\"")
             );
             cmd = std::process::Command::new("osascript");
             cmd.args(["-e", &script]);
         }
         _ => {
             // Generic fallback: try -e flag
-            cmd.args(["-e", "sh", "-c", &wrap_cmd]);
+            cmd.arg("-e").arg(&shell).args(&shell_args);
         }
     }
 

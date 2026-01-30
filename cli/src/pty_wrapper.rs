@@ -37,6 +37,7 @@ pub struct WrapConfig {
     pub args: Vec<String>,
     pub session_name: String,
     pub quiet: bool,
+    pub working_dir: Option<String>,
 }
 
 /// Resolve a command to its full path
@@ -70,10 +71,12 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
     // Generate session ID (12 chars for better collision resistance)
     let session_id = uuid::Uuid::new_v4().to_string()[..12].to_string();
 
-    // Get current working directory
-    let cwd = std::env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| ".".to_string());
+    // Get current working directory (allow override)
+    let cwd = config.working_dir.clone().unwrap_or_else(|| {
+        std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| ".".to_string())
+    });
 
     // Connect to daemon (use actual port from file, fallback to default)
     let port = get_port().unwrap_or(DEFAULT_PORT);

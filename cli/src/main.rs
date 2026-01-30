@@ -52,6 +52,10 @@ struct RunArgs {
     #[arg(long = "quiet", short = 'q')]
     quiet: bool,
 
+    /// Working directory for the session
+    #[arg(long = "dir")]
+    working_dir: Option<String>,
+
     /// Run setup wizard and show QR code for pairing
     #[arg(long = "setup")]
     setup: bool,
@@ -208,6 +212,7 @@ async fn main() -> ExitCode {
         args,
         session_name: session_name.clone(),
         quiet: run_args.quiet,
+        working_dir: run_args.working_dir.clone(),
     };
 
     match pty_wrapper::run_wrapped(wrap_config).await {
