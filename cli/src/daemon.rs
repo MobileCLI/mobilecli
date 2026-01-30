@@ -668,6 +668,38 @@ fn shell_quote_posix(s: &str) -> String {
     out
 }
 
+fn shell_base_name(shell: &str) -> String {
+    std::path::Path::new(shell)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(shell)
+        .to_lowercase()
+}
+
+fn shell_args_for_command(shell: &str, command: &str) -> Vec<String> {
+    let base = shell_base_name(shell);
+    let supports_login = matches!(
+        base.as_str(),
+        "bash" | "zsh" | "fish" | "ksh" | "tcsh" | "csh"
+    );
+    let mut args = Vec::with_capacity(3);
+    if supports_login {
+        args.push("-l".to_string());
+    }
+    args.push("-c".to_string());
+    args.push(command.to_string());
+    args
+}
+
+fn shell_command_line(shell: &str, args: &[String]) -> String {
+    let mut parts = Vec::with_capacity(args.len() + 1);
+    parts.push(shell_quote_posix(shell));
+    for arg in args {
+        parts.push(shell_quote_posix(arg));
+    }
+    parts.join(" ")
+}
+
 /// Build the shell command to run inside a terminal emulator.
 fn build_wrap_shell_command(
     mobilecli_bin: &str,
@@ -787,6 +819,7 @@ async fn spawn_session_from_mobile(
         "/bin/sh".to_string()
     };
     let wrap_cmd = build_wrap_shell_command(&mobilecli_bin, session_name, command, args, working_dir);
+    let shell_args = shell_args_for_command(&shell, &wrap_cmd);
 
     tracing::info!("Spawning session: {} via {}", wrap_cmd, terminal.name);
 
@@ -795,26 +828,26 @@ async fn spawn_session_from_mobile(
 
     match terminal.name.as_str() {
         "kitty" => {
-            cmd.args(["--", &shell, "-lc", &wrap_cmd]);
+            cmd.arg("--").arg(&shell).args(&shell_args);
         }
         "alacritty" => {
-            cmd.args(["-e", &shell, "-lc", &wrap_cmd]);
+            cmd.arg("-e").arg(&shell).args(&shell_args);
         }
         "gnome-terminal" | "tilix" => {
-            cmd.args(["--", &shell, "-lc", &wrap_cmd]);
+            cmd.arg("--").arg(&shell).args(&shell_args);
         }
         "konsole" => {
-            cmd.args(["-e", &shell, "-lc", &wrap_cmd]);
+            cmd.arg("-e").arg(&shell).args(&shell_args);
         }
         "xterm" | "urxvt" => {
-            cmd.args(["-e", &shell, "-lc", &wrap_cmd]);
+            cmd.arg("-e").arg(&shell).args(&shell_args);
         }
         "wezterm" => {
-            cmd.args(["start", "--", &shell, "-lc", &wrap_cmd]);
+            cmd.args(["start", "--"]).arg(&shell).args(&shell_args);
         }
         "iterm" => {
             // macOS iTerm2 - use osascript to open a new window
-            let shell_cmd = format!("{} -lc {}", shell_quote_posix(&shell), wrap_cmd);
+            let shell_cmd = shell_command_line(&shell, &shell_args);
             let script = format!(
                 r#"tell application "iTerm"
                     create window with default profile
@@ -829,7 +862,7 @@ async fn spawn_session_from_mobile(
         }
         "terminal" => {
             // macOS Terminal.app
-            let shell_cmd = format!("{} -lc {}", shell_quote_posix(&shell), wrap_cmd);
+            let shell_cmd = shell_command_line(&shell, &shell_args);
             let script = format!(
                 r#"tell application "Terminal"
                     do script "{}"
@@ -842,7 +875,7 @@ async fn spawn_session_from_mobile(
         }
         _ => {
             // Generic fallback: try -e flag
-            cmd.args(["-e", &shell, "-lc", &wrap_cmd]);
+            cmd.arg("-e").arg(&shell).args(&shell_args);
         }
     }
 
