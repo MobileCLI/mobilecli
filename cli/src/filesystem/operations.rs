@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::Path;
 
 use tokio::fs;
@@ -326,23 +327,23 @@ impl FileOperations {
             }
         }
 
-        let tmp_ext = format!("tmp-{}", uuid::Uuid::new_v4());
-        let temp_path = path.with_extension(tmp_ext);
+        let temp_path = sibling_with_suffix(&path, &format!("tmp-{}", uuid::Uuid::new_v4()));
 
-        fs::write(&temp_path, &bytes)
-            .await
-            .map_err(|e| FileSystemError::IoError {
+        if let Err(e) = fs::write(&temp_path, &bytes).await {
+            return Err(FileSystemError::IoError {
                 message: e.to_string(),
-            })?;
+            });
+        }
 
         let mut backup_path = None;
         if path.exists() {
-            let backup = path.with_extension(format!("bak-{}", uuid::Uuid::new_v4()));
-            fs::rename(&path, &backup)
-                .await
-                .map_err(|e| FileSystemError::IoError {
+            let backup = sibling_with_suffix(&path, &format!("bak-{}", uuid::Uuid::new_v4()));
+            if let Err(e) = fs::rename(&path, &backup).await {
+                let _ = fs::remove_file(&temp_path).await;
+                return Err(FileSystemError::IoError {
                     message: format!("Failed to backup existing file: {}", e),
-                })?;
+                });
+            }
             backup_path = Some(backup);
         }
 
@@ -350,6 +351,7 @@ impl FileOperations {
             if let Some(ref backup) = backup_path {
                 let _ = fs::rename(backup, &path).await;
             }
+            let _ = fs::remove_file(&temp_path).await;
             return Err(FileSystemError::IoError {
                 message: e.to_string(),
             });
@@ -594,6 +596,16 @@ fn decode_text_buffer(buffer: &[u8]) -> Option<String> {
     }
 
     None
+}
+
+fn sibling_with_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut file_name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| OsString::from("file"));
+    file_name.push(".");
+    file_name.push(suffix);
+    path.with_file_name(file_name)
 }
 
 fn sort_entries(entries: &mut [FileEntry], sort_by: Option<SortField>, sort_order: Option<SortOrder>) {
