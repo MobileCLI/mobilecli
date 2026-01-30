@@ -49,7 +49,7 @@ impl FileOperations {
         }
 
         let mut entries = Vec::new();
-        let git_statuses = super::git::status_map_for_path(&path);
+        let git_statuses = super::git::status_map_for_path(&path).await;
         let mut read_dir = fs::read_dir(&path)
             .await
             .map_err(|e| FileSystemError::IoError {
@@ -348,13 +348,31 @@ impl FileOperations {
         }
 
         if let Err(e) = fs::rename(&temp_path, &path).await {
+            let mut restore_error = None;
             if let Some(ref backup) = backup_path {
-                let _ = fs::rename(backup, &path).await;
+                if let Err(restore) = fs::rename(backup, &path).await {
+                    if let Err(copy_err) = fs::copy(backup, &path).await {
+                        restore_error = Some(format!(
+                            "Failed to restore backup at {}: {}; copy failed: {}",
+                            backup.display(),
+                            restore,
+                            copy_err
+                        ));
+                    } else {
+                        restore_error = Some(format!(
+                            "Restored from backup copy after rename failure; backup retained at {}",
+                            backup.display()
+                        ));
+                    }
+                }
             }
             let _ = fs::remove_file(&temp_path).await;
-            return Err(FileSystemError::IoError {
-                message: e.to_string(),
-            });
+            let message = if let Some(restore_error) = restore_error {
+                format!("Failed to replace file: {}; {}", e, restore_error)
+            } else {
+                e.to_string()
+            };
+            return Err(FileSystemError::IoError { message });
         }
 
         if let Some(backup) = backup_path {
@@ -501,7 +519,7 @@ impl FileOperations {
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_string();
-        let git_status = super::git::status_for_path(&path);
+        let git_status = super::git::status_for_path(&path).await;
         self.build_file_entry(&path, &name, git_status).await
     }
 

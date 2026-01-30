@@ -321,6 +321,9 @@ async fn handle_mobile_client(
                 Ok(change) => {
                     let fs = {
                         let st = watch_state.read().await;
+                        if !st.mobile_clients.contains_key(&addr) {
+                            break;
+                        }
                         let watched = match st.file_watch_subscriptions.get(&addr) {
                             Some(paths) => paths,
                             None => continue,
@@ -344,7 +347,9 @@ async fn handle_mobile_client(
                         new_entry,
                     };
                     if let Ok(text) = serde_json::to_string(&msg) {
-                        let _ = watch_tx.send(Message::Text(text));
+                        if watch_tx.send(Message::Text(text)).is_err() {
+                            break;
+                        }
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,

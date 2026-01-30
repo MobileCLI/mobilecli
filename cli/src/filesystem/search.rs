@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ignore::WalkBuilder;
 
@@ -38,12 +39,14 @@ impl FileSearch {
             .build_parallel();
 
         let matches = Arc::new(Mutex::new(Vec::new()));
+        let match_count = Arc::new(AtomicUsize::new(0));
         let pattern = glob::Pattern::new(pattern).map_err(|e| FileSystemError::IoError {
             message: e.to_string(),
         })?;
 
         walker.run(|| {
             let matches = Arc::clone(&matches);
+            let match_count = Arc::clone(&match_count);
             let pattern = pattern.clone();
             let content_pattern = content_pattern.map(|s| s.to_string());
 
@@ -53,7 +56,7 @@ impl FileSearch {
                     Err(_) => return ignore::WalkState::Continue,
                 };
 
-                if matches.lock().unwrap().len() >= max_results as usize {
+                if match_count.load(Ordering::Relaxed) >= max_results as usize {
                     return ignore::WalkState::Quit;
                 }
 
@@ -81,6 +84,25 @@ impl FileSearch {
                 };
 
                 if let Ok(entry_info) = std::fs::metadata(path) {
+                    let mut reserved = false;
+                    loop {
+                        let current = match_count.load(Ordering::Relaxed);
+                        if current >= max_results as usize {
+                            break;
+                        }
+                        if match_count
+                            .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+                            .is_ok()
+                        {
+                            reserved = true;
+                            break;
+                        }
+                    }
+
+                    if !reserved {
+                        return ignore::WalkState::Quit;
+                    }
+
                     let file_entry = build_file_entry_sync(path, &entry_info, &name);
                     matches.lock().unwrap().push(SearchMatch {
                         path: path.display().to_string(),

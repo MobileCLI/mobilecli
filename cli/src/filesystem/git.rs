@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use tokio::process::Command;
 
 use crate::protocol::GitStatus;
 
-pub fn status_map_for_path(path: &Path) -> Option<HashMap<PathBuf, GitStatus>> {
+pub async fn status_map_for_path(path: &Path) -> Option<HashMap<PathBuf, GitStatus>> {
     let repo_root = find_repo_root(path)?;
-    status_map(&repo_root)
+    status_map(&repo_root).await
 }
 
-pub fn status_for_path(path: &Path) -> Option<GitStatus> {
+pub async fn status_for_path(path: &Path) -> Option<GitStatus> {
     let repo_root = find_repo_root(path)?;
     let rel = path.strip_prefix(&repo_root).ok()?;
 
@@ -23,6 +23,7 @@ pub fn status_for_path(path: &Path) -> Option<GitStatus> {
         .arg("--")
         .arg(rel)
         .output()
+        .await
         .ok()?;
 
     if !output.status.success() {
@@ -34,7 +35,7 @@ pub fn status_for_path(path: &Path) -> Option<GitStatus> {
     parse_status_line(line)
 }
 
-fn status_map(repo_root: &Path) -> Option<HashMap<PathBuf, GitStatus>> {
+async fn status_map(repo_root: &Path) -> Option<HashMap<PathBuf, GitStatus>> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_root)
@@ -43,6 +44,7 @@ fn status_map(repo_root: &Path) -> Option<HashMap<PathBuf, GitStatus>> {
         .arg("--ignored")
         .arg("--untracked-files=normal")
         .output()
+        .await
         .ok()?;
 
     if !output.status.success() {
