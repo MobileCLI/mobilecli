@@ -11,6 +11,7 @@
 
 mod daemon;
 mod detection;
+mod filesystem;
 mod link;
 mod platform;
 mod protocol;
