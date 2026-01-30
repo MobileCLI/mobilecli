@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::process::Command;
+use tokio::time::timeout;
 
 use crate::protocol::GitStatus;
 
@@ -13,7 +15,9 @@ pub async fn status_for_path(path: &Path) -> Option<GitStatus> {
     let repo_root = find_repo_root(path)?;
     let rel = path.strip_prefix(&repo_root).ok()?;
 
-    let output = Command::new("git")
+    let output = timeout(
+        Duration::from_millis(800),
+        Command::new("git")
         .arg("-C")
         .arg(&repo_root)
         .arg("status")
@@ -22,9 +26,11 @@ pub async fn status_for_path(path: &Path) -> Option<GitStatus> {
         .arg("--untracked-files=normal")
         .arg("--")
         .arg(rel)
-        .output()
-        .await
-        .ok()?;
+        .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
 
     if !output.status.success() {
         return None;
@@ -36,16 +42,20 @@ pub async fn status_for_path(path: &Path) -> Option<GitStatus> {
 }
 
 async fn status_map(repo_root: &Path) -> Option<HashMap<PathBuf, GitStatus>> {
-    let output = Command::new("git")
+    let output = timeout(
+        Duration::from_millis(800),
+        Command::new("git")
         .arg("-C")
         .arg(repo_root)
         .arg("status")
         .arg("--porcelain")
         .arg("--ignored")
         .arg("--untracked-files=normal")
-        .output()
-        .await
-        .ok()?;
+        .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
 
     if !output.status.success() {
         return None;
