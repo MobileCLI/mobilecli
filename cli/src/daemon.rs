@@ -6,8 +6,9 @@
 use crate::detection::{
     detect_wait_event, strip_ansi_and_normalize, ApprovalModel, CliTracker, CliType, WaitType,
 };
+use crate::filesystem::{config::FileSystemConfig, rate_limit::RateLimiter, FileSystemService};
 use crate::platform;
-use crate::protocol::{ClientMessage, ServerMessage, SessionListItem};
+use crate::protocol::{ChangeType, ClientMessage, FileSystemError, ServerMessage, SessionListItem};
 use crate::session::{self, SessionInfo};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::Utc;
@@ -128,6 +129,10 @@ pub struct DaemonState {
     pub push_tokens: Vec<PushToken>,
     pub mobile_views: HashMap<SocketAddr, std::collections::HashSet<String>>,
     pub session_view_counts: HashMap<String, usize>,
+    pub file_system: std::sync::Arc<FileSystemService>,
+    pub file_watch_subscriptions: HashMap<SocketAddr, std::collections::HashSet<String>>,
+    pub file_watch_counts: HashMap<String, usize>,
+    pub file_rate_limiters: HashMap<SocketAddr, RateLimiter>,
     /// Device UUID (for multi-device support)
     pub device_id: Option<String>,
     /// Device name (hostname)
@@ -137,6 +142,7 @@ pub struct DaemonState {
 impl DaemonState {
     pub fn new(port: u16) -> Self {
         let (pty_broadcast, _) = broadcast::channel(256);
+        let file_system = std::sync::Arc::new(FileSystemService::new(FileSystemConfig::default()));
 
         // Load device info from config
         let (device_id, device_name) = crate::setup::load_config()
@@ -151,6 +157,10 @@ impl DaemonState {
             push_tokens: Vec::new(),
             mobile_views: HashMap::new(),
             session_view_counts: HashMap::new(),
+            file_system,
+            file_watch_subscriptions: HashMap::new(),
+            file_watch_counts: HashMap::new(),
+            file_rate_limiters: HashMap::new(),
             device_id,
             device_name,
         }
@@ -290,6 +300,8 @@ async fn handle_mobile_client(
     tracing::info!("Mobile client connected: {}", addr);
 
     let (client_tx, mut client_rx) = mpsc::unbounded_channel::<Message>();
+    let watch_tx = client_tx.clone();
+    let (disconnect_tx, mut disconnect_rx) = tokio::sync::watch::channel(false);
 
     // Register client and get broadcast receiver
     let mut pty_rx = {
@@ -297,6 +309,80 @@ async fn handle_mobile_client(
         st.mobile_clients.insert(addr, client_tx);
         st.pty_broadcast.subscribe()
     };
+
+    // Subscribe to file system change events for this client
+    let mut file_watch_rx = {
+        let st = state.read().await;
+        st.file_system.watcher().subscribe()
+    };
+    let watch_state = state.clone();
+    tokio::spawn(async move {
+        'watch: loop {
+            if *disconnect_rx.borrow() {
+                break;
+            }
+            let change = tokio::select! {
+                _ = disconnect_rx.changed() => {
+                    if *disconnect_rx.borrow() {
+                        break 'watch;
+                    }
+                    continue 'watch;
+                }
+                result = file_watch_rx.recv() => {
+                    match result {
+                        Ok(change) => change,
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue 'watch,
+                        Err(_) => break 'watch,
+                    }
+                }
+            };
+
+            let fs = {
+                let st = watch_state.read().await;
+                if !st.mobile_clients.contains_key(&addr) {
+                    break 'watch;
+                }
+                let watched = match st.file_watch_subscriptions.get(&addr) {
+                    Some(paths) => paths,
+                    None => continue,
+                };
+                if !is_path_watched(&change.path, watched) {
+                    continue;
+                }
+                st.file_system.clone()
+            };
+
+            let mut new_entry = None;
+            if matches!(change.change_type, ChangeType::Created | ChangeType::Modified) {
+                let should_break = tokio::select! {
+                    _ = disconnect_rx.changed() => *disconnect_rx.borrow(),
+                    result = fs.ops().get_file_info(&change.path) => {
+                        if let Ok(entry) = result {
+                            new_entry = Some(entry);
+                        }
+                        false
+                    }
+                };
+                if should_break {
+                    break;
+                }
+            }
+            if *disconnect_rx.borrow() {
+                break;
+            }
+
+            let msg = ServerMessage::FileChanged {
+                path: change.path.clone(),
+                change_type: change.change_type.clone(),
+                new_entry,
+            };
+            if let Ok(text) = serde_json::to_string(&msg) {
+                if watch_tx.send(Message::Text(text)).is_err() {
+                    break;
+                }
+            }
+        }
+    });
 
     // Send welcome with device info
     let (device_id, device_name) = {
@@ -368,8 +454,13 @@ async fn handle_mobile_client(
     }
 
     // Unregister
-    cleanup_mobile_views(&state, addr).await;
-    state.write().await.mobile_clients.remove(&addr);
+    let _ = disconnect_tx.send(true);
+    {
+        let mut st = state.write().await;
+        st.mobile_clients.remove(&addr);
+        st.file_rate_limiters.remove(&addr);
+    }
+    cleanup_client_state(&state, addr).await;
     tracing::info!("Mobile client disconnected: {}", addr);
     Ok(())
 }
@@ -1192,8 +1283,559 @@ async fn process_client_msg(
             };
             tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
         }
+        ClientMessage::ListDirectory {
+            request_id,
+            path,
+            include_hidden,
+            sort_by,
+            sort_order,
+        } => {
+            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+                send_fs_error(
+                    tx,
+                    request_id,
+                    "list_directory",
+                    &path,
+                    FileSystemError::RateLimited { retry_after_ms },
+                )
+                .await?;
+                return Ok(());
+            }
+            let fs = { state.read().await.file_system.clone() };
+            match fs
+                .ops()
+                .list_directory(&path, include_hidden, sort_by, sort_order)
+                .await
+            {
+                Ok((path, entries, total_count, truncated)) => {
+                    let msg = ServerMessage::DirectoryListing {
+                        request_id,
+                        path,
+                        entries,
+                        total_count,
+                        truncated,
+                    };
+                    tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                }
+                Err(e) => {
+                    send_fs_error(tx, request_id, "list_directory", &path, e).await?;
+                }
+            }
+        }
+        ClientMessage::ReadFile {
+            request_id,
+            path,
+            offset,
+            length,
+            encoding,
+        } => {
+            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+                send_fs_error(
+                    tx,
+                    request_id,
+                    "read_file",
+                    &path,
+                    FileSystemError::RateLimited { retry_after_ms },
+                )
+                .await?;
+                return Ok(());
+            }
+            let fs = { state.read().await.file_system.clone() };
+            match fs.ops().read_file(&path, offset, length, encoding).await {
+                Ok(file) => {
+                    let msg = ServerMessage::FileContent {
+                        request_id,
+                        path: file.path,
+                        content: file.content,
+                        encoding: file.encoding,
+                        mime_type: file.mime_type,
+                        size: file.size,
+                        modified: file.modified,
+                        truncated_at: file.truncated_at,
+                    };
+                    tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                }
+                Err(e) => {
+                    send_fs_error(tx, request_id, "read_file", &path, e).await?;
+                }
+            }
+        }
+        ClientMessage::ReadFileChunk {
+            request_id,
+            path,
+            chunk_index,
+            chunk_size,
+        } => {
+            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+                send_fs_error(
+                    tx,
+                    request_id,
+                    "read_file_chunk",
+                    &path,
+                    FileSystemError::RateLimited { retry_after_ms },
+                )
+                .await?;
+                return Ok(());
+            }
+            let fs = { state.read().await.file_system.clone() };
+            let size = chunk_size.unwrap_or(262_144);
+            match fs.ops().read_file_chunk(&path, chunk_index, size).await {
+                Ok((path, total_chunks, total_size, chunk_index, data, checksum, is_last)) => {
+                    let msg = ServerMessage::FileChunk {
+                        request_id,
+                        path,
+                        chunk_index,
+                        total_chunks,
+                        total_size,
+                        data,
+                        checksum,
+                        is_last,
+                    };
+                    tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                }
+                Err(e) => {
+                    send_fs_error(tx, request_id, "read_file_chunk", &path, e).await?;
+                }
+            }
+        }
+        ClientMessage::WriteFile {
+            request_id,
+            path,
+            content,
+            encoding,
+            create_parents,
+        } => {
+            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+                send_fs_error(
+                    tx,
+                    request_id,
+                    "write_file",
+                    &path,
+                    FileSystemError::RateLimited { retry_after_ms },
+                )
+                .await?;
+                return Ok(());
+            }
+            let fs = { state.read().await.file_system.clone() };
+            match fs
+                .ops()
+                .write_file(&path, &content, encoding, create_parents)
+                .await
+            {
+                Ok(()) => {
+                    let msg = ServerMessage::OperationSuccess {
+                        request_id,
+                        operation: "write_file".to_string(),
+                        path: path.clone(),
+                        message: None,
+                    };
+                    tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                }
+                Err(e) => {
+                    send_fs_error(tx, request_id, "write_file", &path, e).await?;
+                }
+            }
+        }
+        ClientMessage::CreateDirectory {
+            request_id,
+            path,
+            recursive,
+        } => {
+            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+                send_fs_error(
+                    tx,
+                    request_id,
+                    "create_directory",
+                    &path,
+                    FileSystemError::RateLimited { retry_after_ms },
+                )
+                .await?;
+                return Ok(());
+            }
+            let fs = { state.read().await.file_system.clone() };
+            match fs.ops().create_directory(&path, recursive).await {
+                Ok(()) => {
+                    let msg = ServerMessage::OperationSuccess {
+                        request_id,
+                        operation: "create_directory".to_string(),
+                        path: path.clone(),
+                        message: None,
+                    };
+                    tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                }
+                Err(e) => {
+                    send_fs_error(tx, request_id, "create_directory", &path, e).await?;
+                }
+            }
+        }
+        ClientMessage::DeletePath {
+            request_id,
+            path,
+            recursive,
+        } => {
+            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+                send_fs_error(
+                    tx,
+                    request_id,
+                    "delete_path",
+                    &path,
+                    FileSystemError::RateLimited { retry_after_ms },
+                )
+                .await?;
+                return Ok(());
+            }
+            let fs = { state.read().await.file_system.clone() };
+            match fs.ops().delete_path(&path, recursive).await {
+                Ok(()) => {
+                    let msg = ServerMessage::OperationSuccess {
+                        request_id,
+                        operation: "delete_path".to_string(),
+                        path: path.clone(),
+                        message: None,
+                    };
+                    tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                }
+                Err(e) => {
+                    send_fs_error(tx, request_id, "delete_path", &path, e).await?;
+                }
+            }
+        }
+        ClientMessage::RenamePath {
+            request_id,
+            old_path,
+            new_path,
+        } => {
+            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+                send_fs_error(
+                    tx,
+                    request_id,
+                    "rename_path",
+                    &old_path,
+                    FileSystemError::RateLimited { retry_after_ms },
+                )
+                .await?;
+                return Ok(());
+            }
+            let fs = { state.read().await.file_system.clone() };
+            match fs.ops().rename_path(&old_path, &new_path).await {
+                Ok(()) => {
+                    let msg = ServerMessage::OperationSuccess {
+                        request_id,
+                        operation: "rename_path".to_string(),
+                        path: old_path.clone(),
+                        message: Some(new_path),
+                    };
+                    tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                }
+                Err(e) => {
+                    send_fs_error(tx, request_id, "rename_path", &old_path, e).await?;
+                }
+            }
+        }
+        ClientMessage::CopyPath {
+            request_id,
+            source,
+            destination,
+            recursive,
+        } => {
+            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+                send_fs_error(
+                    tx,
+                    request_id,
+                    "copy_path",
+                    &source,
+                    FileSystemError::RateLimited { retry_after_ms },
+                )
+                .await?;
+                return Ok(());
+            }
+            let fs = { state.read().await.file_system.clone() };
+            match fs.ops().copy_path(&source, &destination, recursive).await {
+                Ok(()) => {
+                    let msg = ServerMessage::OperationSuccess {
+                        request_id,
+                        operation: "copy_path".to_string(),
+                        path: source.clone(),
+                        message: Some(destination),
+                    };
+                    tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                }
+                Err(e) => {
+                    send_fs_error(tx, request_id, "copy_path", &source, e).await?;
+                }
+            }
+        }
+        ClientMessage::GetFileInfo { request_id, path } => {
+            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+                send_fs_error(
+                    tx,
+                    request_id,
+                    "get_file_info",
+                    &path,
+                    FileSystemError::RateLimited { retry_after_ms },
+                )
+                .await?;
+                return Ok(());
+            }
+            let fs = { state.read().await.file_system.clone() };
+            match fs.ops().get_file_info(&path).await {
+                Ok(entry) => {
+                    let msg = ServerMessage::FileInfo {
+                        request_id,
+                        path,
+                        entry,
+                    };
+                    tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                }
+                Err(e) => {
+                    send_fs_error(tx, request_id, "get_file_info", &path, e).await?;
+                }
+            }
+        }
+        ClientMessage::SearchFiles {
+            request_id,
+            path,
+            pattern,
+            content_pattern,
+            max_depth,
+            max_results,
+        } => {
+            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+                send_fs_error(
+                    tx,
+                    request_id,
+                    "search_files",
+                    &path,
+                    FileSystemError::RateLimited { retry_after_ms },
+                )
+                .await?;
+                return Ok(());
+            }
+            let fs = { state.read().await.file_system.clone() };
+            let max_results = max_results.unwrap_or(fs.config().max_search_results);
+            match fs
+                .search()
+                .search_files(&path, &pattern, content_pattern.as_deref(), max_depth, max_results)
+                .await
+            {
+                Ok((root, matches, truncated)) => {
+                    let msg = ServerMessage::SearchResults {
+                        request_id,
+                        query: pattern,
+                        path: root,
+                        matches,
+                        truncated,
+                    };
+                    tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                }
+                Err(e) => {
+                    send_fs_error(tx, request_id, "search_files", &path, e).await?;
+                }
+            }
+        }
+        ClientMessage::WatchDirectory { request_id, path } => {
+            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+                send_fs_error(
+                    tx,
+                    request_id,
+                    "watch_directory",
+                    &path,
+                    FileSystemError::RateLimited { retry_after_ms },
+                )
+                .await?;
+                return Ok(());
+            }
+            let fs = { state.read().await.file_system.clone() };
+            match fs.validator().validate_existing(&path) {
+                Ok(canonical) => {
+                    if !canonical.is_dir() {
+                        send_fs_error(
+                            tx,
+                            request_id,
+                            "watch_directory",
+                            &path,
+                            FileSystemError::NotADirectory {
+                                path: canonical.display().to_string(),
+                            },
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+
+                    let watch_path = canonical.display().to_string();
+                    let should_watch = {
+                        let mut st = state.write().await;
+                        let entry = st.file_watch_subscriptions.entry(addr).or_default();
+                        if entry.insert(watch_path.clone()) {
+                            let count = st.file_watch_counts.entry(watch_path.clone()).or_insert(0);
+                            *count += 1;
+                            *count == 1
+                        } else {
+                            false
+                        }
+                    };
+
+                    if should_watch {
+                        if let Err(e) = fs.watcher().watch(&watch_path) {
+                            send_fs_error(tx, request_id, "watch_directory", &path, e).await?;
+                            return Ok(());
+                        }
+                    }
+
+                    let msg = ServerMessage::OperationSuccess {
+                        request_id,
+                        operation: "watch_directory".to_string(),
+                        path: watch_path,
+                        message: None,
+                    };
+                    tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                }
+                Err(e) => {
+                    send_fs_error(tx, request_id, "watch_directory", &path, e).await?;
+                }
+            }
+        }
+        ClientMessage::UnwatchDirectory { request_id, path } => {
+            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+                send_fs_error(
+                    tx,
+                    request_id,
+                    "unwatch_directory",
+                    &path,
+                    FileSystemError::RateLimited { retry_after_ms },
+                )
+                .await?;
+                return Ok(());
+            }
+            let fs = { state.read().await.file_system.clone() };
+            let watch_path = match fs.validator().validate_existing(&path) {
+                Ok(canonical) => canonical.display().to_string(),
+                Err(_) => path.clone(),
+            };
+
+            let should_unwatch = {
+                let mut st = state.write().await;
+                let entry = st.file_watch_subscriptions.entry(addr).or_default();
+                let removed = entry.remove(&watch_path);
+                if removed {
+                    if let Some(count) = st.file_watch_counts.get_mut(&watch_path) {
+                        if *count > 0 {
+                            *count -= 1;
+                        }
+                        if *count == 0 {
+                            st.file_watch_counts.remove(&watch_path);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+
+            if should_unwatch {
+                let _ = fs.watcher().unwatch(&watch_path);
+            }
+
+            let msg = ServerMessage::OperationSuccess {
+                request_id,
+                operation: "unwatch_directory".to_string(),
+                path: watch_path,
+                message: None,
+            };
+            tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+        }
+        ClientMessage::GetHomeDirectory { request_id } => {
+            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+                send_fs_error(
+                    tx,
+                    request_id,
+                    "get_home_directory",
+                    "",
+                    FileSystemError::RateLimited { retry_after_ms },
+                )
+                .await?;
+                return Ok(());
+            }
+            let fs = { state.read().await.file_system.clone() };
+            let home = dirs_next::home_dir().or_else(|| fs.config().allowed_roots.first().cloned());
+            if let Some(path) = home {
+                let msg = ServerMessage::HomeDirectory {
+                    request_id,
+                    path: path.display().to_string(),
+                };
+                tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+            } else {
+                send_fs_error(
+                    tx,
+                    request_id,
+                    "get_home_directory",
+                    "",
+                    FileSystemError::NotFound {
+                        path: "home".to_string(),
+                    },
+                )
+                .await?;
+            }
+        }
+        ClientMessage::GetAllowedRoots { request_id } => {
+            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+                send_fs_error(
+                    tx,
+                    request_id,
+                    "get_allowed_roots",
+                    "",
+                    FileSystemError::RateLimited { retry_after_ms },
+                )
+                .await?;
+                return Ok(());
+            }
+            let fs = { state.read().await.file_system.clone() };
+            let roots = fs
+                .config()
+                .allowed_roots
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            let msg = ServerMessage::AllowedRoots { request_id, roots };
+            tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+        }
     }
     Ok(())
+}
+
+async fn send_fs_error(
+    tx: &mut futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<TcpStream>,
+        Message,
+    >,
+    request_id: String,
+    operation: &str,
+    path: &str,
+    error: FileSystemError,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let msg = ServerMessage::OperationError {
+        request_id,
+        operation: operation.to_string(),
+        path: path.to_string(),
+        error,
+    };
+    tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+    Ok(())
+}
+
+async fn check_fs_rate_limit(state: &SharedState, addr: SocketAddr) -> Result<(), u64> {
+    const REQUESTS_PER_SECOND: u32 = 100;
+    const BURST_SIZE: u32 = 50;
+    let mut st = state.write().await;
+    let limiter = st
+        .file_rate_limiters
+        .entry(addr)
+        .or_insert_with(|| RateLimiter::new(REQUESTS_PER_SECOND, BURST_SIZE));
+    limiter.allow()
 }
 
 /// Send sessions list to a client
@@ -1402,31 +2044,72 @@ fn build_notification_text(
     (title_with_session, body)
 }
 
-async fn cleanup_mobile_views(state: &SharedState, addr: SocketAddr) {
-    let sessions_to_restore = {
+async fn cleanup_client_state(state: &SharedState, addr: SocketAddr) {
+    let (sessions_to_restore, to_unwatch) = {
         let mut st = state.write().await;
-        let sessions = match st.mobile_views.remove(&addr) {
-            Some(s) => s,
-            None => return,
-        };
-        let mut restore = Vec::new();
-        for session_id in sessions {
-            if let Some(count) = st.session_view_counts.get_mut(&session_id) {
-                if *count > 0 {
-                    *count -= 1;
+
+        let sessions_to_restore = match st.mobile_views.remove(&addr) {
+            Some(sessions) => {
+                let mut restore = Vec::new();
+                for session_id in sessions {
+                    if let Some(count) = st.session_view_counts.get_mut(&session_id) {
+                        if *count > 0 {
+                            *count -= 1;
+                        }
+                        if *count == 0 {
+                            st.session_view_counts.remove(&session_id);
+                            restore.push(session_id);
+                        }
+                    }
                 }
-                if *count == 0 {
-                    st.session_view_counts.remove(&session_id);
-                    restore.push(session_id);
-                }
+                restore
             }
-        }
-        restore
+            None => Vec::new(),
+        };
+
+        let to_unwatch = match st.file_watch_subscriptions.remove(&addr) {
+            Some(paths) => {
+                let mut to_unwatch = Vec::new();
+                for path in paths {
+                    if let Some(count) = st.file_watch_counts.get_mut(&path) {
+                        if *count > 0 {
+                            *count -= 1;
+                        }
+                        if *count == 0 {
+                            st.file_watch_counts.remove(&path);
+                            to_unwatch.push(path);
+                        }
+                    }
+                }
+                to_unwatch
+            }
+            None => Vec::new(),
+        };
+
+        (sessions_to_restore, to_unwatch)
     };
+
+    let fs = { state.read().await.file_system.clone() };
+    for path in to_unwatch {
+        let _ = fs.watcher().unwatch(&path);
+    }
 
     for session_id in sessions_to_restore {
         restore_pty_size(state, &session_id).await;
     }
+}
+
+fn is_path_watched(changed_path: &str, watched: &std::collections::HashSet<String>) -> bool {
+    if watched.contains(changed_path) {
+        return true;
+    }
+    let parent = std::path::Path::new(changed_path)
+        .parent()
+        .map(|p| p.display().to_string());
+    if let Some(parent) = parent {
+        return watched.contains(&parent);
+    }
+    false
 }
 
 async fn restore_pty_size(state: &SharedState, session_id: &str) {

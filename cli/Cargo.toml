@@ -46,6 +46,18 @@ local-ip-address = "0.6"
 base64 = "0.22"
 rand = "0.8"
 strip-ansi-escapes = "0.2"
+walkdir = "2.5"
+ignore = "0.4"
+notify = "6.1"
+notify-debouncer-mini = "0.4"
+path_jail = "0.3"
+infer = "0.15"
+memmap2 = "0.9"
+dashmap = "5.5"
+rayon = "1.10"
+md5 = "0.7"
+glob-match = "0.2"
+glob = "0.3"
 
 # Terminal colors
 colored = "2"
@@ -78,3 +90,6 @@ libc = "0.2"
 lto = true
 codegen-units = 1
 strip = true
+
+[dev-dependencies]
+tempfile = "3"

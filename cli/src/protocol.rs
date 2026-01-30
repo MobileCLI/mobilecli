@@ -68,6 +68,96 @@ pub enum ClientMessage {
         #[serde(default)]
         working_dir: Option<String>,
     },
+    // ---- File system requests ----
+    ListDirectory {
+        request_id: String,
+        path: String,
+        #[serde(default)]
+        include_hidden: bool,
+        #[serde(default)]
+        sort_by: Option<SortField>,
+        #[serde(default)]
+        sort_order: Option<SortOrder>,
+    },
+    ReadFile {
+        request_id: String,
+        path: String,
+        #[serde(default)]
+        offset: Option<u64>,
+        #[serde(default)]
+        length: Option<u64>,
+        #[serde(default)]
+        encoding: FileEncoding,
+    },
+    WriteFile {
+        request_id: String,
+        path: String,
+        content: String,
+        #[serde(default)]
+        encoding: FileEncoding,
+        #[serde(default)]
+        create_parents: bool,
+    },
+    CreateDirectory {
+        request_id: String,
+        path: String,
+        #[serde(default)]
+        recursive: bool,
+    },
+    DeletePath {
+        request_id: String,
+        path: String,
+        #[serde(default)]
+        recursive: bool,
+    },
+    RenamePath {
+        request_id: String,
+        old_path: String,
+        new_path: String,
+    },
+    CopyPath {
+        request_id: String,
+        source: String,
+        destination: String,
+        #[serde(default)]
+        recursive: bool,
+    },
+    GetFileInfo {
+        request_id: String,
+        path: String,
+    },
+    SearchFiles {
+        request_id: String,
+        path: String,
+        pattern: String,
+        #[serde(default)]
+        content_pattern: Option<String>,
+        #[serde(default)]
+        max_depth: Option<u32>,
+        #[serde(default)]
+        max_results: Option<u32>,
+    },
+    WatchDirectory {
+        request_id: String,
+        path: String,
+    },
+    UnwatchDirectory {
+        request_id: String,
+        path: String,
+    },
+    GetHomeDirectory {
+        request_id: String,
+    },
+    GetAllowedRoots {
+        request_id: String,
+    },
+    ReadFileChunk {
+        request_id: String,
+        path: String,
+        chunk_index: u64,
+        #[serde(default)]
+        chunk_size: Option<u64>,
+    },
 }
 
 /// Messages sent from server to mobile client
@@ -148,6 +238,74 @@ pub enum ServerMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    // ---- File system responses ----
+    DirectoryListing {
+        request_id: String,
+        path: String,
+        entries: Vec<FileEntry>,
+        total_count: usize,
+        truncated: bool,
+    },
+    FileContent {
+        request_id: String,
+        path: String,
+        content: String,
+        encoding: FileEncoding,
+        mime_type: String,
+        size: u64,
+        modified: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        truncated_at: Option<u64>,
+    },
+    FileInfo {
+        request_id: String,
+        path: String,
+        entry: FileEntry,
+    },
+    OperationSuccess {
+        request_id: String,
+        operation: String,
+        path: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
+    OperationError {
+        request_id: String,
+        operation: String,
+        path: String,
+        error: FileSystemError,
+    },
+    SearchResults {
+        request_id: String,
+        query: String,
+        path: String,
+        matches: Vec<SearchMatch>,
+        truncated: bool,
+    },
+    FileChanged {
+        path: String,
+        change_type: ChangeType,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        new_entry: Option<FileEntry>,
+    },
+    HomeDirectory {
+        request_id: String,
+        path: String,
+    },
+    AllowedRoots {
+        request_id: String,
+        roots: Vec<String>,
+    },
+    FileChunk {
+        request_id: String,
+        path: String,
+        chunk_index: u64,
+        total_chunks: u64,
+        total_size: u64,
+        data: String,
+        checksum: String,
+        is_last: bool,
+    },
 }
 
 /// Session list item for GetSessions response
@@ -161,6 +319,127 @@ pub struct SessionListItem {
     pub started_at: String,
     /// Explicit CLI type identifier for mobile app disambiguation
     pub cli_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortField {
+    Name,
+    Size,
+    Modified,
+    Type,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortOrder {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileEncoding {
+    Utf8,
+    Base64,
+}
+
+impl Default for FileEncoding {
+    fn default() -> Self {
+        FileEncoding::Utf8
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileEntry {
+    pub name: String,
+    pub path: String,
+    pub is_directory: bool,
+    pub is_symlink: bool,
+    pub is_hidden: bool,
+    pub size: u64,
+    pub modified: u64, // Unix timestamp ms
+    pub created: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symlink_target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_status: Option<GitStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileContent {
+    pub path: String,
+    pub content: String,
+    pub encoding: FileEncoding,
+    pub mime_type: String,
+    pub size: u64,
+    pub modified: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitStatus {
+    Modified,
+    Added,
+    Deleted,
+    Untracked,
+    Ignored,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchMatch {
+    pub path: String,
+    pub entry: FileEntry,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_matches: Option<Vec<ContentMatch>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentMatch {
+    pub line_number: u32,
+    pub line_content: String,
+    pub match_start: u32,
+    pub match_end: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileChanged {
+    pub path: String,
+    pub change_type: ChangeType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_entry: Option<FileEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeType {
+    Created,
+    Modified,
+    Deleted,
+    Renamed { from: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileSystemError {
+    NotFound { path: String },
+    PermissionDenied { path: String, reason: String },
+    PathTraversal { attempted_path: String },
+    NotADirectory { path: String },
+    NotAFile { path: String },
+    AlreadyExists { path: String },
+    NotEmpty { path: String },
+    FileTooLarge { path: String, size: u64, max_size: u64 },
+    IoError { message: String },
+    InvalidEncoding { path: String },
+    OperationCancelled,
+    RateLimited { retry_after_ms: u64 },
 }
 
 /// Connection info for QR code / pairing
