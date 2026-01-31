@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use dashmap::{DashMap, DashSet};
-use notify::{RecursiveMode, Watcher};
+use notify::RecursiveMode;
 use notify_debouncer_mini::{new_debouncer, DebouncedEvent, DebouncedEventKind, Debouncer};
 use tokio::sync::broadcast;
 
@@ -47,7 +47,7 @@ impl FileWatcher {
 
         let mut debouncer = new_debouncer(
             std::time::Duration::from_millis(self.debounce_ms),
-            move |res: Result<Vec<DebouncedEvent>, Vec<notify::Error>>| {
+            move |res: Result<Vec<DebouncedEvent>, notify::Error>| {
                 if let Ok(events) = res {
                     for event in events {
                         let change = classify_event(&event, &known_paths);
@@ -79,25 +79,31 @@ impl FileWatcher {
 
 fn classify_event(event: &DebouncedEvent, known_paths: &DashSet<String>) -> FileChanged {
     let path = event.path.display().to_string();
+    let exists = event.path.exists();
     let change_type = match event.kind {
         DebouncedEventKind::Any | DebouncedEventKind::AnyContinuous => {
-            if event.path.exists() {
-                if !known_paths.contains(&path) {
-                    known_paths.insert(path.clone());
-                    ChangeType::Created
-                } else {
-                    ChangeType::Modified
-                }
-            } else {
-                known_paths.remove(&path);
-                ChangeType::Deleted
-            }
+            classify_known_path(&path, exists, known_paths)
         }
+        _ => classify_known_path(&path, exists, known_paths),
     };
 
     FileChanged {
         path,
         change_type,
         new_entry: None,
+    }
+}
+
+fn classify_known_path(path: &str, exists: bool, known_paths: &DashSet<String>) -> ChangeType {
+    if exists {
+        if !known_paths.contains(path) {
+            known_paths.insert(path.to_string());
+            ChangeType::Created
+        } else {
+            ChangeType::Modified
+        }
+    } else {
+        known_paths.remove(path);
+        ChangeType::Deleted
     }
 }

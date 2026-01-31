@@ -662,41 +662,45 @@ fn extension_of(name: &str) -> String {
 }
 
 async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), FileSystemError> {
-    fs::create_dir_all(dst)
-        .await
-        .map_err(|e| FileSystemError::IoError {
-            message: e.to_string(),
-        })?;
+    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
 
-    let mut read_dir = fs::read_dir(src)
-        .await
-        .map_err(|e| FileSystemError::IoError {
-            message: e.to_string(),
-        })?;
-
-    while let Some(entry) = read_dir
-        .next_entry()
-        .await
-        .map_err(|e| FileSystemError::IoError {
-            message: e.to_string(),
-        })?
-    {
-        let entry_path = entry.path();
-        let dest_path = dst.join(entry.file_name());
-        let meta = entry
-            .metadata()
+    while let Some((current_src, current_dst)) = stack.pop() {
+        fs::create_dir_all(&current_dst)
             .await
             .map_err(|e| FileSystemError::IoError {
                 message: e.to_string(),
             })?;
-        if meta.is_dir() {
-            copy_dir_recursive(&entry_path, &dest_path).await?;
-        } else {
-            fs::copy(&entry_path, &dest_path)
+
+        let mut read_dir = fs::read_dir(&current_src)
+            .await
+            .map_err(|e| FileSystemError::IoError {
+                message: e.to_string(),
+            })?;
+
+        while let Some(entry) = read_dir
+            .next_entry()
+            .await
+            .map_err(|e| FileSystemError::IoError {
+                message: e.to_string(),
+            })?
+        {
+            let entry_path = entry.path();
+            let dest_path = current_dst.join(entry.file_name());
+            let meta = entry
+                .metadata()
                 .await
                 .map_err(|e| FileSystemError::IoError {
                     message: e.to_string(),
                 })?;
+            if meta.is_dir() {
+                stack.push((entry_path, dest_path));
+            } else {
+                fs::copy(&entry_path, &dest_path)
+                    .await
+                    .map_err(|e| FileSystemError::IoError {
+                        message: e.to_string(),
+                    })?;
+            }
         }
     }
 
