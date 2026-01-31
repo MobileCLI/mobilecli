@@ -1,7 +1,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use glob_match::glob_match;
-use path_jail::PathJail;
+use path_jail::Jail;
 
 use crate::protocol::FileSystemError;
 
@@ -10,7 +10,7 @@ use super::config::FileSystemConfig;
 /// Validates and sanitizes paths before any file operation
 pub struct PathValidator {
     config: std::sync::Arc<FileSystemConfig>,
-    jails: Vec<PathJail>,
+    jails: Vec<Jail>,
     symlink_cache: std::sync::Mutex<std::collections::HashMap<PathBuf, bool>>,
 }
 
@@ -19,7 +19,7 @@ impl PathValidator {
         let jails = config
             .allowed_roots
             .iter()
-            .filter_map(|root| PathJail::new(root).ok())
+            .filter_map(|root| Jail::new(root).ok())
             .collect();
         Self {
             config,
@@ -128,10 +128,7 @@ impl PathValidator {
     }
 
     fn ensure_allowed(&self, path: &Path) -> Result<(), FileSystemError> {
-        let is_allowed = self
-            .jails
-            .iter()
-            .any(|jail| jail.contains(path).unwrap_or(false));
+        let is_allowed = self.jails.iter().any(|jail| jail.contains(path).is_ok());
 
         if !is_allowed {
             return Err(FileSystemError::PermissionDenied {
@@ -192,4 +189,3 @@ fn normalize_for_match(path: &Path) -> String {
 fn find_existing_ancestor(path: &Path) -> Option<PathBuf> {
     path.ancestors().find(|p| p.exists()).map(|p| p.to_path_buf())
 }
-
