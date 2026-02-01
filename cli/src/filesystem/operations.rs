@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -297,6 +297,9 @@ impl FileOperations {
             });
         }
 
+        // Ensure no parent component is a file (prevents ENOTDIR later).
+        path_utils::validate_parent_components(path.parent().unwrap_or(&path)).await?;
+
         if path.exists() && path.is_dir() {
             return Err(FileSystemError::NotAFile {
                 path: path.display().to_string(),
@@ -325,9 +328,7 @@ impl FileOperations {
         let temp_path = sibling_with_suffix(&path, &format!("tmp-{}", uuid::Uuid::new_v4()));
 
         if let Err(e) = fs::write(&temp_path, &bytes).await {
-            return Err(FileSystemError::IoError {
-                message: e.to_string(),
-            });
+            return Err(map_not_a_directory_error(&path, e));
         }
 
         let mut backup_path = None;
@@ -336,8 +337,12 @@ impl FileOperations {
             let _ = fs::remove_file(&backup).await;
             if let Err(e) = fs::rename(&path, &backup).await {
                 let _ = fs::remove_file(&temp_path).await;
-                return Err(FileSystemError::IoError {
-                    message: format!("Failed to backup existing file: {}", e),
+                let mapped = map_not_a_directory_error(&path, e);
+                return Err(match mapped {
+                    FileSystemError::IoError { message } => FileSystemError::IoError {
+                        message: format!("Failed to backup existing file: {}", message),
+                    },
+                    other => other,
                 });
             }
             backup_path = Some(backup);
@@ -363,12 +368,18 @@ impl FileOperations {
                 }
             }
             let _ = fs::remove_file(&temp_path).await;
-            let message = if let Some(restore_error) = restore_error {
-                format!("Failed to replace file: {}; {}", e, restore_error)
-            } else {
-                e.to_string()
-            };
-            return Err(FileSystemError::IoError { message });
+            let mapped = map_not_a_directory_error(&path, e);
+            return Err(match mapped {
+                FileSystemError::IoError { message } => {
+                    let message = if let Some(restore_error) = restore_error {
+                        format!("Failed to replace file: {}; {}", message, restore_error)
+                    } else {
+                        message
+                    };
+                    FileSystemError::IoError { message }
+                }
+                other => other,
+            });
         }
 
         if let Some(backup) = backup_path {
@@ -640,6 +651,32 @@ fn sibling_with_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
     file_name.push(".");
     file_name.push(suffix);
     path.with_file_name(file_name)
+}
+
+fn map_not_a_directory_error(path: &Path, error: std::io::Error) -> FileSystemError {
+    if let Some(20) = error.raw_os_error() {
+        if let Some(parent) = path.parent() {
+            if let Some(err) = find_not_a_directory(parent) {
+                return err;
+            }
+        }
+    }
+    FileSystemError::IoError {
+        message: error.to_string(),
+    }
+}
+
+fn find_not_a_directory(path: &Path) -> Option<FileSystemError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        if current.exists() && current.is_file() {
+            return Some(FileSystemError::NotADirectory {
+                path: current.display().to_string(),
+            });
+        }
+    }
+    None
 }
 
 fn sort_entries(entries: &mut [FileEntry], sort_by: Option<SortField>, sort_order: Option<SortOrder>) {
