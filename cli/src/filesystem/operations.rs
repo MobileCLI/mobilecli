@@ -11,6 +11,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
 use super::config::FileSystemConfig;
 use super::mime;
+use super::path_utils;
 use super::platform;
 use super::security::PathValidator;
 
@@ -318,13 +319,7 @@ impl FileOperations {
         }
 
         if create_parents {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)
-                    .await
-                    .map_err(|e| FileSystemError::IoError {
-                        message: e.to_string(),
-                    })?;
-            }
+            path_utils::create_parent_dirs_safe(&path).await?;
         }
 
         let temp_path = sibling_with_suffix(&path, &format!("tmp-{}", uuid::Uuid::new_v4()));
@@ -394,12 +389,32 @@ impl FileOperations {
         }
 
         if recursive {
+            // Use our safe function that checks for files in the path
+            path_utils::validate_parent_components(&path).await?;
             fs::create_dir_all(&path)
                 .await
-                .map_err(|e| FileSystemError::IoError {
-                    message: e.to_string(),
+                .map_err(|e| {
+                    // Check if error is ENOTDIR (error 20)
+                    if let Some(20) = e.raw_os_error() {
+                        // Find which component is the file
+                        let mut current = std::path::PathBuf::new();
+                        for component in path.components() {
+                            current.push(component);
+                            if current.exists() && current.is_file() {
+                                return FileSystemError::NotADirectory {
+                                    path: current.display().to_string(),
+                                };
+                            }
+                        }
+                    }
+                    FileSystemError::IoError {
+                        message: e.to_string(),
+                    }
                 })?;
         } else {
+            if let Some(parent) = path.parent() {
+                path_utils::validate_parent_components(parent).await?;
+            }
             fs::create_dir(&path)
                 .await
                 .map_err(|e| FileSystemError::IoError {
@@ -665,10 +680,26 @@ async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), FileSystemErro
     let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
 
     while let Some((current_src, current_dst)) = stack.pop() {
+        // Check parent paths for files before creating directories
+        super::path_utils::create_parent_dirs_safe(&current_dst).await?;
         fs::create_dir_all(&current_dst)
             .await
-            .map_err(|e| FileSystemError::IoError {
-                message: e.to_string(),
+            .map_err(|e| {
+                if let Some(20) = e.raw_os_error() {
+                    // ENOTDIR error - a path component is a file
+                    let mut current = std::path::PathBuf::new();
+                    for component in current_dst.components() {
+                        current.push(component);
+                        if current.exists() && current.is_file() {
+                            return FileSystemError::NotADirectory {
+                                path: current.display().to_string(),
+                            };
+                        }
+                    }
+                }
+                FileSystemError::IoError {
+                    message: e.to_string(),
+                }
             })?;
 
         let mut read_dir = fs::read_dir(&current_src)

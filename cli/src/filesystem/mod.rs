@@ -4,6 +4,7 @@ pub mod config;
 pub mod git;
 pub mod mime;
 pub mod operations;
+pub mod path_utils;
 pub mod platform;
 pub mod rate_limit;
 pub mod search;
