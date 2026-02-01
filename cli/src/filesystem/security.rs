@@ -71,6 +71,17 @@ impl PathValidator {
             attempted_path: path.display().to_string(),
         })?;
 
+        // Check if any component in the parent path exists as a file when it should be a directory
+        let mut current = PathBuf::new();
+        for component in parent.components() {
+            current.push(component);
+            if current.exists() && current.is_file() {
+                return Err(FileSystemError::NotADirectory {
+                    path: current.display().to_string(),
+                });
+            }
+        }
+
         if !allow_missing_parents && !parent.exists() {
             return Err(FileSystemError::NotFound {
                 path: parent.display().to_string(),

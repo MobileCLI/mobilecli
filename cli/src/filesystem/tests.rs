@@ -65,3 +65,38 @@ async fn test_list_directory_sorts_directories_first() {
     assert!(entries[1].is_directory);
     assert!(!entries[2].is_directory);
 }
+
+#[tokio::test]
+async fn test_write_file_fails_when_parent_is_file() {
+    let temp = TempDir::new().unwrap();
+    let config = Arc::new(FileSystemConfig {
+        allowed_roots: vec![temp.path().to_path_buf()],
+        ..Default::default()
+    });
+    let validator = Arc::new(PathValidator::new(config.clone()));
+    let ops = FileOperations::new(validator, config);
+
+    // Create a file
+    let file_path = temp.path().join("existing_file.txt");
+    std::fs::write(&file_path, "content").unwrap();
+
+    // Try to write a file with the existing file in the parent path
+    let invalid_path = file_path.join("should_fail.txt");
+    let result = ops
+        .write_file(
+            &invalid_path.to_string_lossy(),
+            "test content",
+            crate::protocol::FileEncoding::Utf8,
+            true, // create_parents = true
+        )
+        .await;
+
+    // Should fail with NotADirectory error
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        crate::protocol::FileSystemError::NotADirectory { path } => {
+            assert_eq!(path, file_path.to_string_lossy());
+        }
+        e => panic!("Expected NotADirectory error, got: {:?}", e),
+    }
+}
