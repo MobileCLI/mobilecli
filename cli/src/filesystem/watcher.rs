@@ -5,6 +5,7 @@ use notify::RecursiveMode;
 use notify_debouncer_mini::{new_debouncer, DebouncedEvent, DebouncedEventKind, Debouncer};
 use tokio::sync::broadcast;
 
+use crate::filesystem::path_utils;
 use crate::protocol::{ChangeType, FileChanged, FileSystemError};
 
 pub struct FileWatcher {
@@ -38,10 +39,10 @@ impl FileWatcher {
         let event_tx = self.event_tx.clone();
         let known_paths = self.known_paths.clone();
 
-        known_paths.insert(path_buf.display().to_string());
+        known_paths.insert(path_utils::to_protocol_path(&path_buf));
         if let Ok(entries) = std::fs::read_dir(&path_buf) {
             for entry in entries.flatten() {
-                known_paths.insert(entry.path().display().to_string());
+                known_paths.insert(path_utils::to_protocol_path(&entry.path()));
             }
         }
 
@@ -78,7 +79,7 @@ impl FileWatcher {
 }
 
 fn classify_event(event: &DebouncedEvent, known_paths: &DashSet<String>) -> FileChanged {
-    let path = event.path.display().to_string();
+    let path = path_utils::to_protocol_path(&event.path);
     let exists = event.path.exists();
     let change_type = match event.kind {
         DebouncedEventKind::Any | DebouncedEventKind::AnyContinuous => {

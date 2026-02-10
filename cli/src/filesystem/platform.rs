@@ -1,33 +1,4 @@
-use std::path::{Path, PathBuf, MAIN_SEPARATOR};
-
-/// Normalize path separators for cross-platform compatibility
-pub fn normalize_path(path: &str) -> PathBuf {
-    let normalized = path.replace('\\', "/");
-    PathBuf::from(normalized)
-}
-
-/// Get path separator for current platform
-pub fn path_separator() -> char {
-    MAIN_SEPARATOR
-}
-
-/// Check if path is absolute (handles both Unix and Windows)
-pub fn is_absolute(path: &str) -> bool {
-    let path = Path::new(path);
-    path.is_absolute()
-        || (cfg!(windows)
-            && (path
-                .to_string_lossy()
-                .chars()
-                .nth(1)
-                == Some(':')
-                || path.to_string_lossy().starts_with("\\\\")))
-}
-
-/// Get home directory cross-platform
-pub fn home_dir() -> Option<PathBuf> {
-    dirs_next::home_dir()
-}
+use std::path::Path;
 
 #[cfg(unix)]
 pub fn is_hidden(path: &Path) -> bool {

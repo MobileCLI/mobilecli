@@ -26,6 +26,10 @@ pub struct Config {
     pub connection_mode: ConnectionMode,
     pub tailscale_ip: Option<String>,
     pub local_ip: Option<String>,
+    /// Shared secret used by the mobile app to authenticate.
+    ///
+    /// Stored locally in `~/.mobilecli/config.json` and embedded into the pairing QR code.
+    pub auth_token: String,
 }
 
 impl Default for Config {
@@ -36,6 +40,7 @@ impl Default for Config {
             connection_mode: ConnectionMode::Local,
             tailscale_ip: None,
             local_ip: None,
+            auth_token: uuid::Uuid::new_v4().to_string(),
         }
     }
 }
@@ -94,7 +99,18 @@ pub fn load_config() -> Option<Config> {
         .map(|s| s.to_string())
         .unwrap_or_else(get_hostname);
 
-    Some(Config {
+    let mut needs_save = false;
+    let auth_token = json
+        .get("auth_token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            needs_save = true;
+            uuid::Uuid::new_v4().to_string()
+        });
+
+    let config = Config {
         device_id,
         device_name,
         connection_mode: mode,
@@ -106,7 +122,14 @@ pub fn load_config() -> Option<Config> {
             .get("local_ip")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
-    })
+        auth_token,
+    };
+
+    if needs_save {
+        let _ = save_config(&config);
+    }
+
+    Some(config)
 }
 
 /// Save configuration
@@ -128,6 +151,7 @@ pub fn save_config(config: &Config) -> io::Result<()> {
         "connection_mode": mode_str,
         "tailscale_ip": config.tailscale_ip,
         "local_ip": config.local_ip,
+        "auth_token": config.auth_token,
     });
 
     std::fs::write(&config_path, serde_json::to_string_pretty(&json)?)?;
@@ -138,7 +162,6 @@ pub fn save_config(config: &Config) -> io::Result<()> {
 #[derive(Debug)]
 pub struct TailscaleStatus {
     pub installed: bool,
-    pub running: bool,
     pub logged_in: bool,
     pub ip: Option<String>,
 }
@@ -150,7 +173,6 @@ pub fn check_tailscale() -> TailscaleStatus {
     if !installed {
         return TailscaleStatus {
             installed: false,
-            running: false,
             logged_in: false,
             ip: None,
         };
@@ -184,14 +206,12 @@ pub fn check_tailscale() -> TailscaleStatus {
 
                 TailscaleStatus {
                     installed: true,
-                    running,
                     logged_in,
                     ip,
                 }
             } else {
                 TailscaleStatus {
                     installed: true,
-                    running: false,
                     logged_in: false,
                     ip: None,
                 }
@@ -199,7 +219,6 @@ pub fn check_tailscale() -> TailscaleStatus {
         }
         _ => TailscaleStatus {
             installed: true,
-            running: false,
             logged_in: false,
             ip: None,
         },
@@ -242,6 +261,7 @@ fn prompt_yn(message: &str, default: bool) -> bool {
 /// User is prompted for confirmation before execution. For additional security,
 /// users can manually install via their package manager or verify the script at
 /// https://tailscale.com/install.sh before running.
+#[cfg(target_os = "linux")]
 fn install_tailscale_linux() -> io::Result<bool> {
     println!();
     println!("{}", "Installing Tailscale...".cyan());
@@ -274,6 +294,7 @@ fn install_tailscale_linux() -> io::Result<bool> {
 }
 
 /// Install Tailscale (macOS)
+#[cfg(target_os = "macos")]
 fn install_tailscale_macos() -> io::Result<bool> {
     println!();
     println!("{}", "Installing Tailscale via Homebrew...".cyan());
@@ -485,7 +506,9 @@ pub fn run_setup_wizard() -> io::Result<Config> {
         3 => {
             // Custom
             println!();
-            let url = prompt("Enter WebSocket URL (e.g., ws://192.168.1.100:9847): ");
+            let url = prompt(
+                "Enter WebSocket URL (e.g., ws://192.168.1.100:9847 or wss://demo.example.com): ",
+            );
             config.connection_mode = ConnectionMode::Custom(url);
         }
         _ => unreachable!(),
@@ -514,58 +537,9 @@ pub fn run_setup_wizard() -> io::Result<Config> {
     );
     println!(
         "Run {} to change these settings.",
-        "mobilecli --setup".dimmed()
+        "mobilecli setup".dimmed()
     );
     println!();
 
     Ok(config)
-}
-
-/// Get the IP to use based on config
-pub fn get_connection_ip(config: &Config) -> Option<String> {
-    match &config.connection_mode {
-        ConnectionMode::Local => config.local_ip.clone().or_else(get_local_ip),
-        ConnectionMode::Tailscale => config.tailscale_ip.clone().or_else(|| {
-            // Try to get Tailscale IP dynamically
-            let status = check_tailscale();
-            status.ip
-        }),
-        ConnectionMode::Custom(url) => {
-            // Extract host from URL, handling schemes and IPv6
-            // Examples: "ws://192.168.1.1:9847", "wss://[::1]:9847", "192.168.1.1"
-            let url = url.trim();
-
-            // Strip scheme if present
-            let without_scheme = url
-                .strip_prefix("ws://")
-                .or_else(|| url.strip_prefix("wss://"))
-                .or_else(|| url.strip_prefix("http://"))
-                .or_else(|| url.strip_prefix("https://"))
-                .unwrap_or(url);
-
-            // Handle IPv6 addresses in brackets [::1]:port
-            if without_scheme.starts_with('[') {
-                // IPv6: find the closing bracket
-                if let Some(bracket_end) = without_scheme.find(']') {
-                    // Return the IPv6 address without brackets
-                    return Some(without_scheme[1..bracket_end].to_string());
-                }
-            }
-
-            // For IPv4 or hostname: split on ':' to remove port, or '/' to remove path
-            let host = without_scheme
-                .split(':')
-                .next()
-                .unwrap_or(without_scheme)
-                .split('/')
-                .next()
-                .unwrap_or(without_scheme);
-
-            if host.is_empty() {
-                None
-            } else {
-                Some(host.to_string())
-            }
-        }
-    }
 }

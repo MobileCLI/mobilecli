@@ -58,7 +58,7 @@ impl Default for FileSystemConfig {
                 "/sbin/**".to_string(),
                 "/System/**".to_string(),
                 "/Library/**".to_string(),
-                "C:\\Windows\\**".to_string(),
+                "C:/Windows/**".to_string(),
             ],
             max_list_entries: 10_000,
             max_search_results: 1_000,

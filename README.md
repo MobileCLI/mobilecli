@@ -72,10 +72,10 @@ cargo install --path .
 ### 2. Run Setup
 
 ```bash
-mobilecli --setup
+mobilecli setup
 ```
 
-This starts the background daemon and displays a QR code for pairing.
+This starts the background daemon and displays a QR code for pairing. (`mobilecli --setup` is an alias.)
 
 ### 3. Install the Mobile App
 
@@ -175,7 +175,8 @@ Config stored in `~/.mobilecli/config.json`:
   "device_name": "MacBook-Pro",    // Display name (hostname by default)
   "connection_mode": "local",      // "local" or "tailscale"
   "local_ip": "192.168.1.100",
-  "tailscale_ip": null
+  "tailscale_ip": null,
+  "auth_token": "uuid-string"      // Pairing token (shared secret)
 }
 ```
 
@@ -201,6 +202,7 @@ The mobile app supports linking multiple computers. Each computer gets a unique 
 1. **Same network?** Ensure phone and computer are on same WiFi
 2. **Firewall?** Allow port 9847 (or check `~/.mobilecli/daemon.port`)
 3. **Daemon running?** Run `mobilecli status` to check
+4. **Re-pair?** Re-scan the QR code (`mobilecli pair`) to refresh the pairing token
 
 ### No push notifications
 

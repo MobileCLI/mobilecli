@@ -1,12 +1,13 @@
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ignore::WalkBuilder;
 
 use crate::protocol::{ContentMatch, FileEntry, FileSystemError, SearchMatch};
 
 use super::operations::FileOperations;
+use super::path_utils;
 
 const MAX_CONTENT_MATCHES_PER_FILE: usize = 20;
 
@@ -29,6 +30,7 @@ impl FileSearch {
         max_results: u32,
     ) -> Result<(String, Vec<SearchMatch>, bool), FileSystemError> {
         let root = self.ops.validator().validate_existing(path)?;
+        let max_read_size = self.ops.config().max_read_size;
 
         let walker = WalkBuilder::new(&root)
             .max_depth(max_depth.map(|d| d as usize))
@@ -69,13 +71,33 @@ impl FileSearch {
                 if !pattern.matches(&name) {
                     return ignore::WalkState::Continue;
                 }
-                if self.ops.validator().is_denied(path) {
+
+                // Validate per-entry to enforce allowlist + denied patterns and prevent following symlinks.
+                let canonical = match self
+                    .ops
+                    .validator()
+                    .validate_existing(path.to_string_lossy().as_ref())
+                {
+                    Ok(p) => p,
+                    Err(_) => return ignore::WalkState::Continue,
+                };
+
+                if self.ops.validator().is_denied(&canonical) {
                     return ignore::WalkState::Continue;
                 }
 
                 let content_matches = if let Some(ref content_pat) = content_pattern {
-                    if path.is_file() {
-                        search_file_content(path, content_pat)
+                    if canonical.is_file() {
+                        if let Ok(meta) = std::fs::metadata(&canonical) {
+                            // Avoid loading huge files into memory during search.
+                            if meta.len() <= max_read_size {
+                                search_file_content(&canonical, content_pat)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
@@ -83,7 +105,7 @@ impl FileSearch {
                     None
                 };
 
-                if let Ok(entry_info) = std::fs::metadata(path) {
+                if let Ok(entry_info) = std::fs::metadata(&canonical) {
                     let mut reserved = false;
                     loop {
                         let current = match_count.load(Ordering::Relaxed);
@@ -91,7 +113,12 @@ impl FileSearch {
                             break;
                         }
                         if match_count
-                            .compare_exchange(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+                            .compare_exchange(
+                                current,
+                                current + 1,
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                            )
                             .is_ok()
                         {
                             reserved = true;
@@ -103,9 +130,9 @@ impl FileSearch {
                         return ignore::WalkState::Quit;
                     }
 
-                    let file_entry = build_file_entry_sync(path, &entry_info, &name);
+                    let file_entry = build_file_entry_sync(&canonical, &entry_info, &name);
                     matches.lock().unwrap().push(SearchMatch {
-                        path: path.display().to_string(),
+                        path: path_utils::to_protocol_path(&canonical),
                         entry: file_entry,
                         content_matches,
                     });
@@ -118,7 +145,7 @@ impl FileSearch {
         let matches = Arc::try_unwrap(matches).unwrap().into_inner().unwrap();
         let truncated = matches.len() >= max_results as usize;
 
-        Ok((root.display().to_string(), matches, truncated))
+        Ok((path_utils::to_protocol_path(&root), matches, truncated))
     }
 }
 
@@ -163,9 +190,9 @@ fn build_file_entry_sync(path: &Path, metadata: &std::fs::Metadata, name: &str) 
 
     FileEntry {
         name: name.to_string(),
-        path: path.display().to_string(),
+        path: path_utils::to_protocol_path(path),
         is_directory,
-        is_symlink: metadata.file_type().is_symlink(),
+        is_symlink: false,
         is_hidden: super::platform::is_hidden(path),
         size,
         modified,
@@ -176,11 +203,7 @@ fn build_file_entry_sync(path: &Path, metadata: &std::fs::Metadata, name: &str) 
             Some(super::mime::guess_mime_from_extension(name))
         },
         permissions: Some(super::platform::format_permissions(metadata)),
-        symlink_target: if metadata.file_type().is_symlink() {
-            std::fs::read_link(path).ok().map(|p| p.display().to_string())
-        } else {
-            None
-        },
+        symlink_target: None,
         git_status: None,
     }
 }

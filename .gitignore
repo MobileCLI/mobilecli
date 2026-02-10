@@ -44,3 +44,18 @@ npm-debug.log*
 # Auth keys
 AuthKey_*.p8
 *.p8
+
+# EAS / store credentials
+mobile/secrets/
+**/google-play-service-account.json
+
+# Tooling / agent artifacts
+.claude/
+.cache/
+.playwright-mcp/
+.research/
+**/CLAUDE.md
+
+# Old experimental copies (keep out of the repo)
+cli/cli/
+cli/mobile/
