@@ -59,3 +59,6 @@ mobile/secrets/
 # Old experimental copies (keep out of the repo)
 cli/cli/
 cli/mobile/
+
+# Private mobile app repo lives in a separate GitHub repository.
+mobile/
