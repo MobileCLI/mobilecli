@@ -26,9 +26,9 @@ pub struct Config {
     pub connection_mode: ConnectionMode,
     pub tailscale_ip: Option<String>,
     pub local_ip: Option<String>,
-    /// Shared secret used by the mobile app to authenticate.
+    /// Optional token embedded into pairing QR metadata.
     ///
-    /// Stored locally in `~/.mobilecli/config.json` and embedded into the pairing QR code.
+    /// Stored locally in `~/.mobilecli/config.json`.
     pub auth_token: String,
 }
 

@@ -9,7 +9,7 @@ Use a VPS + `tmux`, and terminate TLS with `nginx` so the mobile app connects vi
 Notes:
 - MobileCLI daemon speaks plain WebSocket (`ws://`) by default.
 - For review, use `nginx` to provide TLS and proxy to `localhost:9847`.
-- Pairing QR contains an `auth_token`. Re-generate QR after server changes.
+- Pairing QR can include an `auth_token` for convenience, but direct URL entry is also supported.
 - To make the QR encode `wss://`, set a Custom pairing URL in `~/.mobilecli/config.json` (or via setup wizard)
   so `mobilecli setup` prints a `wss=1` QR.
 

@@ -138,7 +138,8 @@ pub struct DaemonState {
     pub device_id: Option<String>,
     /// Device name (hostname)
     pub device_name: Option<String>,
-    /// Shared secret for authenticating mobile clients (from `~/.mobilecli/config.json`).
+    /// Optional pairing token embedded in QR codes (from `~/.mobilecli/config.json`).
+    /// Direct URL/IP connections are allowed without this token.
     pub auth_token: Option<String>,
 }
 
@@ -318,34 +319,39 @@ async fn handle_mobile_client(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!("Mobile client connected: {}", addr);
 
-    // Enforce a pairing token if one is configured.
+    // Pairing token from QR is optional. Direct URL/IP entry should work without QR.
+    // If a token is provided, we log mismatches for diagnostics but do not reject.
     let expected_token = {
         let st = state.read().await;
         st.auth_token.clone()
     }
     .filter(|t| !t.trim().is_empty());
 
-    if let Some(expected) = expected_token.as_deref() {
-        let hello_msg = first_msg
-            .as_deref()
-            .and_then(|text| serde_json::from_str::<ClientMessage>(text).ok());
-        let provided = match hello_msg {
-            Some(ClientMessage::Hello { auth_token, .. }) => auth_token,
-            _ => None,
-        };
+    let hello_msg = first_msg
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<ClientMessage>(text).ok());
+    let provided_token = match hello_msg {
+        Some(ClientMessage::Hello { auth_token, .. }) => auth_token,
+        _ => None,
+    };
 
-        if provided.as_deref() != Some(expected) {
-            tracing::warn!("Mobile client authentication failed: {}", addr);
-            let msg = ServerMessage::Error {
-                code: "auth_required".to_string(),
-                message:
-                    "Invalid or missing auth token. Re-scan the pairing QR code from the CLI setup."
-                        .to_string(),
-            };
-            // Best-effort response; then close.
-            let _ = tx.send(Message::Text(serde_json::to_string(&msg)?)).await;
-            let _ = tx.send(Message::Close(None)).await;
-            return Ok(());
+    if let Some(expected) = expected_token.as_deref() {
+        match provided_token.as_deref() {
+            Some(provided) if provided != expected => {
+                tracing::warn!(
+                    "Mobile client provided mismatched pairing token: {} (allowing direct connection)",
+                    addr
+                );
+            }
+            Some(_) => {
+                tracing::debug!("Mobile client provided matching pairing token: {}", addr);
+            }
+            None => {
+                tracing::debug!(
+                    "Mobile client connected without pairing token: {} (direct/manual connect)",
+                    addr
+                );
+            }
         }
     }
 

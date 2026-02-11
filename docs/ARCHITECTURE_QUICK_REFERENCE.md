@@ -81,7 +81,7 @@ mobile/
 
 ## Security Model
 
-- **Pairing Token**: A per-device `auth_token` is generated during setup and embedded in the pairing QR code. The mobile app sends it in the initial `hello` message.
+- **Pairing Token (Optional)**: A per-device `auth_token` is generated during setup and embedded in the pairing QR code for convenience.
 - **Device IDs**: UUID per computer (for multi-device support / display)
 - **Network Options**: 
   - Local WiFi (192.168.x.x)

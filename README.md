@@ -176,7 +176,7 @@ Config stored in `~/.mobilecli/config.json`:
   "connection_mode": "local",      // "local" or "tailscale"
   "local_ip": "192.168.1.100",
   "tailscale_ip": null,
-  "auth_token": "uuid-string"      // Pairing token (shared secret)
+  "auth_token": "uuid-string"      // Optional QR pairing token
 }
 ```
 
@@ -202,7 +202,7 @@ The mobile app supports linking multiple computers. Each computer gets a unique 
 1. **Same network?** Ensure phone and computer are on same WiFi
 2. **Firewall?** Allow port 9847 (or check `~/.mobilecli/daemon.port`)
 3. **Daemon running?** Run `mobilecli status` to check
-4. **Re-pair?** Re-scan the QR code (`mobilecli pair`) to refresh the pairing token
+4. **Pairing metadata (optional):** Re-scan the QR code (`mobilecli pair`) to refresh saved device details
 
 ### No push notifications
 

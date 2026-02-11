@@ -477,9 +477,10 @@ pub struct ConnectionInfo {
     pub session_name: Option<String>,
     /// Optional encryption key (base64)
     pub encryption_key: Option<String>,
-    /// Optional auth token used to authenticate the mobile app.
+    /// Optional auth token included in pairing QR metadata.
     ///
-    /// This is only distributed via the pairing QR code and stored locally on-device.
+    /// This can be stored on-device for convenience, but direct URL/IP connections
+    /// are also supported without a token.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
     /// Server version
