@@ -102,6 +102,30 @@ async fn test_write_file_fails_when_parent_is_file() {
 }
 
 #[tokio::test]
+async fn test_write_file_overwrite_existing_file_succeeds() {
+    let temp = TempDir::new().unwrap();
+    let config = Arc::new(FileSystemConfig {
+        allowed_roots: vec![temp.path().to_path_buf()],
+        ..Default::default()
+    });
+    let validator = Arc::new(PathValidator::new(config.clone()));
+    let ops = FileOperations::new(validator, config);
+
+    let file_path = temp.path().join("overwrite.txt");
+    let path = file_path.to_string_lossy().to_string();
+
+    ops.write_file(&path, "first", crate::protocol::FileEncoding::Utf8, true)
+        .await
+        .unwrap();
+    ops.write_file(&path, "second", crate::protocol::FileEncoding::Utf8, true)
+        .await
+        .unwrap();
+
+    let final_content = std::fs::read_to_string(&file_path).unwrap();
+    assert_eq!(final_content, "second");
+}
+
+#[tokio::test]
 async fn test_create_directory_respects_read_only_patterns() {
     let temp = TempDir::new().unwrap();
     let config = Arc::new(FileSystemConfig {

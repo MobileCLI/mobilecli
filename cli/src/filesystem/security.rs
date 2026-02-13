@@ -122,7 +122,14 @@ impl PathValidator {
         let relative = path
             .strip_prefix(&existing_ancestor)
             .unwrap_or_else(|_| Path::new(""));
-        let resolved = canonical_ancestor.join(relative);
+        // When the full target path already exists, `relative` is empty. Joining an empty
+        // segment can append a trailing slash on file paths (`/file/`) which later causes
+        // ENOTDIR on write/rename operations. Keep the canonical path as-is in that case.
+        let resolved = if relative.as_os_str().is_empty() {
+            canonical_ancestor.clone()
+        } else {
+            canonical_ancestor.join(relative)
+        };
 
         self.ensure_not_denied(&resolved)?;
 
