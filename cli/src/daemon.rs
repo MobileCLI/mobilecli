@@ -8,7 +8,9 @@ use crate::detection::{
 };
 use crate::filesystem::{config::FileSystemConfig, rate_limit::RateLimiter, FileSystemService};
 use crate::platform;
-use crate::protocol::{ChangeType, ClientMessage, FileSystemError, ServerMessage, SessionListItem};
+use crate::protocol::{
+    ChangeType, ClientMessage, FileEncoding, FileSystemError, ServerMessage, SessionListItem,
+};
 use crate::session::{self, SessionInfo};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::Utc;
@@ -1506,6 +1508,71 @@ async fn process_client_msg(
                 }
             }
         }
+        ClientMessage::UploadFile {
+            request_id,
+            session_id,
+            file_name,
+            content_base64,
+            mime_type,
+        } => {
+            if let Err(retry_after_ms) = check_fs_rate_limit(state, addr).await {
+                send_fs_error(
+                    tx,
+                    request_id,
+                    "upload_file",
+                    &session_id,
+                    FileSystemError::RateLimited { retry_after_ms },
+                )
+                .await?;
+                return Ok(());
+            }
+
+            let (project_path, fs) = {
+                let st = state.read().await;
+                let Some(session) = st.sessions.get(&session_id) else {
+                    send_fs_error(
+                        tx,
+                        request_id,
+                        "upload_file",
+                        &session_id,
+                        FileSystemError::NotFound {
+                            path: format!("session:{}", session_id),
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                (session.project_path.clone(), st.file_system.clone())
+            };
+
+            let destination =
+                build_upload_destination_path(&project_path, sanitize_upload_file_name(&file_name));
+            let destination_path = crate::filesystem::path_utils::to_protocol_path(&destination);
+
+            match fs
+                .ops()
+                .write_file(
+                    &destination_path,
+                    &content_base64,
+                    FileEncoding::Base64,
+                    true,
+                )
+                .await
+            {
+                Ok(()) => {
+                    let msg = ServerMessage::OperationSuccess {
+                        request_id,
+                        operation: "upload_file".to_string(),
+                        path: destination_path,
+                        message: mime_type,
+                    };
+                    tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                }
+                Err(e) => {
+                    send_fs_error(tx, request_id, "upload_file", &project_path, e).await?;
+                }
+            }
+        }
         ClientMessage::CreateDirectory {
             request_id,
             path,
@@ -1903,6 +1970,45 @@ async fn send_fs_error(
     };
     tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
     Ok(())
+}
+
+fn sanitize_upload_file_name(file_name: &str) -> String {
+    let trimmed = file_name.trim();
+    let candidate = if trimmed.is_empty() {
+        "attachment.bin"
+    } else {
+        trimmed
+    };
+
+    let mut sanitized: String = candidate
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            ch if ch.is_control() => '_',
+            _ => ch,
+        })
+        .collect();
+
+    sanitized = sanitized.trim_matches('.').trim().to_string();
+    if sanitized.is_empty() {
+        return "attachment.bin".to_string();
+    }
+
+    if sanitized.len() > 120 {
+        sanitized.truncate(120);
+    }
+    sanitized
+}
+
+fn build_upload_destination_path(project_path: &str, file_name: String) -> PathBuf {
+    let mut path = PathBuf::from(project_path);
+    path.push(".mobilecli");
+    path.push("uploads");
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let suffix = uuid::Uuid::new_v4().to_string();
+    let short_suffix = &suffix[..8];
+    path.push(format!("{}-{}-{}", stamp, short_suffix, file_name));
+    path
 }
 
 async fn check_fs_rate_limit(state: &SharedState, addr: SocketAddr) -> Result<(), u64> {

@@ -162,6 +162,14 @@ pub enum ClientMessage {
         #[serde(default)]
         chunk_size: Option<u64>,
     },
+    UploadFile {
+        request_id: String,
+        session_id: String,
+        file_name: String,
+        content_base64: String,
+        #[serde(default)]
+        mime_type: Option<String>,
+    },
 }
 
 /// Messages sent from server to mobile client
