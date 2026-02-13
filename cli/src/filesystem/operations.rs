@@ -314,8 +314,14 @@ impl FileOperations {
             });
         }
 
+        // Parent is required by resolve_new_path for write targets.
+        let parent = path
+            .parent()
+            .ok_or_else(|| FileSystemError::PathTraversal {
+                attempted_path: path_utils::to_protocol_path(&path),
+            })?;
         // Ensure no parent component is a file (prevents ENOTDIR later).
-        path_utils::validate_parent_components(path.parent().unwrap_or(&path)).await?;
+        path_utils::validate_parent_components(parent).await?;
 
         if path.exists() && path.is_dir() {
             return Err(FileSystemError::NotAFile {
