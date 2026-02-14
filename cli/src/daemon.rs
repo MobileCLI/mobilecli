@@ -22,7 +22,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, RwLock};
-use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tokio_tungstenite::{
+    accept_async_with_config,
+    tungstenite::{protocol::WebSocketConfig, Message},
+};
 
 /// Shared HTTP client for push notifications (lazy initialized with timeout)
 fn http_client() -> &'static reqwest::Client {
@@ -283,7 +286,14 @@ async fn handle_connection(
     addr: SocketAddr,
     state: SharedState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let ws = accept_async(stream).await?;
+    // Uploads are sent base64-encoded over websocket. Keep headroom above the
+    // 50MB file cap to avoid protocol-level disconnects.
+    let ws_config = WebSocketConfig {
+        max_message_size: Some(96 * 1024 * 1024),
+        max_frame_size: Some(96 * 1024 * 1024),
+        ..Default::default()
+    };
+    let ws = accept_async_with_config(stream, Some(ws_config)).await?;
     let (tx, mut rx) = ws.split();
 
     // Wait for first message to determine client type
@@ -467,8 +477,11 @@ async fn handle_mobile_client(
 
     // Process first message if it was a client message
     if let Some(text) = first_msg {
-        if let Ok(msg) = serde_json::from_str::<ClientMessage>(&text) {
-            process_client_msg(msg, &state, &mut tx, addr).await?;
+        match serde_json::from_str::<ClientMessage>(&text) {
+            Ok(msg) => process_client_msg(msg, &state, &mut tx, addr).await?,
+            Err(e) => {
+                tracing::debug!("Ignoring unparsable client message from {}: {}", addr, e);
+            }
         }
     }
 
@@ -502,8 +515,11 @@ async fn handle_mobile_client(
             result = rx.next() => {
                 match result {
                     Some(Ok(Message::Text(text))) => {
-                        if let Ok(msg) = serde_json::from_str::<ClientMessage>(&text) {
-                            process_client_msg(msg, &state, &mut tx, addr).await?;
+                        match serde_json::from_str::<ClientMessage>(&text) {
+                            Ok(msg) => process_client_msg(msg, &state, &mut tx, addr).await?,
+                            Err(e) => {
+                                tracing::debug!("Ignoring unparsable client message from {}: {}", addr, e);
+                            }
                         }
                     }
                     Some(Ok(Message::Ping(d))) => { let _ = tx.send(Message::Pong(d)).await; }
@@ -1515,6 +1531,12 @@ async fn process_client_msg(
             content_base64,
             mime_type,
         } => {
+            tracing::debug!(
+                "UploadFile request: session_id={}, file_name={}, bytes_base64={}",
+                session_id,
+                file_name,
+                content_base64.len()
+            );
             if let Err(retry_after_ms) = check_fs_rate_limit(state, addr).await {
                 send_fs_error(
                     tx,
@@ -1560,6 +1582,7 @@ async fn process_client_msg(
                 .await
             {
                 Ok(()) => {
+                    tracing::debug!("UploadFile success: {}", destination_path);
                     let msg = ServerMessage::OperationSuccess {
                         request_id,
                         operation: "upload_file".to_string(),
@@ -1569,6 +1592,7 @@ async fn process_client_msg(
                     tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
                 }
                 Err(e) => {
+                    tracing::debug!("UploadFile error for {}: {:?}", project_path, e);
                     send_fs_error(tx, request_id, "upload_file", &project_path, e).await?;
                 }
             }
@@ -1972,6 +1996,17 @@ async fn send_fs_error(
     Ok(())
 }
 
+// Uploads are stored as:
+//   <project>/.mobilecli/uploads/<timestamp>-<short_uuid>-<sanitized_name>
+// and then written atomically via FileOperations::write_file, which appends
+// ".tmp-<uuid>" as a sibling path. Keep the sanitized name short enough that
+// the temp-file component stays under conservative filesystem limits.
+const UPLOAD_COMPONENT_BUDGET_BYTES: usize = 90;
+const UPLOAD_DEST_PREFIX_BYTES: usize = 25; // YYYYMMDD-HHMMSS-XXXXXXXX-
+const UPLOAD_TEMP_SUFFIX_BYTES: usize = 41; // .tmp-<uuid-v4>
+const MAX_UPLOAD_FILE_NAME_BYTES: usize =
+    UPLOAD_COMPONENT_BUDGET_BYTES - UPLOAD_DEST_PREFIX_BYTES - UPLOAD_TEMP_SUFFIX_BYTES;
+
 fn sanitize_upload_file_name(file_name: &str) -> String {
     let trimmed = file_name.trim();
     let candidate = if trimmed.is_empty() {
@@ -1989,15 +2024,88 @@ fn sanitize_upload_file_name(file_name: &str) -> String {
         })
         .collect();
 
+    sanitized = sanitized
+        .split_whitespace()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+
     sanitized = sanitized.trim_matches('.').trim().to_string();
     if sanitized.is_empty() {
         return "attachment.bin".to_string();
     }
 
-    if sanitized.len() > 120 {
-        sanitized.truncate(120);
+    let stem = sanitized
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches([' ', '.']);
+    if is_windows_reserved_device_name(stem) {
+        sanitized.push_str("_file");
+    }
+
+    if sanitized.len() > MAX_UPLOAD_FILE_NAME_BYTES {
+        sanitized = truncate_file_name_preserving_extension(&sanitized, MAX_UPLOAD_FILE_NAME_BYTES);
+        sanitized = sanitized.trim_matches('.').trim().to_string();
+        if sanitized.is_empty() {
+            return "attachment.bin".to_string();
+        }
     }
     sanitized
+}
+
+fn truncate_file_name_preserving_extension(input: &str, max_bytes: usize) -> String {
+    if input.len() <= max_bytes {
+        return input.to_string();
+    }
+
+    let Some((stem, ext)) = input.rsplit_once('.') else {
+        return truncate_utf8_to_max_bytes(input, max_bytes);
+    };
+    if stem.is_empty() || ext.is_empty() {
+        return truncate_utf8_to_max_bytes(input, max_bytes);
+    }
+
+    let ext_with_dot = format!(".{}", ext);
+    if ext_with_dot.len() >= max_bytes {
+        return truncate_utf8_to_max_bytes(input, max_bytes);
+    }
+
+    let stem_budget = max_bytes - ext_with_dot.len();
+    let mut stem_truncated = truncate_utf8_to_max_bytes(stem, stem_budget);
+    stem_truncated = stem_truncated
+        .trim_matches('.')
+        .trim_end_matches(' ')
+        .to_string();
+    if stem_truncated.is_empty() {
+        return truncate_utf8_to_max_bytes(input, max_bytes);
+    }
+
+    format!("{}{}", stem_truncated, ext_with_dot)
+}
+
+fn truncate_utf8_to_max_bytes(input: &str, max_bytes: usize) -> String {
+    let mut out = String::new();
+    for ch in input.chars() {
+        if out.len() + ch.len_utf8() > max_bytes {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn is_windows_reserved_device_name(name: &str) -> bool {
+    let upper = name.trim().to_ascii_uppercase();
+    if matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6"
+            | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5"
+            | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+    ) {
+        return true;
+    }
+    false
 }
 
 fn build_upload_destination_path(project_path: &str, file_name: String) -> PathBuf {
@@ -2351,5 +2459,77 @@ async fn send_push_notifications(tokens: &[PushToken], title: &str, body: &str, 
         Err(e) => {
             tracing::warn!("Failed to send push notification: {}", e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_upload_destination_path, is_windows_reserved_device_name, sanitize_upload_file_name,
+        MAX_UPLOAD_FILE_NAME_BYTES,
+    };
+    use tempfile::TempDir;
+
+    #[test]
+    fn sanitize_upload_file_name_replaces_invalid_chars() {
+        let out = sanitize_upload_file_name(r#" folder/..\bad:name?.txt "#);
+        assert_eq!(out, "folder_.._bad_name_.txt");
+    }
+
+    #[test]
+    fn sanitize_upload_file_name_handles_windows_reserved_names() {
+        assert!(is_windows_reserved_device_name("con"));
+        assert!(is_windows_reserved_device_name("LPT1"));
+        assert!(!is_windows_reserved_device_name("config"));
+
+        let out = sanitize_upload_file_name("con.txt");
+        assert_eq!(out, "con.txt_file");
+    }
+
+    #[test]
+    fn sanitize_upload_file_name_truncates_without_unicode_panic() {
+        let input = "你".repeat(200);
+        let out = sanitize_upload_file_name(&input);
+        assert!(!out.is_empty());
+        assert!(out.len() <= MAX_UPLOAD_FILE_NAME_BYTES);
+    }
+
+    #[test]
+    fn sanitize_upload_file_name_preserves_extension_on_truncate() {
+        let input = format!("{}{}", "a".repeat(200), ".png");
+        let out = sanitize_upload_file_name(&input);
+        assert!(out.ends_with(".png"));
+        assert!(out.len() <= MAX_UPLOAD_FILE_NAME_BYTES);
+    }
+
+    #[test]
+    fn build_upload_destination_path_uses_expected_folder_structure() {
+        let out = build_upload_destination_path("/tmp/project", "image.png".to_string());
+        let components: Vec<String> = out
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().to_string())
+            .collect();
+        assert!(components.contains(&".mobilecli".to_string()));
+        assert!(components.contains(&"uploads".to_string()));
+        let last = components.last().map(String::as_str).unwrap_or_default();
+        assert!(last.ends_with("-image.png"));
+    }
+
+    #[tokio::test]
+    async fn unicode_upload_name_stays_within_filesystem_limits() {
+        let temp = TempDir::new().expect("tempdir");
+        let project = temp.path().join("project");
+        tokio::fs::create_dir_all(&project).await.expect("create project");
+
+        let file_name = sanitize_upload_file_name(&(String::from("你").repeat(160) + ".txt"));
+        assert!(file_name.len() <= MAX_UPLOAD_FILE_NAME_BYTES);
+
+        let path = build_upload_destination_path(&project.to_string_lossy(), file_name);
+        let parent = path.parent().expect("parent").to_path_buf();
+        tokio::fs::create_dir_all(parent).await.expect("create uploads dir");
+
+        tokio::fs::write(&path, b"x")
+            .await
+            .expect("unicode path should be writable");
     }
 }

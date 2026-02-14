@@ -56,6 +56,14 @@ mobile/secrets/
 .research/
 **/CLAUDE.md
 
+# Runtime state (do not commit)
+.mobilecli/
+cli/.mobilecli/
+
+# Local-only side projects in this workspace
+promo-video/
+website/
+
 # Old experimental copies (keep out of the repo)
 cli/cli/
 cli/mobile/

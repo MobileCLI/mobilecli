@@ -12,6 +12,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use colored::Colorize;
 use futures_util::{SinkExt, StreamExt};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use std::borrow::Cow;
 use std::io::{IsTerminal, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -102,6 +103,37 @@ fn request_terminal_resize(cols: u16, rows: u16) {
     let _ = stdout.write_all(seq.as_bytes());
     let _ = stdout.flush();
     set_stdout_winsize(cols, rows);
+}
+
+/// Normalize newline input sequences before writing into the PTY.
+///
+/// Some shells/PTY configurations rely on CR->NL translation (ICRNL). If that
+/// translation is disabled, a raw '\r' Enter key may not be treated as "submit".
+/// Converting CR and CRLF to '\n' makes Enter robust across environments.
+fn normalize_input_newlines(input: &[u8]) -> Cow<'_, [u8]> {
+    if !input.contains(&b'\r') {
+        return Cow::Borrowed(input);
+    }
+
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        let b = input[i];
+        if b == b'\r' {
+            // If CRLF, collapse to single LF.
+            if i + 1 < input.len() && input[i + 1] == b'\n' {
+                out.push(b'\n');
+                i += 2;
+                continue;
+            }
+            out.push(b'\n');
+            i += 1;
+            continue;
+        }
+        out.push(b);
+        i += 1;
+    }
+    Cow::Owned(out)
 }
 
 /// Run a command wrapped with mobile streaming via daemon
@@ -293,7 +325,8 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
 
             // Local stdin input
             Some(input) = stdin_rx.recv() => {
-                if let Err(e) = writer.write_all(&input) {
+                let normalized = normalize_input_newlines(&input);
+                if let Err(e) = writer.write_all(normalized.as_ref()) {
                     tracing::debug!("Failed to write stdin to PTY: {}", e);
                 }
                 let _ = writer.flush();
@@ -308,7 +341,8 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                                 Some("input") => {
                                     if let Some(data) = msg["data"].as_str() {
                                         if let Ok(bytes) = BASE64.decode(data) {
-                                            if let Err(e) = writer.write_all(&bytes) {
+                                            let normalized = normalize_input_newlines(&bytes);
+                                            if let Err(e) = writer.write_all(normalized.as_ref()) {
                                                 tracing::debug!("Failed to write mobile input to PTY: {}", e);
                                             }
                                             let _ = writer.flush();
