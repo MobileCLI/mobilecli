@@ -171,7 +171,8 @@ impl FileOperations {
 
         let (content, actual_encoding) = match encoding {
             FileEncoding::Utf8 => {
-                if mime::is_text_mime(&mime_type) {
+                // Treat as text if MIME says text or the buffer looks like text.
+                if mime::is_text_mime(&mime_type) || mime::is_probably_text(&buffer) {
                     if let Some(text) = decode_text_buffer(&buffer) {
                         (text, FileEncoding::Utf8)
                     } else {
@@ -609,7 +610,23 @@ impl FileOperations {
             .unwrap_or("")
             .to_string();
         let git_status = super::git::status_for_path(&path).await;
-        self.build_file_entry(&path, &name, git_status).await
+        let mut entry = self.build_file_entry(&path, &name, git_status).await?;
+
+        // For a single file info request (used by the viewer/editor), do a small content sniff
+        // so extensionless files and dotfiles render correctly as text when appropriate.
+        if !entry.is_directory {
+            const SNIFF_BYTES: usize = 8 * 1024;
+            if let Ok(mut file) = fs::File::open(&path).await {
+                let mut buffer = vec![0u8; SNIFF_BYTES];
+                if let Ok(n) = file.read(&mut buffer).await {
+                    buffer.truncate(n);
+                    let mime_type = mime::detect_mime_type(&buffer, &name);
+                    entry.mime_type = Some(mime_type);
+                }
+            }
+        }
+
+        Ok(entry)
     }
 
     pub async fn build_file_entry(
