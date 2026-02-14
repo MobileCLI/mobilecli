@@ -62,10 +62,11 @@ fn get_terminal_size() -> (u16, u16) {
 fn get_terminal_size_opt() -> Option<(u16, u16)> {
     unsafe {
         let mut ws: libc::winsize = std::mem::zeroed();
-        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 {
-            if ws.ws_col > 0 && ws.ws_row > 0 {
-                return Some((ws.ws_col, ws.ws_row));
-            }
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0
+            && ws.ws_col > 0
+            && ws.ws_row > 0
+        {
+            return Some((ws.ws_col, ws.ws_row));
         }
     }
     term_size::dimensions().map(|(w, h)| (w as u16, h as u16))

@@ -371,29 +371,46 @@ async fn show_pair_qr() -> Result<(), Box<dyn std::error::Error>> {
     // Get connection config (includes device_id and device_name)
     let config = setup::load_config().unwrap_or_default();
 
-    let ip = match &config.connection_mode {
-        setup::ConnectionMode::Local => setup::get_local_ip(),
-        setup::ConnectionMode::Tailscale => {
-            let ts = setup::check_tailscale();
-            if ts.logged_in {
-                ts.ip.or_else(setup::get_local_ip)
-            } else {
-                eprintln!("{}", "⚠ Tailscale not connected".yellow());
-                setup::get_local_ip()
-            }
-        }
-        setup::ConnectionMode::Custom(_) => setup::get_connection_ip(&config),
-    };
-
     // Get the actual daemon port (fallback to default if not running)
     let port = daemon::get_port().unwrap_or(daemon::DEFAULT_PORT);
 
-    if let Some(ip) = ip {
+    // In Custom mode we allow an explicit ws:// or wss:// URL (useful for TLS proxies).
+    let ws_url = match &config.connection_mode {
+        setup::ConnectionMode::Custom(url) => {
+            if url.starts_with("ws://") || url.starts_with("wss://") {
+                url.clone()
+            } else {
+                format!("ws://{}", url)
+            }
+        }
+        setup::ConnectionMode::Local | setup::ConnectionMode::Tailscale => {
+            let ip = match &config.connection_mode {
+                setup::ConnectionMode::Local => setup::get_local_ip(),
+                setup::ConnectionMode::Tailscale => {
+                    let ts = setup::check_tailscale();
+                    if ts.logged_in {
+                        ts.ip.or_else(setup::get_local_ip)
+                    } else {
+                        eprintln!("{}", "⚠ Tailscale not connected".yellow());
+                        setup::get_local_ip()
+                    }
+                }
+                setup::ConnectionMode::Custom(_) => None,
+            };
+            match ip {
+                Some(ip) => format!("ws://{}:{}", ip, port),
+                None => format!("ws://localhost:{}", port),
+            }
+        }
+    };
+
+    if !ws_url.is_empty() {
         let info = protocol::ConnectionInfo {
-            ws_url: format!("ws://{}:{}", ip, port),
+            ws_url,
             session_id: String::new(), // Not session-specific
             session_name: None,
             encryption_key: None,
+            auth_token: Some(config.auth_token),
             version: env!("CARGO_PKG_VERSION").to_string(),
             device_id: Some(config.device_id),
             device_name: Some(config.device_name),

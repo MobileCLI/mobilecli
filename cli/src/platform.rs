@@ -168,46 +168,9 @@ pub fn terminate_process(_pid: u32) -> bool {
     false
 }
 
-/// Get the path separator for the current platform.
-///
-/// Returns '/' on Unix, '\\' on Windows.
-pub fn path_separator() -> char {
-    std::path::MAIN_SEPARATOR
-}
-
-/// Extract the last component from a path string, handling both
-/// forward slashes and backslashes for cross-platform compatibility.
-///
-/// This is useful for extracting project names from paths received
-/// from different operating systems.
-pub fn extract_path_basename(path: &str) -> &str {
-    // Handle both Unix (/) and Windows (\) separators
-    path.rsplit(['/', '\\']).next().unwrap_or(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_extract_path_basename_unix() {
-        assert_eq!(extract_path_basename("/home/user/project"), "project");
-        assert_eq!(extract_path_basename("/home/user/"), "");
-        assert_eq!(extract_path_basename("project"), "project");
-    }
-
-    #[test]
-    fn test_extract_path_basename_windows() {
-        assert_eq!(extract_path_basename(r"C:\Users\user\project"), "project");
-        assert_eq!(extract_path_basename(r"C:\Users\user\"), "");
-        assert_eq!(extract_path_basename("project"), "project");
-    }
-
-    #[test]
-    fn test_extract_path_basename_mixed() {
-        // Edge case: mixed separators (shouldn't happen but handle gracefully)
-        assert_eq!(extract_path_basename(r"C:\Users/user\project"), "project");
-    }
 
     #[test]
     fn test_config_dir() {

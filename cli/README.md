@@ -17,7 +17,7 @@ cp target/release/mobilecli ~/.local/bin/
 
 ```bash
 # First time setup (shows QR code for mobile pairing)
-mobilecli --setup
+mobilecli setup
 
 # Start your shell with mobile streaming
 mobilecli
@@ -47,7 +47,7 @@ mobilecli pair
 | Command | Description |
 |---------|-------------|
 | `mobilecli` | Start your default shell with streaming |
-| `mobilecli --setup` | Run setup wizard and show pairing QR code |
+| `mobilecli setup` | Run setup wizard and show pairing QR code (`mobilecli --setup` alias) |
 | `mobilecli status` | Show daemon status and active sessions |
 | `mobilecli pair` | Show QR code for mobile pairing |
 | `mobilecli stop` | Stop the background daemon |
@@ -60,11 +60,11 @@ mobilecli pair
 | `-n, --name <NAME>` | Name for this session (shown in mobile app) |
 | `-q, --quiet` | Don't show connection status on startup |
 
-Connection mode (Local/Tailscale/Custom) is configured via `mobilecli --setup`.
+Connection mode (Local/Tailscale/Custom) is configured via `mobilecli setup` (or `mobilecli --setup`).
 
 ## How It Works
 
-1. **Setup**: Run `mobilecli --setup` to configure and scan QR code with mobile app
+1. **Setup**: Run `mobilecli setup` (or `mobilecli --setup`) to configure and optionally scan QR code with mobile app
 2. **Daemon**: A background daemon starts automatically and manages all sessions
 3. **Sessions**: Each `mobilecli` terminal registers with the daemon
 4. **Mobile**: Connect once to see all active terminal sessions
@@ -78,7 +78,7 @@ Terminal 3 ──┘
 
 ## Mobile App
 
-Scan the QR code with the MobileCLI mobile app during setup. The app connects to the daemon and shows all active terminal sessions.
+Scan the QR code with the MobileCLI mobile app during setup, or enter the daemon URL/IP manually in app settings. The app connects to the daemon and shows all active terminal sessions.
 
 ## Session Management
 
@@ -95,12 +95,13 @@ Sessions: 2 active session(s):
 
 ## Security Model
 
-MobileCLI uses network-level access control:
+MobileCLI uses network-level access control, with optional QR pairing metadata:
 
+- **Pairing Token (Optional)**: `mobilecli setup` (or `mobilecli --setup`) generates an `auth_token` and embeds it in the QR code for convenience.
 - **Local Network**: Only devices on the same WiFi can connect
 - **Tailscale**: Only authenticated Tailscale network members can connect
 
-The daemon binds to all interfaces (0.0.0.0) intentionally so mobile devices can connect. Security relies on your network configuration, not application-level authentication.
+The daemon binds to all interfaces (0.0.0.0) intentionally so mobile devices can connect. For remote access, use Tailscale or terminate TLS (`wss://`) with a reverse proxy.
 
 ## Protocol
 

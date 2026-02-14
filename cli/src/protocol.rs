@@ -47,6 +47,10 @@ pub enum ClientMessage {
         token_type: String, // "expo" | "apns" | "fcm"
         platform: String,   // "ios" | "android"
     },
+    /// Unregister a previously registered push notification token
+    UnregisterPushToken {
+        token: String,
+    },
     /// Tool approval response from mobile
     ToolApproval {
         session_id: String,
@@ -157,6 +161,14 @@ pub enum ClientMessage {
         chunk_index: u64,
         #[serde(default)]
         chunk_size: Option<u64>,
+    },
+    UploadFile {
+        request_id: String,
+        session_id: String,
+        file_name: String,
+        content_base64: String,
+        #[serde(default)]
+        mime_type: Option<String>,
     },
 }
 
@@ -337,17 +349,12 @@ pub enum SortOrder {
     Desc,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum FileEncoding {
+    #[default]
     Utf8,
     Base64,
-}
-
-impl Default for FileEncoding {
-    fn default() -> Self {
-        FileEncoding::Utf8
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -428,18 +435,43 @@ pub enum ChangeType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileSystemError {
-    NotFound { path: String },
-    PermissionDenied { path: String, reason: String },
-    PathTraversal { attempted_path: String },
-    NotADirectory { path: String },
-    NotAFile { path: String },
-    AlreadyExists { path: String },
-    NotEmpty { path: String },
-    FileTooLarge { path: String, size: u64, max_size: u64 },
-    IoError { message: String },
-    InvalidEncoding { path: String },
+    NotFound {
+        path: String,
+    },
+    PermissionDenied {
+        path: String,
+        reason: String,
+    },
+    PathTraversal {
+        attempted_path: String,
+    },
+    NotADirectory {
+        path: String,
+    },
+    NotAFile {
+        path: String,
+    },
+    AlreadyExists {
+        path: String,
+    },
+    NotEmpty {
+        path: String,
+    },
+    FileTooLarge {
+        path: String,
+        size: u64,
+        max_size: u64,
+    },
+    IoError {
+        message: String,
+    },
+    InvalidEncoding {
+        path: String,
+    },
     OperationCancelled,
-    RateLimited { retry_after_ms: u64 },
+    RateLimited {
+        retry_after_ms: u64,
+    },
 }
 
 /// Connection info for QR code / pairing
@@ -453,6 +485,12 @@ pub struct ConnectionInfo {
     pub session_name: Option<String>,
     /// Optional encryption key (base64)
     pub encryption_key: Option<String>,
+    /// Optional auth token included in pairing QR metadata.
+    ///
+    /// This can be stored on-device for convenience, but direct URL/IP connections
+    /// are also supported without a token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
     /// Server version
     pub version: String,
     /// Device UUID (for multi-device support)
@@ -464,19 +502,8 @@ pub struct ConnectionInfo {
 }
 
 impl ConnectionInfo {
-    /// Encode as JSON for QR code (full format)
-    pub fn to_qr_data(&self) -> String {
-        match serde_json::to_string(self) {
-            Ok(json) => json,
-            Err(e) => {
-                tracing::error!("Failed to serialize ConnectionInfo: {}", e);
-                String::new()
-            }
-        }
-    }
-
     /// Encode as compact string for QR code (smaller QR)
-    /// Format: mobilecli://host:port?device_id=UUID&device_name=HOSTNAME
+    /// Format: mobilecli://host:port?device_id=UUID&device_name=HOSTNAME[&wss=1]
     ///
     /// Note: This format is for device-level pairing, not session-specific connections.
     /// The mobile app connects to the device and then fetches the session list via
@@ -484,6 +511,8 @@ impl ConnectionInfo {
     /// to multiple computers. Session-specific QR codes are no longer used as sessions
     /// are transient and device pairing is persistent.
     pub fn to_compact_qr(&self) -> String {
+        let is_wss = self.ws_url.starts_with("wss://");
+
         // Extract host:port from ws_url
         let host_port = self
             .ws_url
@@ -501,6 +530,12 @@ impl ConnectionInfo {
         }
         if let Some(name) = &self.device_name {
             params.push(format!("device_name={}", urlencoding::encode(name)));
+        }
+        if let Some(token) = &self.auth_token {
+            params.push(format!("auth_token={}", urlencoding::encode(token)));
+        }
+        if is_wss {
+            params.push("wss=1".to_string());
         }
 
         if !params.is_empty() {

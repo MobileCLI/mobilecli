@@ -1,5 +1,5 @@
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -33,6 +33,10 @@ impl FileOperations {
         &self.validator
     }
 
+    pub fn config(&self) -> &FileSystemConfig {
+        self.config.as_ref()
+    }
+
     /// List directory contents
     pub async fn list_directory(
         &self,
@@ -45,7 +49,7 @@ impl FileOperations {
 
         if !path.is_dir() {
             return Err(FileSystemError::NotADirectory {
-                path: path.display().to_string(),
+                path: path_utils::to_protocol_path(&path),
             });
         }
 
@@ -57,12 +61,13 @@ impl FileOperations {
                 message: e.to_string(),
             })?;
 
-        while let Some(entry) = read_dir
-            .next_entry()
-            .await
-            .map_err(|e| FileSystemError::IoError {
-                message: e.to_string(),
-            })?
+        while let Some(entry) =
+            read_dir
+                .next_entry()
+                .await
+                .map_err(|e| FileSystemError::IoError {
+                    message: e.to_string(),
+                })?
         {
             let entry_path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
@@ -90,7 +95,12 @@ impl FileOperations {
             entries.truncate(self.config.max_list_entries);
         }
 
-        Ok((path.display().to_string(), entries, total_count, truncated))
+        Ok((
+            path_utils::to_protocol_path(&path),
+            entries,
+            total_count,
+            truncated,
+        ))
     }
 
     /// Read file contents
@@ -105,7 +115,7 @@ impl FileOperations {
 
         if !path.is_file() {
             return Err(FileSystemError::NotAFile {
-                path: path.display().to_string(),
+                path: path_utils::to_protocol_path(&path),
             });
         }
 
@@ -119,7 +129,7 @@ impl FileOperations {
 
         if size > self.config.max_read_size {
             return Err(FileSystemError::FileTooLarge {
-                path: path.display().to_string(),
+                path: path_utils::to_protocol_path(&path),
                 size,
                 max_size: self.config.max_read_size,
             });
@@ -165,7 +175,10 @@ impl FileOperations {
                     if let Some(text) = decode_text_buffer(&buffer) {
                         (text, FileEncoding::Utf8)
                     } else {
-                        (String::from_utf8_lossy(&buffer).to_string(), FileEncoding::Utf8)
+                        (
+                            String::from_utf8_lossy(&buffer).to_string(),
+                            FileEncoding::Utf8,
+                        )
                     }
                 } else {
                     (BASE64.encode(&buffer), FileEncoding::Base64)
@@ -180,7 +193,7 @@ impl FileOperations {
             .unwrap_or(0);
 
         Ok(FileContent {
-            path: path.display().to_string(),
+            path: path_utils::to_protocol_path(&path),
             content,
             encoding: actual_encoding,
             mime_type,
@@ -209,7 +222,7 @@ impl FileOperations {
 
         if !path.is_file() {
             return Err(FileSystemError::NotAFile {
-                path: path.display().to_string(),
+                path: path_utils::to_protocol_path(&path),
             });
         }
 
@@ -223,7 +236,7 @@ impl FileOperations {
 
         if size > self.config.max_read_size {
             return Err(FileSystemError::FileTooLarge {
-                path: path.display().to_string(),
+                path: path_utils::to_protocol_path(&path),
                 size,
                 max_size: self.config.max_read_size,
             });
@@ -238,7 +251,7 @@ impl FileOperations {
         let offset = chunk_index.saturating_mul(chunk_size);
         if offset >= size && size != 0 {
             return Err(FileSystemError::NotFound {
-                path: path.display().to_string(),
+                path: path_utils::to_protocol_path(&path),
             });
         }
 
@@ -255,7 +268,11 @@ impl FileOperations {
                 })?;
         }
 
-        let read_len = if size == 0 { 0 } else { chunk_size.min(size - offset) };
+        let read_len = if size == 0 {
+            0
+        } else {
+            chunk_size.min(size - offset)
+        };
         let mut buffer = vec![0u8; read_len as usize];
         let bytes_read = file
             .read(&mut buffer)
@@ -270,7 +287,7 @@ impl FileOperations {
         let is_last = chunk_index + 1 >= total_chunks;
 
         Ok((
-            path.display().to_string(),
+            path_utils::to_protocol_path(&path),
             total_chunks,
             size,
             chunk_index,
@@ -292,27 +309,40 @@ impl FileOperations {
 
         if !self.validator.is_writable(&path) {
             return Err(FileSystemError::PermissionDenied {
-                path: path.display().to_string(),
+                path: path_utils::to_protocol_path(&path),
                 reason: "Path is read-only".to_string(),
             });
         }
 
+        // Parent is required by resolve_new_path for write targets.
+        let parent = path
+            .parent()
+            .ok_or_else(|| FileSystemError::PathTraversal {
+                attempted_path: path_utils::to_protocol_path(&path),
+            })?;
+        // Ensure no parent component is a file (prevents ENOTDIR later).
+        path_utils::validate_parent_components(parent).await?;
+
         if path.exists() && path.is_dir() {
             return Err(FileSystemError::NotAFile {
-                path: path.display().to_string(),
+                path: path_utils::to_protocol_path(&path),
             });
         }
 
         let bytes = match encoding {
             FileEncoding::Utf8 => content.as_bytes().to_vec(),
-            FileEncoding::Base64 => BASE64.decode(content).map_err(|_| FileSystemError::InvalidEncoding {
-                path: path.display().to_string(),
-            })?,
+            FileEncoding::Base64 => {
+                BASE64
+                    .decode(content)
+                    .map_err(|_| FileSystemError::InvalidEncoding {
+                        path: path_utils::to_protocol_path(&path),
+                    })?
+            }
         };
 
         if bytes.len() as u64 > self.config.max_write_size {
             return Err(FileSystemError::FileTooLarge {
-                path: path.display().to_string(),
+                path: path_utils::to_protocol_path(&path),
                 size: bytes.len() as u64,
                 max_size: self.config.max_write_size,
             });
@@ -325,9 +355,7 @@ impl FileOperations {
         let temp_path = sibling_with_suffix(&path, &format!("tmp-{}", uuid::Uuid::new_v4()));
 
         if let Err(e) = fs::write(&temp_path, &bytes).await {
-            return Err(FileSystemError::IoError {
-                message: e.to_string(),
-            });
+            return Err(map_not_a_directory_error(&path, e));
         }
 
         let mut backup_path = None;
@@ -336,8 +364,12 @@ impl FileOperations {
             let _ = fs::remove_file(&backup).await;
             if let Err(e) = fs::rename(&path, &backup).await {
                 let _ = fs::remove_file(&temp_path).await;
-                return Err(FileSystemError::IoError {
-                    message: format!("Failed to backup existing file: {}", e),
+                let mapped = map_not_a_directory_error(&path, e);
+                return Err(match mapped {
+                    FileSystemError::IoError { message } => FileSystemError::IoError {
+                        message: format!("Failed to backup existing file: {}", message),
+                    },
+                    other => other,
                 });
             }
             backup_path = Some(backup);
@@ -363,12 +395,18 @@ impl FileOperations {
                 }
             }
             let _ = fs::remove_file(&temp_path).await;
-            let message = if let Some(restore_error) = restore_error {
-                format!("Failed to replace file: {}; {}", e, restore_error)
-            } else {
-                e.to_string()
-            };
-            return Err(FileSystemError::IoError { message });
+            let mapped = map_not_a_directory_error(&path, e);
+            return Err(match mapped {
+                FileSystemError::IoError { message } => {
+                    let message = if let Some(restore_error) = restore_error {
+                        format!("Failed to replace file: {}; {}", message, restore_error)
+                    } else {
+                        message
+                    };
+                    FileSystemError::IoError { message }
+                }
+                other => other,
+            });
         }
 
         if let Some(backup) = backup_path {
@@ -379,38 +417,47 @@ impl FileOperations {
     }
 
     /// Create directory
-    pub async fn create_directory(&self, path: &str, recursive: bool) -> Result<(), FileSystemError> {
+    pub async fn create_directory(
+        &self,
+        path: &str,
+        recursive: bool,
+    ) -> Result<(), FileSystemError> {
         let path = self.validator.resolve_new_path(path, recursive)?;
+
+        if !self.validator.is_writable(&path) {
+            return Err(FileSystemError::PermissionDenied {
+                path: path_utils::to_protocol_path(&path),
+                reason: "Path is read-only".to_string(),
+            });
+        }
 
         if path.exists() {
             return Err(FileSystemError::AlreadyExists {
-                path: path.display().to_string(),
+                path: path_utils::to_protocol_path(&path),
             });
         }
 
         if recursive {
             // Use our safe function that checks for files in the path
             path_utils::validate_parent_components(&path).await?;
-            fs::create_dir_all(&path)
-                .await
-                .map_err(|e| {
-                    // Check if error is ENOTDIR (error 20)
-                    if let Some(20) = e.raw_os_error() {
-                        // Find which component is the file
-                        let mut current = std::path::PathBuf::new();
-                        for component in path.components() {
-                            current.push(component);
-                            if current.exists() && current.is_file() {
-                                return FileSystemError::NotADirectory {
-                                    path: current.display().to_string(),
-                                };
-                            }
+            fs::create_dir_all(&path).await.map_err(|e| {
+                // Check if error is ENOTDIR (error 20)
+                if let Some(20) = e.raw_os_error() {
+                    // Find which component is the file
+                    let mut current = std::path::PathBuf::new();
+                    for component in path.components() {
+                        current.push(component);
+                        if current.exists() && current.is_file() {
+                            return FileSystemError::NotADirectory {
+                                path: path_utils::to_protocol_path(&current),
+                            };
                         }
                     }
-                    FileSystemError::IoError {
-                        message: e.to_string(),
-                    }
-                })?;
+                }
+                FileSystemError::IoError {
+                    message: e.to_string(),
+                }
+            })?;
         } else {
             if let Some(parent) = path.parent() {
                 path_utils::validate_parent_components(parent).await?;
@@ -431,21 +478,29 @@ impl FileOperations {
 
         if !self.validator.is_writable(&path) {
             return Err(FileSystemError::PermissionDenied {
-                path: path.display().to_string(),
+                path: path_utils::to_protocol_path(&path),
                 reason: "Path is read-only".to_string(),
             });
         }
 
         if path.is_dir() {
             if !recursive {
-                let mut read_dir = fs::read_dir(&path)
+                let mut read_dir =
+                    fs::read_dir(&path)
+                        .await
+                        .map_err(|e| FileSystemError::IoError {
+                            message: e.to_string(),
+                        })?;
+                if read_dir
+                    .next_entry()
                     .await
                     .map_err(|e| FileSystemError::IoError {
                         message: e.to_string(),
-                    })?;
-                if read_dir.next_entry().await.map_err(|e| FileSystemError::IoError { message: e.to_string() })?.is_some() {
+                    })?
+                    .is_some()
+                {
                     return Err(FileSystemError::NotEmpty {
-                        path: path.display().to_string(),
+                        path: path_utils::to_protocol_path(&path),
                     });
                 }
                 fs::remove_dir(&path)
@@ -478,14 +533,14 @@ impl FileOperations {
 
         if !self.validator.is_writable(&old_path) || !self.validator.is_writable(&new_path) {
             return Err(FileSystemError::PermissionDenied {
-                path: new_path.display().to_string(),
+                path: path_utils::to_protocol_path(&new_path),
                 reason: "Path is read-only".to_string(),
             });
         }
 
         if new_path.exists() {
             return Err(FileSystemError::AlreadyExists {
-                path: new_path.display().to_string(),
+                path: path_utils::to_protocol_path(&new_path),
             });
         }
 
@@ -499,23 +554,41 @@ impl FileOperations {
     }
 
     /// Copy file or directory
-    pub async fn copy_path(&self, source: &str, destination: &str, recursive: bool) -> Result<(), FileSystemError> {
+    pub async fn copy_path(
+        &self,
+        source: &str,
+        destination: &str,
+        recursive: bool,
+    ) -> Result<(), FileSystemError> {
         let source = self.validator.validate_existing(source)?;
         let destination = self.validator.resolve_new_path(destination, recursive)?;
 
+        if !self.validator.is_writable(&destination) {
+            return Err(FileSystemError::PermissionDenied {
+                path: path_utils::to_protocol_path(&destination),
+                reason: "Path is read-only".to_string(),
+            });
+        }
+
         if destination.exists() {
             return Err(FileSystemError::AlreadyExists {
-                path: destination.display().to_string(),
+                path: path_utils::to_protocol_path(&destination),
             });
         }
 
         if source.is_dir() {
             if !recursive {
                 return Err(FileSystemError::NotADirectory {
-                    path: source.display().to_string(),
+                    path: path_utils::to_protocol_path(&source),
                 });
             }
-            copy_dir_recursive(&source, &destination).await?;
+            copy_dir_recursive(
+                &source,
+                &destination,
+                self.validator.as_ref(),
+                self.config.as_ref(),
+            )
+            .await?;
         } else {
             fs::copy(&source, &destination)
                 .await
@@ -551,9 +624,7 @@ impl FileOperations {
                 message: e.to_string(),
             })?;
         let is_symlink = metadata.file_type().is_symlink();
-        let file_metadata = fs::metadata(path)
-            .await
-            .unwrap_or(metadata.clone());
+        let file_metadata = fs::metadata(path).await.unwrap_or(metadata.clone());
 
         let is_directory = file_metadata.is_dir();
         let size = if is_directory { 0 } else { file_metadata.len() };
@@ -576,14 +647,16 @@ impl FileOperations {
         };
 
         let symlink_target = if is_symlink {
-            std::fs::read_link(path).ok().map(|p| p.display().to_string())
+            std::fs::read_link(path)
+                .ok()
+                .map(|p| path_utils::to_protocol_path(&p))
         } else {
             None
         };
 
         Ok(FileEntry {
             name: name.to_string(),
-            path: path.display().to_string(),
+            path: path_utils::to_protocol_path(path),
             is_directory,
             is_symlink,
             is_hidden,
@@ -642,7 +715,37 @@ fn sibling_with_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
     path.with_file_name(file_name)
 }
 
-fn sort_entries(entries: &mut [FileEntry], sort_by: Option<SortField>, sort_order: Option<SortOrder>) {
+fn map_not_a_directory_error(path: &Path, error: std::io::Error) -> FileSystemError {
+    if let Some(20) = error.raw_os_error() {
+        if let Some(parent) = path.parent() {
+            if let Some(err) = find_not_a_directory(parent) {
+                return err;
+            }
+        }
+    }
+    FileSystemError::IoError {
+        message: error.to_string(),
+    }
+}
+
+fn find_not_a_directory(path: &Path) -> Option<FileSystemError> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        if current.exists() && current.is_file() {
+            return Some(FileSystemError::NotADirectory {
+                path: path_utils::to_protocol_path(&current),
+            });
+        }
+    }
+    None
+}
+
+fn sort_entries(
+    entries: &mut [FileEntry],
+    sort_by: Option<SortField>,
+    sort_order: Option<SortOrder>,
+) {
     use std::cmp::Ordering;
 
     let sort_by = sort_by.unwrap_or(SortField::Name);
@@ -676,56 +779,110 @@ fn extension_of(name: &str) -> String {
         .to_lowercase()
 }
 
-async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), FileSystemError> {
+async fn copy_dir_recursive(
+    src: &Path,
+    dst: &Path,
+    validator: &PathValidator,
+    config: &FileSystemConfig,
+) -> Result<(), FileSystemError> {
     let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
 
     while let Some((current_src, current_dst)) = stack.pop() {
+        if validator.is_denied(&current_dst) {
+            return Err(FileSystemError::PermissionDenied {
+                path: path_utils::to_protocol_path(&current_dst),
+                reason: "Destination matches denied pattern".to_string(),
+            });
+        }
+        if !validator.is_writable(&current_dst) {
+            return Err(FileSystemError::PermissionDenied {
+                path: path_utils::to_protocol_path(&current_dst),
+                reason: "Destination is read-only".to_string(),
+            });
+        }
+
         // Check parent paths for files before creating directories
         super::path_utils::create_parent_dirs_safe(&current_dst).await?;
-        fs::create_dir_all(&current_dst)
-            .await
-            .map_err(|e| {
-                if let Some(20) = e.raw_os_error() {
-                    // ENOTDIR error - a path component is a file
-                    let mut current = std::path::PathBuf::new();
-                    for component in current_dst.components() {
-                        current.push(component);
-                        if current.exists() && current.is_file() {
-                            return FileSystemError::NotADirectory {
-                                path: current.display().to_string(),
-                            };
-                        }
+        fs::create_dir_all(&current_dst).await.map_err(|e| {
+            if let Some(20) = e.raw_os_error() {
+                // ENOTDIR error - a path component is a file
+                let mut current = std::path::PathBuf::new();
+                for component in current_dst.components() {
+                    current.push(component);
+                    if current.exists() && current.is_file() {
+                        return FileSystemError::NotADirectory {
+                            path: path_utils::to_protocol_path(&current),
+                        };
                     }
                 }
-                FileSystemError::IoError {
-                    message: e.to_string(),
-                }
-            })?;
-
-        let mut read_dir = fs::read_dir(&current_src)
-            .await
-            .map_err(|e| FileSystemError::IoError {
+            }
+            FileSystemError::IoError {
                 message: e.to_string(),
-            })?;
+            }
+        })?;
 
-        while let Some(entry) = read_dir
-            .next_entry()
-            .await
-            .map_err(|e| FileSystemError::IoError {
-                message: e.to_string(),
-            })?
-        {
-            let entry_path = entry.path();
-            let dest_path = current_dst.join(entry.file_name());
-            let meta = entry
-                .metadata()
+        let mut read_dir =
+            fs::read_dir(&current_src)
                 .await
                 .map_err(|e| FileSystemError::IoError {
                     message: e.to_string(),
                 })?;
+
+        while let Some(entry) =
+            read_dir
+                .next_entry()
+                .await
+                .map_err(|e| FileSystemError::IoError {
+                    message: e.to_string(),
+                })?
+        {
+            let entry_path = entry.path();
+            let dest_path = current_dst.join(entry.file_name());
+
+            if validator.is_denied(&entry_path) {
+                return Err(FileSystemError::PermissionDenied {
+                    path: path_utils::to_protocol_path(&entry_path),
+                    reason: "Source matches denied pattern".to_string(),
+                });
+            }
+
+            let meta =
+                fs::symlink_metadata(&entry_path)
+                    .await
+                    .map_err(|e| FileSystemError::IoError {
+                        message: e.to_string(),
+                    })?;
+
+            if meta.file_type().is_symlink() {
+                if !config.follow_symlinks {
+                    return Err(FileSystemError::PermissionDenied {
+                        path: path_utils::to_protocol_path(&entry_path),
+                        reason: "Symlinks are not allowed".to_string(),
+                    });
+                }
+                // Even when follow_symlinks=true, copying symlinks in a recursive walk can
+                // escape allowed roots. Require callers to handle symlinks explicitly.
+                return Err(FileSystemError::PermissionDenied {
+                    path: path_utils::to_protocol_path(&entry_path),
+                    reason: "Symlinks are not supported in recursive copy".to_string(),
+                });
+            }
+
             if meta.is_dir() {
                 stack.push((entry_path, dest_path));
             } else {
+                if validator.is_denied(&dest_path) {
+                    return Err(FileSystemError::PermissionDenied {
+                        path: path_utils::to_protocol_path(&dest_path),
+                        reason: "Destination matches denied pattern".to_string(),
+                    });
+                }
+                if !validator.is_writable(&dest_path) {
+                    return Err(FileSystemError::PermissionDenied {
+                        path: path_utils::to_protocol_path(&dest_path),
+                        reason: "Destination is read-only".to_string(),
+                    });
+                }
                 fs::copy(&entry_path, &dest_path)
                     .await
                     .map_err(|e| FileSystemError::IoError {

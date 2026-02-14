@@ -8,7 +8,9 @@ use crate::detection::{
 };
 use crate::filesystem::{config::FileSystemConfig, rate_limit::RateLimiter, FileSystemService};
 use crate::platform;
-use crate::protocol::{ChangeType, ClientMessage, FileSystemError, ServerMessage, SessionListItem};
+use crate::protocol::{
+    ChangeType, ClientMessage, FileEncoding, FileSystemError, ServerMessage, SessionListItem,
+};
 use crate::session::{self, SessionInfo};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::Utc;
@@ -95,7 +97,8 @@ pub struct WaitingState {
 pub struct PushToken {
     pub token: String,
     pub token_type: String, // "expo" | "apns" | "fcm"
-    pub platform: String,   // "ios" | "android"
+    #[allow(dead_code)]
+    pub platform: String, // "ios" | "android"
 }
 
 /// Default scrollback buffer size (64KB)
@@ -137,6 +140,9 @@ pub struct DaemonState {
     pub device_id: Option<String>,
     /// Device name (hostname)
     pub device_name: Option<String>,
+    /// Optional pairing token embedded in QR codes (from `~/.mobilecli/config.json`).
+    /// Direct URL/IP connections are allowed without this token.
+    pub auth_token: Option<String>,
 }
 
 impl DaemonState {
@@ -144,10 +150,18 @@ impl DaemonState {
         let (pty_broadcast, _) = broadcast::channel(256);
         let file_system = std::sync::Arc::new(FileSystemService::new(FileSystemConfig::default()));
 
-        // Load device info from config
-        let (device_id, device_name) = crate::setup::load_config()
-            .map(|c| (Some(c.device_id), Some(c.device_name)))
-            .unwrap_or((None, None));
+        // Load device info from config. If missing, create a default config so we always
+        // have a stable device_id + auth_token for pairing/auth.
+        let cfg = crate::setup::load_config().unwrap_or_else(|| {
+            let cfg = crate::setup::Config::default();
+            let _ = crate::setup::save_config(&cfg);
+            cfg
+        });
+        let (device_id, device_name, auth_token) = (
+            Some(cfg.device_id),
+            Some(cfg.device_name),
+            Some(cfg.auth_token),
+        );
 
         Self {
             sessions: HashMap::new(),
@@ -163,6 +177,7 @@ impl DaemonState {
             file_rate_limiters: HashMap::new(),
             device_id,
             device_name,
+            auth_token,
         }
     }
 }
@@ -279,6 +294,13 @@ async fn handle_connection(
             if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) {
                 if msg.get("type").and_then(|v| v.as_str()) == Some("register_pty") {
                     // This is a PTY session registering
+                    if !addr.ip().is_loopback() {
+                        tracing::warn!(
+                            "Rejecting PTY registration from non-loopback address: {}",
+                            addr
+                        );
+                        return Ok(());
+                    }
                     return handle_pty_session(msg, tx, rx, addr, state).await;
                 }
             }
@@ -298,6 +320,42 @@ async fn handle_mobile_client(
     state: SharedState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!("Mobile client connected: {}", addr);
+
+    // Pairing token from QR is optional. Direct URL/IP entry should work without QR.
+    // If a token is provided, we log mismatches for diagnostics but do not reject.
+    let expected_token = {
+        let st = state.read().await;
+        st.auth_token.clone()
+    }
+    .filter(|t| !t.trim().is_empty());
+
+    let hello_msg = first_msg
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<ClientMessage>(text).ok());
+    let provided_token = match hello_msg {
+        Some(ClientMessage::Hello { auth_token, .. }) => auth_token,
+        _ => None,
+    };
+
+    if let Some(expected) = expected_token.as_deref() {
+        match provided_token.as_deref() {
+            Some(provided) if provided != expected => {
+                tracing::warn!(
+                    "Mobile client provided mismatched pairing token: {} (allowing direct connection)",
+                    addr
+                );
+            }
+            Some(_) => {
+                tracing::debug!("Mobile client provided matching pairing token: {}", addr);
+            }
+            None => {
+                tracing::debug!(
+                    "Mobile client connected without pairing token: {} (direct/manual connect)",
+                    addr
+                );
+            }
+        }
+    }
 
     let (client_tx, mut client_rx) = mpsc::unbounded_channel::<Message>();
     let watch_tx = client_tx.clone();
@@ -353,7 +411,10 @@ async fn handle_mobile_client(
             };
 
             let mut new_entry = None;
-            if matches!(change.change_type, ChangeType::Created | ChangeType::Modified) {
+            if matches!(
+                change.change_type,
+                ChangeType::Created | ChangeType::Modified
+            ) {
                 let should_break = tokio::select! {
                     _ = disconnect_rx.changed() => *disconnect_rx.borrow(),
                     result = fs.ops().get_file_info(&change.path) => {
@@ -909,7 +970,8 @@ async fn spawn_session_from_mobile(
     } else {
         "/bin/sh".to_string()
     };
-    let wrap_cmd = build_wrap_shell_command(&mobilecli_bin, session_name, command, args, working_dir);
+    let wrap_cmd =
+        build_wrap_shell_command(&mobilecli_bin, session_name, command, args, working_dir);
     let shell_args = shell_args_for_command(&shell, &wrap_cmd);
 
     tracing::info!("Spawning session: {} via {}", wrap_cmd, terminal.name);
@@ -1197,6 +1259,16 @@ async fn process_client_msg(
             });
             tracing::info!("Registered push token ({}/{})", token_type, platform);
         }
+        ClientMessage::UnregisterPushToken { token } => {
+            let mut st = state.write().await;
+            let before = st.push_tokens.len();
+            st.push_tokens.retain(|t| t.token != token);
+            let after = st.push_tokens.len();
+            tracing::info!(
+                "Unregistered push token (removed {})",
+                before.saturating_sub(after)
+            );
+        }
         ClientMessage::ToolApproval {
             session_id,
             response,
@@ -1290,7 +1362,7 @@ async fn process_client_msg(
             sort_by,
             sort_order,
         } => {
-            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+            if let Err(retry_after_ms) = check_fs_rate_limit(state, addr).await {
                 send_fs_error(
                     tx,
                     request_id,
@@ -1329,7 +1401,7 @@ async fn process_client_msg(
             length,
             encoding,
         } => {
-            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+            if let Err(retry_after_ms) = check_fs_rate_limit(state, addr).await {
                 send_fs_error(
                     tx,
                     request_id,
@@ -1366,7 +1438,7 @@ async fn process_client_msg(
             chunk_index,
             chunk_size,
         } => {
-            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+            if let Err(retry_after_ms) = check_fs_rate_limit(state, addr).await {
                 send_fs_error(
                     tx,
                     request_id,
@@ -1405,7 +1477,7 @@ async fn process_client_msg(
             encoding,
             create_parents,
         } => {
-            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+            if let Err(retry_after_ms) = check_fs_rate_limit(state, addr).await {
                 send_fs_error(
                     tx,
                     request_id,
@@ -1436,12 +1508,77 @@ async fn process_client_msg(
                 }
             }
         }
+        ClientMessage::UploadFile {
+            request_id,
+            session_id,
+            file_name,
+            content_base64,
+            mime_type,
+        } => {
+            if let Err(retry_after_ms) = check_fs_rate_limit(state, addr).await {
+                send_fs_error(
+                    tx,
+                    request_id,
+                    "upload_file",
+                    &session_id,
+                    FileSystemError::RateLimited { retry_after_ms },
+                )
+                .await?;
+                return Ok(());
+            }
+
+            let (project_path, fs) = {
+                let st = state.read().await;
+                let Some(session) = st.sessions.get(&session_id) else {
+                    send_fs_error(
+                        tx,
+                        request_id,
+                        "upload_file",
+                        &session_id,
+                        FileSystemError::NotFound {
+                            path: format!("session:{}", session_id),
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                };
+                (session.project_path.clone(), st.file_system.clone())
+            };
+
+            let destination =
+                build_upload_destination_path(&project_path, sanitize_upload_file_name(&file_name));
+            let destination_path = crate::filesystem::path_utils::to_protocol_path(&destination);
+
+            match fs
+                .ops()
+                .write_file(
+                    &destination_path,
+                    &content_base64,
+                    FileEncoding::Base64,
+                    true,
+                )
+                .await
+            {
+                Ok(()) => {
+                    let msg = ServerMessage::OperationSuccess {
+                        request_id,
+                        operation: "upload_file".to_string(),
+                        path: destination_path,
+                        message: mime_type,
+                    };
+                    tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                }
+                Err(e) => {
+                    send_fs_error(tx, request_id, "upload_file", &project_path, e).await?;
+                }
+            }
+        }
         ClientMessage::CreateDirectory {
             request_id,
             path,
             recursive,
         } => {
-            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+            if let Err(retry_after_ms) = check_fs_rate_limit(state, addr).await {
                 send_fs_error(
                     tx,
                     request_id,
@@ -1473,7 +1610,7 @@ async fn process_client_msg(
             path,
             recursive,
         } => {
-            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+            if let Err(retry_after_ms) = check_fs_rate_limit(state, addr).await {
                 send_fs_error(
                     tx,
                     request_id,
@@ -1505,7 +1642,7 @@ async fn process_client_msg(
             old_path,
             new_path,
         } => {
-            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+            if let Err(retry_after_ms) = check_fs_rate_limit(state, addr).await {
                 send_fs_error(
                     tx,
                     request_id,
@@ -1538,7 +1675,7 @@ async fn process_client_msg(
             destination,
             recursive,
         } => {
-            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+            if let Err(retry_after_ms) = check_fs_rate_limit(state, addr).await {
                 send_fs_error(
                     tx,
                     request_id,
@@ -1566,7 +1703,7 @@ async fn process_client_msg(
             }
         }
         ClientMessage::GetFileInfo { request_id, path } => {
-            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+            if let Err(retry_after_ms) = check_fs_rate_limit(state, addr).await {
                 send_fs_error(
                     tx,
                     request_id,
@@ -1600,7 +1737,7 @@ async fn process_client_msg(
             max_depth,
             max_results,
         } => {
-            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+            if let Err(retry_after_ms) = check_fs_rate_limit(state, addr).await {
                 send_fs_error(
                     tx,
                     request_id,
@@ -1615,7 +1752,13 @@ async fn process_client_msg(
             let max_results = max_results.unwrap_or(fs.config().max_search_results);
             match fs
                 .search()
-                .search_files(&path, &pattern, content_pattern.as_deref(), max_depth, max_results)
+                .search_files(
+                    &path,
+                    &pattern,
+                    content_pattern.as_deref(),
+                    max_depth,
+                    max_results,
+                )
                 .await
             {
                 Ok((root, matches, truncated)) => {
@@ -1634,7 +1777,7 @@ async fn process_client_msg(
             }
         }
         ClientMessage::WatchDirectory { request_id, path } => {
-            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+            if let Err(retry_after_ms) = check_fs_rate_limit(state, addr).await {
                 send_fs_error(
                     tx,
                     request_id,
@@ -1655,14 +1798,16 @@ async fn process_client_msg(
                             "watch_directory",
                             &path,
                             FileSystemError::NotADirectory {
-                                path: canonical.display().to_string(),
+                                path: crate::filesystem::path_utils::to_protocol_path(&canonical),
                             },
                         )
                         .await?;
                         return Ok(());
                     }
 
-                    let watch_path = canonical.display().to_string();
+                    // Use protocol-normalized paths for watcher keys and subscriptions so the
+                    // mobile app can match file_changed events reliably across OSes.
+                    let watch_path = crate::filesystem::path_utils::to_protocol_path(&canonical);
                     let should_watch = {
                         let mut st = state.write().await;
                         let entry = st.file_watch_subscriptions.entry(addr).or_default();
@@ -1696,7 +1841,7 @@ async fn process_client_msg(
             }
         }
         ClientMessage::UnwatchDirectory { request_id, path } => {
-            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+            if let Err(retry_after_ms) = check_fs_rate_limit(state, addr).await {
                 send_fs_error(
                     tx,
                     request_id,
@@ -1709,7 +1854,7 @@ async fn process_client_msg(
             }
             let fs = { state.read().await.file_system.clone() };
             let watch_path = match fs.validator().validate_existing(&path) {
-                Ok(canonical) => canonical.display().to_string(),
+                Ok(canonical) => crate::filesystem::path_utils::to_protocol_path(&canonical),
                 Err(_) => path.clone(),
             };
 
@@ -1749,7 +1894,7 @@ async fn process_client_msg(
             tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
         }
         ClientMessage::GetHomeDirectory { request_id } => {
-            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+            if let Err(retry_after_ms) = check_fs_rate_limit(state, addr).await {
                 send_fs_error(
                     tx,
                     request_id,
@@ -1765,7 +1910,7 @@ async fn process_client_msg(
             if let Some(path) = home {
                 let msg = ServerMessage::HomeDirectory {
                     request_id,
-                    path: path.display().to_string(),
+                    path: crate::filesystem::path_utils::to_protocol_path(&path),
                 };
                 tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
             } else {
@@ -1782,7 +1927,7 @@ async fn process_client_msg(
             }
         }
         ClientMessage::GetAllowedRoots { request_id } => {
-            if let Err(retry_after_ms) = check_fs_rate_limit(&state, addr).await {
+            if let Err(retry_after_ms) = check_fs_rate_limit(state, addr).await {
                 send_fs_error(
                     tx,
                     request_id,
@@ -1798,7 +1943,7 @@ async fn process_client_msg(
                 .config()
                 .allowed_roots
                 .iter()
-                .map(|p| p.display().to_string())
+                .map(|p| crate::filesystem::path_utils::to_protocol_path(p))
                 .collect();
             let msg = ServerMessage::AllowedRoots { request_id, roots };
             tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
@@ -1825,6 +1970,45 @@ async fn send_fs_error(
     };
     tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
     Ok(())
+}
+
+fn sanitize_upload_file_name(file_name: &str) -> String {
+    let trimmed = file_name.trim();
+    let candidate = if trimmed.is_empty() {
+        "attachment.bin"
+    } else {
+        trimmed
+    };
+
+    let mut sanitized: String = candidate
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            ch if ch.is_control() => '_',
+            _ => ch,
+        })
+        .collect();
+
+    sanitized = sanitized.trim_matches('.').trim().to_string();
+    if sanitized.is_empty() {
+        return "attachment.bin".to_string();
+    }
+
+    if sanitized.len() > 120 {
+        sanitized.truncate(120);
+    }
+    sanitized
+}
+
+fn build_upload_destination_path(project_path: &str, file_name: String) -> PathBuf {
+    let mut path = PathBuf::from(project_path);
+    path.push(".mobilecli");
+    path.push("uploads");
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let suffix = uuid::Uuid::new_v4().to_string();
+    let short_suffix = &suffix[..8];
+    path.push(format!("{}-{}-{}", stamp, short_suffix, file_name));
+    path
 }
 
 async fn check_fs_rate_limit(state: &SharedState, addr: SocketAddr) -> Result<(), u64> {
@@ -2105,7 +2289,7 @@ fn is_path_watched(changed_path: &str, watched: &std::collections::HashSet<Strin
     }
     let parent = std::path::Path::new(changed_path)
         .parent()
-        .map(|p| p.display().to_string());
+        .map(crate::filesystem::path_utils::to_protocol_path);
     if let Some(parent) = parent {
         return watched.contains(&parent);
     }

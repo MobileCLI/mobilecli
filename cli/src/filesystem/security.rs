@@ -6,6 +6,7 @@ use path_jail::Jail;
 use crate::protocol::FileSystemError;
 
 use super::config::FileSystemConfig;
+use super::path_utils;
 
 /// Validates and sanitizes paths before any file operation
 pub struct PathValidator {
@@ -34,42 +35,48 @@ impl PathValidator {
 
         if !path.is_absolute() || contains_parent_dir(path) {
             return Err(FileSystemError::PathTraversal {
-                attempted_path: path.display().to_string(),
+                attempted_path: path_utils::to_protocol_path(path),
             });
         }
 
-        let canonical = path
-            .canonicalize()
-            .map_err(|e| FileSystemError::IoError {
-                message: e.to_string(),
-            })?;
-
-        self.ensure_allowed(&canonical)?;
-        self.ensure_not_denied(&canonical)?;
-
-        if !self.config.follow_symlinks && self.contains_symlink(&canonical) {
+        // Enforce "no symlinks" on the *original* path. Checking the canonicalized
+        // path would miss symlink components because canonicalize() resolves them.
+        if !self.config.follow_symlinks && self.contains_symlink(path) {
             return Err(FileSystemError::PermissionDenied {
-                path: canonical.display().to_string(),
+                path: path_utils::to_protocol_path(path),
                 reason: "Symlinked paths are not allowed".to_string(),
             });
         }
+
+        let canonical = path.canonicalize().map_err(|e| FileSystemError::IoError {
+            message: e.to_string(),
+        })?;
+
+        self.ensure_allowed(&canonical)?;
+        self.ensure_not_denied(&canonical)?;
 
         Ok(canonical)
     }
 
     /// Resolve a path that may not exist yet (e.g. create/rename targets)
-    pub fn resolve_new_path(&self, path: &str, allow_missing_parents: bool) -> Result<PathBuf, FileSystemError> {
+    pub fn resolve_new_path(
+        &self,
+        path: &str,
+        allow_missing_parents: bool,
+    ) -> Result<PathBuf, FileSystemError> {
         let path = Path::new(path);
 
         if !path.is_absolute() || contains_parent_dir(path) {
             return Err(FileSystemError::PathTraversal {
-                attempted_path: path.display().to_string(),
+                attempted_path: path_utils::to_protocol_path(path),
             });
         }
 
-        let parent = path.parent().ok_or_else(|| FileSystemError::PathTraversal {
-            attempted_path: path.display().to_string(),
-        })?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| FileSystemError::PathTraversal {
+                attempted_path: path_utils::to_protocol_path(path),
+            })?;
 
         // Check if any component in the parent path exists as a file when it should be a directory
         let mut current = PathBuf::new();
@@ -77,41 +84,52 @@ impl PathValidator {
             current.push(component);
             if current.exists() && current.is_file() {
                 return Err(FileSystemError::NotADirectory {
-                    path: current.display().to_string(),
+                    path: path_utils::to_protocol_path(&current),
                 });
             }
         }
 
         if !allow_missing_parents && !parent.exists() {
             return Err(FileSystemError::NotFound {
-                path: parent.display().to_string(),
+                path: path_utils::to_protocol_path(parent),
             });
         }
 
-        let existing_ancestor = find_existing_ancestor(path).ok_or_else(|| FileSystemError::NotFound {
-            path: path.display().to_string(),
-        })?;
-
-        let canonical_ancestor = existing_ancestor
-            .canonicalize()
-            .map_err(|e| FileSystemError::IoError {
-                message: e.to_string(),
+        let existing_ancestor =
+            find_existing_ancestor(path).ok_or_else(|| FileSystemError::NotFound {
+                path: path_utils::to_protocol_path(path),
             })?;
 
-        self.ensure_allowed(&canonical_ancestor)?;
-        self.ensure_not_denied(&canonical_ancestor)?;
-
-        if !self.config.follow_symlinks && self.contains_symlink(&canonical_ancestor) {
+        // Same rationale as validate_existing: check symlinks on the existing (non-canonical)
+        // prefix that is actually present on disk.
+        if !self.config.follow_symlinks && self.contains_symlink(&existing_ancestor) {
             return Err(FileSystemError::PermissionDenied {
-                path: canonical_ancestor.display().to_string(),
+                path: path_utils::to_protocol_path(&existing_ancestor),
                 reason: "Symlinked paths are not allowed".to_string(),
             });
         }
 
+        let canonical_ancestor =
+            existing_ancestor
+                .canonicalize()
+                .map_err(|e| FileSystemError::IoError {
+                    message: e.to_string(),
+                })?;
+
+        self.ensure_allowed(&canonical_ancestor)?;
+        self.ensure_not_denied(&canonical_ancestor)?;
+
         let relative = path
             .strip_prefix(&existing_ancestor)
             .unwrap_or_else(|_| Path::new(""));
-        let resolved = canonical_ancestor.join(relative);
+        // When the full target path already exists, `relative` is empty. Joining an empty
+        // segment can append a trailing slash on file paths (`/file/`) which later causes
+        // ENOTDIR on write/rename operations. Keep the canonical path as-is in that case.
+        let resolved = if relative.as_os_str().is_empty() {
+            canonical_ancestor.clone()
+        } else {
+            canonical_ancestor.join(relative)
+        };
 
         self.ensure_not_denied(&resolved)?;
 
@@ -143,7 +161,7 @@ impl PathValidator {
 
         if !is_allowed {
             return Err(FileSystemError::PermissionDenied {
-                path: path.display().to_string(),
+                path: path_utils::to_protocol_path(path),
                 reason: "Path is outside allowed directories".to_string(),
             });
         }
@@ -156,7 +174,7 @@ impl PathValidator {
         for pattern in &self.config.denied_patterns {
             if glob_match(pattern, &normalized) {
                 return Err(FileSystemError::PermissionDenied {
-                    path: path.display().to_string(),
+                    path: path_utils::to_protocol_path(path),
                     reason: format!("Path matches denied pattern: {}", pattern),
                 });
             }
@@ -168,7 +186,12 @@ impl PathValidator {
         let mut current = PathBuf::new();
         for component in path.components() {
             current.push(component.as_os_str());
-            if let Some(cached) = self.symlink_cache.lock().ok().and_then(|cache| cache.get(&current).cloned()) {
+            if let Some(cached) = self
+                .symlink_cache
+                .lock()
+                .ok()
+                .and_then(|cache| cache.get(&current).cloned())
+            {
                 if cached {
                     return true;
                 }
@@ -198,5 +221,7 @@ fn normalize_for_match(path: &Path) -> String {
 }
 
 fn find_existing_ancestor(path: &Path) -> Option<PathBuf> {
-    path.ancestors().find(|p| p.exists()).map(|p| p.to_path_buf())
+    path.ancestors()
+        .find(|p| p.exists())
+        .map(|p| p.to_path_buf())
 }

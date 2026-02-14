@@ -4,6 +4,7 @@
 
 use crate::daemon;
 use crate::protocol::{ClientMessage, ServerMessage, SessionListItem};
+use crate::setup;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use colored::Colorize;
 use futures_util::{SinkExt, StreamExt};
@@ -19,13 +20,14 @@ pub async fn run(session_id: Option<String>) -> Result<(), Box<dyn std::error::E
 
     let port = daemon::get_port().unwrap_or(daemon::DEFAULT_PORT);
     let ws_url = format!("ws://127.0.0.1:{}", port);
+    let auth_token = setup::load_config().map(|c| c.auth_token);
 
     // Connect to daemon to get session list
     let (mut ws, _) = connect_async(&ws_url).await?;
 
     // Send hello
     let hello = ClientMessage::Hello {
-        auth_token: None,
+        auth_token,
         client_version: env!("CARGO_PKG_VERSION").to_string(),
     };
     ws.send(Message::Text(serde_json::to_string(&hello)?))
@@ -173,7 +175,7 @@ async fn run_linked_mode(
 
     // Send hello
     let hello = ClientMessage::Hello {
-        auth_token: None,
+        auth_token: setup::load_config().map(|c| c.auth_token),
         client_version: env!("CARGO_PKG_VERSION").to_string(),
     };
     tx.send(Message::Text(serde_json::to_string(&hello)?))

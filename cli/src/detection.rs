@@ -107,10 +107,6 @@ impl CliTracker {
         self.current
     }
 
-    pub fn confidence(&self) -> u8 {
-        self.confidence
-    }
-
     pub fn apply_signal(&mut self, cli: CliType, weight: i32) {
         let entry = self.scores.entry(cli).or_insert(0);
         *entry += weight;
