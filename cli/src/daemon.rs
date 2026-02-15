@@ -2099,9 +2099,28 @@ fn is_windows_reserved_device_name(name: &str) -> bool {
     let upper = name.trim().to_ascii_uppercase();
     if matches!(
         upper.as_str(),
-        "CON" | "PRN" | "AUX" | "NUL" | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6"
-            | "COM7" | "COM8" | "COM9" | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5"
-            | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
     ) {
         return true;
     }
@@ -2519,14 +2538,18 @@ mod tests {
     async fn unicode_upload_name_stays_within_filesystem_limits() {
         let temp = TempDir::new().expect("tempdir");
         let project = temp.path().join("project");
-        tokio::fs::create_dir_all(&project).await.expect("create project");
+        tokio::fs::create_dir_all(&project)
+            .await
+            .expect("create project");
 
         let file_name = sanitize_upload_file_name(&(String::from("你").repeat(160) + ".txt"));
         assert!(file_name.len() <= MAX_UPLOAD_FILE_NAME_BYTES);
 
         let path = build_upload_destination_path(&project.to_string_lossy(), file_name);
         let parent = path.parent().expect("parent").to_path_buf();
-        tokio::fs::create_dir_all(parent).await.expect("create uploads dir");
+        tokio::fs::create_dir_all(parent)
+            .await
+            .expect("create uploads dir");
 
         tokio::fs::write(&path, b"x")
             .await
