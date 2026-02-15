@@ -107,11 +107,12 @@ fn request_terminal_resize(cols: u16, rows: u16) {
 
 /// Normalize newline input sequences before writing into the PTY.
 ///
-/// Some shells/PTY configurations rely on CR->NL translation (ICRNL). If that
-/// translation is disabled, a raw '\r' Enter key may not be treated as "submit".
-/// Converting CR and CRLF to '\n' makes Enter robust across environments.
+/// Different environments (raw/canonical mode, ICRNL, etc.) may send Enter as
+/// `\r` or `\n`. Converting any newline variant (LF/CR/CRLF) to `\r` keeps PTY
+/// input behavior consistent and avoids "line feed without carriage return"
+/// artifacts in some shells.
 fn normalize_input_newlines(input: &[u8]) -> Cow<'_, [u8]> {
-    if !input.contains(&b'\r') {
+    if !input.contains(&b'\r') && !input.contains(&b'\n') {
         return Cow::Borrowed(input);
     }
 
@@ -120,13 +121,18 @@ fn normalize_input_newlines(input: &[u8]) -> Cow<'_, [u8]> {
     while i < input.len() {
         let b = input[i];
         if b == b'\r' {
-            // If CRLF, collapse to single LF.
+            // If CRLF, collapse to a single CR.
             if i + 1 < input.len() && input[i + 1] == b'\n' {
-                out.push(b'\n');
+                out.push(b'\r');
                 i += 2;
                 continue;
             }
-            out.push(b'\n');
+            out.push(b'\r');
+            i += 1;
+            continue;
+        }
+        if b == b'\n' {
+            out.push(b'\r');
             i += 1;
             continue;
         }
