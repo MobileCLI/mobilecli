@@ -858,9 +858,11 @@ fn shell_args_for_command(shell: &str, command: &str) -> Vec<String> {
         base.as_str(),
         "bash" | "zsh" | "fish" | "ksh" | "tcsh" | "csh"
     );
-    let mut args = Vec::with_capacity(3);
+    let mut args = Vec::with_capacity(4);
     if supports_login {
+        // Interactive + login ensures user PATH customizations (e.g. nvm) are loaded.
         args.push("-l".to_string());
+        args.push("-i".to_string());
     }
     args.push("-c".to_string());
     args.push(command.to_string());
