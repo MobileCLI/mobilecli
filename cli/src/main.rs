@@ -9,6 +9,7 @@
 //!   mobilecli daemon       # Run the background server
 //!   mobilecli --help       # Show help
 
+mod autostart;
 mod daemon;
 mod detection;
 mod filesystem;
@@ -78,6 +79,12 @@ enum Commands {
     },
     /// Stop the background daemon
     Stop,
+    /// Install/uninstall daemon autostart (systemd user service on Linux, launchd agent on macOS)
+    Autostart {
+        #[command(subcommand)]
+        command: autostart::AutostartCommand,
+    },
+
     /// Link to an existing session (like screen -x or tmux attach)
     Link {
         /// Session ID or name to link to (optional - shows picker if omitted)
@@ -150,6 +157,13 @@ async fn main() -> ExitCode {
                 stop_daemon();
                 ExitCode::SUCCESS
             }
+            Commands::Autostart { command } => match autostart::run(command.clone()) {
+                Ok(_) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("{}: {}", "Autostart error".red().bold(), e);
+                    ExitCode::FAILURE
+                }
+            },
             Commands::Link { session } => match link::run(session.clone()).await {
                 Ok(_) => ExitCode::SUCCESS,
                 Err(e) => {
@@ -410,7 +424,7 @@ async fn show_pair_qr() -> Result<(), Box<dyn std::error::Error>> {
             session_id: String::new(), // Not session-specific
             session_name: None,
             encryption_key: None,
-            auth_token: Some(config.auth_token),
+            auth_token: None,
             version: env!("CARGO_PKG_VERSION").to_string(),
             device_id: Some(config.device_id),
             device_name: Some(config.device_name),

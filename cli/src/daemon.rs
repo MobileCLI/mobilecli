@@ -65,11 +65,19 @@ pub fn is_running() -> bool {
         return false;
     }
 
-    if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
-        if let Ok(pid) = pid_str.trim().parse::<u32>() {
-            return is_process_alive(pid);
+    let pid = std::fs::read_to_string(&pid_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+
+    if let Some(pid) = pid {
+        if is_process_alive(pid) {
+            return true;
         }
     }
+
+    // Stale PID/port files cause the app to think the daemon is running when it isn't.
+    let _ = std::fs::remove_file(pid_path);
+    let _ = std::fs::remove_file(port_file());
     false
 }
 
