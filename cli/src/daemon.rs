@@ -876,6 +876,43 @@ fn shell_command_line(shell: &str, args: &[String]) -> String {
     parts.join(" ")
 }
 
+fn resolve_mobilecli_bin() -> String {
+    // When the daemon survives a binary replacement, /proc/self/exe can include
+    // a trailing " (deleted)" suffix. Strip it and verify the path still exists.
+    if let Ok(exe) = std::env::current_exe() {
+        let exe_str = exe.to_string_lossy().to_string();
+        if std::path::Path::new(&exe_str).exists() {
+            return exe_str;
+        }
+
+        if let Some(stripped) = exe_str.strip_suffix(" (deleted)") {
+            if std::path::Path::new(stripped).exists() {
+                return stripped.to_string();
+            }
+        }
+    }
+
+    if let Ok(found) = which::which("mobilecli") {
+        let found_str = found.to_string_lossy().to_string();
+        if std::path::Path::new(&found_str).exists() {
+            return found_str;
+        }
+    }
+
+    if let Some(home) = platform::home_dir() {
+        let local_bin = home.join(".local/bin/mobilecli");
+        if local_bin.exists() {
+            return local_bin.to_string_lossy().to_string();
+        }
+    }
+
+    if cfg!(windows) {
+        "mobilecli.exe".to_string()
+    } else {
+        "mobilecli".to_string()
+    }
+}
+
 /// Build the shell command to run inside a terminal emulator.
 fn build_wrap_shell_command(
     mobilecli_bin: &str,
@@ -911,10 +948,7 @@ fn spawn_session_windows(
     use std::os::windows::process::CommandExt;
 
     let session_name = name.unwrap_or(command);
-    let mobilecli_bin = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| "mobilecli.exe".to_string());
+    let mobilecli_bin = resolve_mobilecli_bin();
 
     let mut cmd = std::process::Command::new(&mobilecli_bin);
     cmd.arg("--name").arg(session_name);
@@ -982,10 +1016,7 @@ async fn spawn_session_from_mobile(
 
     // Build the command to run inside the terminal
     let session_name = name.unwrap_or(command);
-    let mobilecli_bin = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| "mobilecli".to_string());
+    let mobilecli_bin = resolve_mobilecli_bin();
     let shell_candidate = platform::default_shell();
     let shell = if std::path::Path::new(&shell_candidate).exists()
         || which::which(&shell_candidate).is_ok()
