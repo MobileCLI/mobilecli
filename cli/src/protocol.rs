@@ -531,9 +531,6 @@ impl ConnectionInfo {
         if let Some(name) = &self.device_name {
             params.push(format!("device_name={}", urlencoding::encode(name)));
         }
-        if let Some(token) = &self.auth_token {
-            params.push(format!("auth_token={}", urlencoding::encode(token)));
-        }
         if is_wss {
             params.push("wss=1".to_string());
         }
