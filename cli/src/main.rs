@@ -20,6 +20,7 @@ mod pty_wrapper;
 mod qr;
 mod session;
 mod setup;
+mod shell_hook;
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
@@ -89,6 +90,12 @@ enum Commands {
     Link {
         /// Session ID or name to link to (optional - shows picker if omitted)
         session: Option<String>,
+    },
+
+    /// Manage auto-launch hook in your shell config (open mobilecli automatically in new terminals)
+    ShellHook {
+        #[command(subcommand)]
+        command: shell_hook::ShellHookCommand,
     },
 }
 
@@ -168,6 +175,13 @@ async fn main() -> ExitCode {
                 Ok(_) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("{}: {}", "Link error".red().bold(), e);
+                    ExitCode::FAILURE
+                }
+            },
+            Commands::ShellHook { command } => match shell_hook::run(command.clone()) {
+                Ok(_) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("{}: {}", "Shell hook error".red().bold(), e);
                     ExitCode::FAILURE
                 }
             },

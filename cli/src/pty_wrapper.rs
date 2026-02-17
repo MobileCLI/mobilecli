@@ -228,6 +228,9 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
         std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string()),
     );
 
+    // Prevent recursive auto-launch when shell hook is installed
+    cmd.env("MOBILECLI_SESSION", "1");
+
     // Spawn the command
     let mut child = pair
         .slave

@@ -3,6 +3,7 @@
 //! Handles first-time setup and connection configuration.
 
 use crate::platform;
+use crate::shell_hook;
 use colored::Colorize;
 use std::io::{self, Write};
 use std::process::Command;
@@ -516,6 +517,50 @@ pub fn run_setup_wizard() -> io::Result<Config> {
 
     // Save configuration
     save_config(&config)?;
+
+    // Offer auto-launch hook installation
+    println!();
+    println!(
+        "{}",
+        "── Auto-Launch ──────────────────────────────────────────────".dimmed()
+    );
+    println!();
+    println!(
+        "Would you like mobilecli to start {} when you open a new terminal?",
+        "automatically".green().bold()
+    );
+    println!(
+        "{}",
+        "This adds a small hook to your shell config (bashrc/zshrc/etc).".dimmed()
+    );
+    println!(
+        "{}",
+        "You can remove it anytime with: mobilecli shell-hook uninstall".dimmed()
+    );
+    println!();
+
+    if prompt_yn("Enable auto-launch?", true) {
+        if shell_hook::install_quiet() {
+            println!(
+                "{} Auto-launch enabled! New terminals will start mobilecli automatically.",
+                "✓".green()
+            );
+            println!(
+                "  To disable temporarily: {}",
+                "export MOBILECLI_NO_AUTO_LAUNCH=1".dimmed()
+            );
+        } else {
+            println!(
+                "{} Auto-launch hook was already installed (or could not detect your shell).",
+                "·".dimmed()
+            );
+        }
+    } else {
+        println!(
+            "{}",
+            "Skipped. You can enable later with: mobilecli shell-hook install".dimmed()
+        );
+    }
 
     println!();
     println!(
