@@ -1,275 +1,359 @@
-# MobileCLI
+<div align="center">
 
-**Control AI coding assistants from your phone.** Stream Claude Code, Codex, Gemini CLI, and any terminal session to your mobile device. Approve tool calls, answer questions, and monitor progress from anywhere.
+# >_ MobileCLI
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/Rust-1.70+-orange.svg)](https://www.rust-lang.org/)
-[![Expo](https://img.shields.io/badge/Expo-SDK_52-black.svg)](https://expo.dev/)
+### Your AI coding assistant, untethered.
 
-**Website:** https://mobilecli.app
-**Releases:** https://github.com/MobileCLI/mobilecli/releases
+Stream Claude Code, Codex, Gemini CLI, and any terminal to your phone.\
+Approve tool calls, browse files, and ship code — from anywhere.
 
----
+[![GitHub stars](https://img.shields.io/github/stars/MobileCLI/mobilecli?style=flat&color=0A84FF)](https://github.com/MobileCLI/mobilecli)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?color=0A84FF)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org/)
+[![Platform](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)]()
+[![iOS Beta](https://img.shields.io/badge/iOS-TestFlight_Beta-0A84FF.svg)](https://testflight.apple.com/join/MobileCLI)
 
-## Why MobileCLI?
+[Website](https://mobilecli.app) &bull; [Download](https://github.com/MobileCLI/mobilecli/releases) &bull; [Docs](https://mobilecli.app/docs) &bull; [TestFlight](https://testflight.apple.com/join/MobileCLI)
 
-AI coding assistants like Claude Code run long tasks that need periodic human approval. Without MobileCLI, you're stuck at your desk waiting for prompts. With MobileCLI:
+<br/>
 
-- **Walk away from your desk** - Get push notifications when Claude needs you
-- **Approve from anywhere** - One-tap approve/deny for tool calls and plans
-- **Monitor progress** - Full terminal output streamed to your phone
-- **Stay in control** - Type responses, send escape sequences, interact fully
+<img src="docs/hero-sidebyside.png" alt="MobileCLI — desktop terminal streaming to mobile" width="720" />
 
-## Features
+</div>
 
-### Smart CLI Detection
-MobileCLI automatically detects which AI assistant you're running and adapts:
-- **Claude Code** - Numbered option approval (1/2/3)
-- **Codex** - Numbered option approval
-- **Gemini CLI** - Yes/No prompts
-- **OpenCode** - Arrow key navigation
+<br/>
 
-### Push Notifications
-Get notified instantly when your CLI needs attention:
-- Tool approval requests
-- Plan review prompts
-- Questions requiring your input
-- Generic "awaiting response" states
+## The Problem
 
-### Real-time Terminal Streaming
-- Full ANSI color and formatting support
-- Scroll through output history
-- Responsive resizing for mobile screens
-- Low-latency WebSocket connection
+AI coding assistants run long tasks that need periodic human approval. You start Claude Code on a refactor, walk away, and come back 20 minutes later to find it's been waiting for you since minute two.
 
-### Privacy-First Architecture
-- **100% self-hosted** - No cloud relay, no third-party servers
-- **Direct connection** - Phone connects to your machine over LAN or Tailscale
-- **No data collection** - Your terminal output never leaves your network
+**MobileCLI fixes this.** Your terminal streams to your phone in real time. When your AI assistant needs you, you get a push notification and approve with one tap.
+
+<br/>
+
+<div align="center">
+<img src="docs/hero-approval.png" alt="One-tap approval from your phone" width="380" />
+<br/>
+<sub><b>One tap to approve, deny, or always-allow.</b></sub>
+</div>
+
+<br/>
 
 ## Quick Start
 
 ### 1. Install the CLI
 
-**Quick Install (recommended):**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/MobileCLI/mobilecli/main/install.sh | bash
+curl -fsSL https://mobilecli.app/install.sh | bash
 ```
 
-**Alternative methods:**
+<details>
+<summary>Other install methods</summary>
+
 ```bash
 # From crates.io
 cargo install mobilecli
 
 # From source
 git clone https://github.com/MobileCLI/mobilecli.git
-cd mobilecli/cli
-cargo install --path .
+cd mobilecli/cli && cargo install --path .
+
+# Pre-built binaries
+# → https://github.com/MobileCLI/mobilecli/releases
 ```
+</details>
 
-**Manual download:** [GitHub Releases](https://github.com/MobileCLI/mobilecli/releases)
-
-### 2. Run Setup
+### 2. Pair your phone
 
 ```bash
 mobilecli setup
 ```
 
-This starts the background daemon and displays a QR code for pairing. (`mobilecli --setup` is an alias.)
+Scan the QR code with the MobileCLI app. Done.
 
-### 3. Install the Mobile App
-
-- **iOS**: [App Store](https://apps.apple.com/app/mobilecli) (coming soon)
-- **Android**: [Google Play](https://play.google.com/store/apps/details?id=app.mobilecli) (coming soon)
-
-Scan the QR code to connect.
-
-### 4. Start Streaming
+### 3. Stream
 
 ```bash
-# Stream your default shell
-mobilecli
-
-# Stream a specific command
-mobilecli claude
-
-# Name your session
-mobilecli -n "Backend refactor" claude
+mobilecli claude           # Stream Claude Code
+mobilecli codex            # Stream Codex
+mobilecli -n "Refactor" claude   # Name your session
+mobilecli                  # Stream your default shell
 ```
 
-## Usage Examples
+Your phone now mirrors your terminal. Walk away.
 
-### Claude Code
-```bash
-mobilecli claude
-# Your phone shows the terminal output
-# When Claude asks for tool approval, you get a notification
-# Tap Approve/Always/Deny on your phone
+<br/>
+
+## Features
+
+### Smart CLI Detection
+
+MobileCLI automatically detects which AI assistant you're running and adapts the approval UI:
+
+| Assistant | Detection | Approval Style |
+|-----------|-----------|---------------|
+| **Claude Code** | Auto | Numbered options (y / a / n) |
+| **Codex** | Auto | Numbered options |
+| **Gemini CLI** | Auto | Yes / No prompts |
+| **OpenCode** | Auto | Arrow key navigation |
+| Any command | Manual | Full terminal + keyboard |
+
+### Push Notifications
+
+Get notified the moment your CLI needs you — not 20 minutes later.
+
+- Tool approval requests
+- Plan review prompts
+- Questions requiring your input
+- Session completion alerts
+
+### File Browser & Editor *(Pro)*
+
+Browse, search, edit, and manage files on your dev machine from your phone:
+
+- Syntax-highlighted code editor
+- Full-text search across directories
+- Create, rename, copy, and delete files
+- Markdown preview, image viewer, PDF viewer
+- Upload files from your phone to your dev machine
+
+### Real-time Terminal
+
+- Full ANSI color and formatting (256-color)
+- Scrollable output history
+- Touch keyboard with special keys (Ctrl, Tab, arrows, Esc)
+- Responsive resize for mobile screens
+- Low-latency WebSocket streaming
+
+<br/>
+
+## Privacy-First Architecture
+
+MobileCLI is **100% self-hosted**. No cloud relay. No third-party servers. No accounts.
+
 ```
-
-### Codex
-```bash
-mobilecli codex
-# Same workflow - notifications and one-tap approval
-```
-
-### Any Command
-```bash
-# Long-running builds
-mobilecli -n "Build" npm run build
-
-# Interactive scripts
-mobilecli python script.py
-
-# Remote sessions
-mobilecli ssh server
-```
-
-## Architecture
-
-```
-┌─────────────────┐     WebSocket      ┌─────────────────┐
-│                 │◄──────────────────►│                 │
-│   CLI Daemon    │                    │   Mobile App    │
-│   (port 9847)   │                    │                 │
-│                 │                    │                 │
-└────────┬────────┘                    └─────────────────┘
+Your Machine                            Your Phone
+┌──────────────────────┐   WebSocket   ┌──────────────────────┐
+│                      │◄────────────►│                      │
+│   mobilecli daemon   │  LAN / VPN   │   MobileCLI App      │
+│   (Rust, port 9847)  │              │   (React Native)     │
+│                      │              │                      │
+│   ┌──────────────┐   │              │   - Live terminal    │
+│   │ PTY session  │   │              │   - Push notifs      │
+│   │ claude/codex │   │              │   - File browser     │
+│   │ gemini/etc   │   │              │   - One-tap approve  │
+│   └──────────────┘   │              │                      │
+└──────────────────────┘              └──────────────────────┘
          │
-         │ PTY
-         ▼
-┌─────────────────┐
-│                 │
-│  claude/codex   │
-│  gemini/etc     │
-│                 │
-└─────────────────┘
+   Direct connection
+   over your network
+   (never leaves LAN)
 ```
 
-**Components:**
-- **Daemon** - Background WebSocket server managing PTY sessions
-- **Wrapper** - Spawns commands in a PTY, streams to daemon
-- **Mobile App** - React Native/Expo app with xterm.js terminal
+Your terminal output **never touches the internet** unless you explicitly use Tailscale for remote access.
+
+<br/>
+
+## Connection Modes
+
+| Mode | Use Case | Setup |
+|------|----------|-------|
+| **Local Network** | Same WiFi / LAN | Zero config — auto-detected |
+| **Tailscale** | Access from anywhere | `mobilecli setup` → choose Tailscale |
+| **Custom URL** | TLS proxy, port forwarding | Provide your own `ws://` or `wss://` URL |
+
+<br/>
 
 ## CLI Reference
 
 ```
-mobilecli                    # Start your shell with streaming
-mobilecli <command>          # Run command with streaming
-mobilecli -n "Name" <cmd>    # Name the session
-mobilecli setup              # Run setup wizard, show QR code
-mobilecli status             # Show daemon and session status
-mobilecli pair               # Show QR code for pairing
-mobilecli link               # Link to an existing session (like screen -x)
-mobilecli link <session>     # Link to specific session by name/ID
-mobilecli daemon             # Start daemon manually
-mobilecli stop               # Stop the daemon
+USAGE:
+    mobilecli [OPTIONS] [COMMAND]
+
+COMMANDS:
+    mobilecli                         Start your shell with streaming
+    mobilecli <command>               Run a command with streaming
+    mobilecli -n "Name" <cmd>         Name the session
+    mobilecli setup                   Run setup wizard + show QR code
+    mobilecli status                  Show daemon and session info
+    mobilecli pair                    Show QR code for pairing
+    mobilecli link [session]          Attach to an existing session
+    mobilecli daemon [--port PORT]    Start daemon manually
+    mobilecli stop                    Stop the daemon
+    mobilecli autostart install       Auto-start daemon on boot (systemd/launchd)
+    mobilecli autostart uninstall     Remove auto-start
+    mobilecli shell-hook install      Auto-launch mobilecli in new terminals
+    mobilecli shell-hook uninstall    Remove auto-launch hook
+    mobilecli shell-hook status       Check auto-launch status
 ```
+
+### Auto-Launch
+
+Want mobilecli to start every time you open a terminal?
+
+```bash
+mobilecli shell-hook install
+```
+
+This adds a small hook to your shell config (`.bashrc`, `.zshrc`, `config.fish`, or PowerShell `$PROFILE`). Remove it anytime with `mobilecli shell-hook uninstall`, or bypass temporarily:
+
+```bash
+export MOBILECLI_NO_AUTO_LAUNCH=1
+```
+
+<br/>
+
+## Platform Support
+
+### CLI (Daemon + Wrapper)
+
+| Platform | Status | Daemon Autostart | Shell Hook |
+|----------|--------|-----------------|------------|
+| **Linux** | Fully supported | systemd user service | bash, zsh, fish |
+| **macOS** | Fully supported | launchd agent | bash, zsh, fish |
+| **Windows** | Fully supported | *(manual)* | PowerShell, cmd.exe |
+
+### Mobile App
+
+| Platform | Status | Link |
+|----------|--------|------|
+| **iOS** | TestFlight Beta | [Join Beta](https://testflight.apple.com/join/MobileCLI) |
+| **Android** | Coming Soon | — |
+
+<br/>
 
 ## Configuration
 
-Config stored in `~/.mobilecli/config.json`:
+Config lives in `~/.mobilecli/`:
 
-```json
-{
-  "device_id": "uuid-string",      // Unique device identifier
-  "device_name": "MacBook-Pro",    // Display name (hostname by default)
-  "connection_mode": "local",      // "local" or "tailscale"
-  "local_ip": "192.168.1.100",
-  "tailscale_ip": null,
-  "auth_token": "uuid-string"      // Optional QR pairing token
-}
-```
+| File | Purpose |
+|------|---------|
+| `config.json` | Device identity, connection mode, auth token |
+| `daemon.pid` | Running daemon process ID |
+| `daemon.port` | WebSocket port (default: `9847`) |
+| `daemon.log` | Daemon debug logs |
 
-**Connection Modes:**
-- **Local** - Connect over your WiFi network (same LAN required)
-- **Tailscale** - Connect over Tailscale VPN (works from anywhere)
+<br/>
 
-**Multi-Device Support:**
-The mobile app supports linking multiple computers. Each computer gets a unique `device_id` on first setup. Scanning a new QR code adds that device to your linked devices list.
+## Pricing
 
-## Mobile App Features
+The CLI daemon is **open source and free forever**.
 
-- **Session List** - See all active terminal sessions
-- **Live Terminal** - Full terminal emulation with touch keyboard
-- **Quick Actions** - Approve/Deny buttons for tool calls
-- **Push Notifications** - Background alerts when CLI needs attention
-- **Dark Theme** - Easy on the eyes, matches terminal aesthetic
+| | Free | Pro |
+|---|---|---|
+| Terminal streaming | Unlimited | Unlimited |
+| Push notifications | Included | Included |
+| Tool call approvals | Included | Included |
+| Session management | Included | Included |
+| Multi-device | Included | Included |
+| File browser & editor | — | Included |
+| Code search | — | Included |
+| Image / PDF / Markdown viewer | — | Included |
+| | **$0** | **$20/yr** or **$30 lifetime** |
+| | | 3-day free trial |
 
-## Troubleshooting
-
-### Can't connect from mobile app
-
-1. **Same network?** Ensure phone and computer are on same WiFi
-2. **Firewall?** Allow port 9847 (or check `~/.mobilecli/daemon.port`)
-3. **Daemon running?** Run `mobilecli status` to check
-4. **Pairing metadata (optional):** Re-scan the QR code (`mobilecli pair`) to refresh saved device details
-
-### No push notifications
-
-1. **Permissions?** Check notification permissions in iOS/Android settings
-2. **Token registered?** App should auto-register on connect
-3. **Daemon logs?** Check `~/.mobilecli/daemon.log`
-
-### Terminal looks wrong
-
-1. **Font?** Mobile uses system monospace font
-2. **Size?** Terminal adapts to phone screen, some content may wrap
-3. **Colors?** Full ANSI 256-color support enabled
+<br/>
 
 ## Development
 
 ### CLI (Rust)
+
 ```bash
 cd cli
 cargo build
-cargo run -- --setup
-RUST_LOG=debug cargo run -- claude  # With debug logging
+cargo run -- setup          # Run setup wizard
+RUST_LOG=debug cargo run    # Debug mode
+cargo test                  # Run tests
+cargo clippy                # Lint
 ```
 
-### Mobile (React Native/Expo)
+### Mobile App (React Native / Expo)
+
 ```bash
 cd mobile
 npm install
-npx expo start
+npx expo start              # Development server
 # Press 'i' for iOS simulator, 'a' for Android emulator
 ```
 
 ### Project Structure
+
 ```
 MobileCLI/
-├── cli/                 # Rust CLI and daemon
-│   ├── src/
-│   │   ├── main.rs      # Entry point, CLI args
-│   │   ├── daemon.rs    # WebSocket server, PTY management
-│   │   ├── detection.rs # CLI type detection, wait state parsing
-│   │   ├── protocol.rs  # WebSocket message types
-│   │   ├── pty_wrapper.rs
-│   │   ├── session.rs
-│   │   └── setup.rs
-│   └── Cargo.toml
-├── mobile/              # React Native app (Expo)
-│   ├── app/             # Expo Router screens
-│   ├── components/      # UI components
-│   ├── hooks/           # useSync, useSettings, etc.
-│   └── package.json
-├── docs/                # Documentation
-└── website/             # Marketing site (Astro)
+├── cli/                        # Rust CLI daemon + wrapper
+│   └── src/
+│       ├── main.rs             # Entry point, command routing
+│       ├── daemon.rs           # WebSocket server, session management
+│       ├── pty_wrapper.rs      # PTY spawning, I/O streaming
+│       ├── detection.rs        # AI CLI detection, wait-state parsing
+│       ├── setup.rs            # Interactive setup wizard
+│       ├── shell_hook.rs       # Shell auto-launch hook
+│       ├── autostart.rs        # systemd / launchd integration
+│       ├── filesystem/         # Remote file operations
+│       └── protocol.rs         # WebSocket message types
+├── mobile/                     # React Native app (Expo)
+│   ├── app/                    # Expo Router screens
+│   ├── components/             # Terminal, file browser, viewers
+│   └── hooks/                  # useSync, useFileSystem, usePremium
+├── website/                    # Marketing site (Astro + Tailwind)
+├── install.sh                  # One-line installer
+└── docs/                       # Documentation + architecture
 ```
+
+<br/>
+
+## Troubleshooting
+
+<details>
+<summary><b>Can't connect from mobile app</b></summary>
+
+1. **Same network?** Phone and computer must be on the same WiFi (or both on Tailscale)
+2. **Firewall?** Allow inbound on port `9847` (check `~/.mobilecli/daemon.port` for actual port)
+3. **Daemon running?** Run `mobilecli status` to verify
+4. **Re-pair:** Run `mobilecli pair` and scan the QR code again
+</details>
+
+<details>
+<summary><b>No push notifications</b></summary>
+
+1. Check notification permissions in iOS/Android settings
+2. Push token registers automatically on WebSocket connect
+3. Check `~/.mobilecli/daemon.log` for delivery errors
+</details>
+
+<details>
+<summary><b>Terminal looks wrong on mobile</b></summary>
+
+1. MobileCLI supports full ANSI 256-color — ensure your `TERM` is set (default: `xterm-256color`)
+2. Terminal auto-resizes to phone screen; some wide content may wrap
+3. Try landscape mode for wider output
+</details>
+
+<br/>
 
 ## Contributing
 
-Contributions welcome! Please:
+Contributions welcome. The CLI daemon is open source under MIT.
 
 1. Fork the repo
 2. Create a feature branch
-3. Make your changes
-4. Run `cargo test` and `cargo clippy`
-5. Submit a PR
+3. Run `cargo test && cargo clippy` before submitting
+4. Open a PR
+
+<br/>
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT License — see [LICENSE](LICENSE) for details.
+
+<br/>
+
+<div align="center">
 
 ---
 
-**Built for developers who use AI coding assistants and want freedom from their desk.**
+**Stop babysitting your AI assistant.** Let it work. You'll get a notification.
+
+[Get Started](https://mobilecli.app) &bull; [GitHub](https://github.com/MobileCLI/mobilecli) &bull; [TestFlight](https://testflight.apple.com/join/MobileCLI)
+
+</div>
