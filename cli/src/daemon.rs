@@ -1013,8 +1013,8 @@ async fn spawn_session_from_mobile(
         return spawn_session_windows(command, args, name, working_dir);
     }
 
-    // Detect terminal emulator
-    let terminal = detect_terminal_emulator()?;
+    // Try to detect terminal emulator (headless servers won't have one)
+    let terminal = detect_terminal_emulator().ok();
 
     // Build the command to run inside the terminal
     let session_name = name.unwrap_or(command);
@@ -1031,63 +1031,88 @@ async fn spawn_session_from_mobile(
         build_wrap_shell_command(&mobilecli_bin, session_name, command, args, working_dir);
     let shell_args = shell_args_for_command(&shell, &wrap_cmd);
 
-    tracing::info!("Spawning session: {} via {}", wrap_cmd, terminal.name);
+    let mut cmd = if let Some(ref terminal) = terminal {
+        tracing::info!("Spawning session: {} via {}", wrap_cmd, terminal.name);
 
-    // Build terminal command based on detected emulator
-    let mut cmd = std::process::Command::new(&terminal.binary);
+        // Build terminal command based on detected emulator
+        let mut c = std::process::Command::new(&terminal.binary);
 
-    match terminal.name.as_str() {
-        "kitty" => {
-            cmd.arg("--").arg(&shell).args(&shell_args);
+        match terminal.name.as_str() {
+            "kitty" => {
+                c.arg("--").arg(&shell).args(&shell_args);
+            }
+            "alacritty" => {
+                c.arg("-e").arg(&shell).args(&shell_args);
+            }
+            "gnome-terminal" | "tilix" => {
+                c.arg("--").arg(&shell).args(&shell_args);
+            }
+            "konsole" => {
+                c.arg("-e").arg(&shell).args(&shell_args);
+            }
+            "xterm" | "urxvt" => {
+                c.arg("-e").arg(&shell).args(&shell_args);
+            }
+            "wezterm" => {
+                c.args(["start", "--"]).arg(&shell).args(&shell_args);
+            }
+            "iterm" => {
+                // macOS iTerm2 - use osascript to open a new window
+                let shell_cmd = shell_command_line(&shell, &shell_args);
+                let script = format!(
+                    r#"tell application "iTerm"
+                        create window with default profile
+                        tell current session of current window
+                            write text "{}"
+                        end tell
+                    end tell"#,
+                    shell_cmd.replace('\\', "\\\\").replace('"', "\\\"")
+                );
+                c = std::process::Command::new("osascript");
+                c.args(["-e", &script]);
+            }
+            "terminal" => {
+                // macOS Terminal.app
+                let shell_cmd = shell_command_line(&shell, &shell_args);
+                let script = format!(
+                    r#"tell application "Terminal"
+                        do script "{}"
+                        activate
+                    end tell"#,
+                    shell_cmd.replace('\\', "\\\\").replace('"', "\\\"")
+                );
+                c = std::process::Command::new("osascript");
+                c.args(["-e", &script]);
+            }
+            _ => {
+                // Generic fallback: try -e flag
+                c.arg("-e").arg(&shell).args(&shell_args);
+            }
         }
-        "alacritty" => {
-            cmd.arg("-e").arg(&shell).args(&shell_args);
-        }
-        "gnome-terminal" | "tilix" => {
-            cmd.arg("--").arg(&shell).args(&shell_args);
-        }
-        "konsole" => {
-            cmd.arg("-e").arg(&shell).args(&shell_args);
-        }
-        "xterm" | "urxvt" => {
-            cmd.arg("-e").arg(&shell).args(&shell_args);
-        }
-        "wezterm" => {
-            cmd.args(["start", "--"]).arg(&shell).args(&shell_args);
-        }
-        "iterm" => {
-            // macOS iTerm2 - use osascript to open a new window
-            let shell_cmd = shell_command_line(&shell, &shell_args);
-            let script = format!(
-                r#"tell application "iTerm"
-                    create window with default profile
-                    tell current session of current window
-                        write text "{}"
-                    end tell
-                end tell"#,
-                shell_cmd.replace('\\', "\\\\").replace('"', "\\\"")
+        c
+    } else {
+        // Headless mode: no terminal emulator available.
+        // Use tmux for session management if available, otherwise spawn directly.
+        // The mobilecli pty-wrap command creates its own PTY, so a terminal
+        // window is not required — the mobile app views output via WebSocket.
+        if which::which("tmux").is_ok() {
+            let tmux_name = format!(
+                "mcli-{}",
+                session_name.replace(|ch: char| !ch.is_alphanumeric() && ch != '-', "-")
             );
-            cmd = std::process::Command::new("osascript");
-            cmd.args(["-e", &script]);
-        }
-        "terminal" => {
-            // macOS Terminal.app
             let shell_cmd = shell_command_line(&shell, &shell_args);
-            let script = format!(
-                r#"tell application "Terminal"
-                    do script "{}"
-                    activate
-                end tell"#,
-                shell_cmd.replace('\\', "\\\\").replace('"', "\\\"")
-            );
-            cmd = std::process::Command::new("osascript");
-            cmd.args(["-e", &script]);
+            tracing::info!("Spawning session headless (tmux): {}", wrap_cmd);
+            let mut c = std::process::Command::new("tmux");
+            c.args(["new-session", "-d", "-s", &tmux_name, &shell_cmd]);
+            c
+        } else {
+            // Direct spawn: mobilecli pty-wrap creates its own PTY
+            tracing::info!("Spawning session headless (direct): {}", wrap_cmd);
+            let mut c = std::process::Command::new(&shell);
+            c.args(&shell_args);
+            c
         }
-        _ => {
-            // Generic fallback: try -e flag
-            cmd.arg("-e").arg(&shell).args(&shell_args);
-        }
-    }
+    };
 
     // Set working directory if specified
     if let Some(dir) = working_dir {
