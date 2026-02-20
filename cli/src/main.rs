@@ -80,7 +80,7 @@ enum Commands {
     },
     /// Stop the background daemon
     Stop,
-    /// Install/uninstall daemon autostart (systemd user service on Linux, launchd agent on macOS)
+    /// Install/uninstall daemon autostart (systemd on Linux, launchd on macOS, Task Scheduler on Windows)
     Autostart {
         #[command(subcommand)]
         command: autostart::AutostartCommand,

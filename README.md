@@ -180,7 +180,7 @@ COMMANDS:
     mobilecli link [session]          Attach to an existing session
     mobilecli daemon [--port PORT]    Start daemon manually
     mobilecli stop                    Stop the daemon
-    mobilecli autostart install       Auto-start daemon on boot (systemd/launchd)
+    mobilecli autostart install       Auto-start daemon on login (systemd/launchd/Task Scheduler)
     mobilecli autostart uninstall     Remove auto-start
     mobilecli shell-hook install      Auto-launch mobilecli in new terminals
     mobilecli shell-hook uninstall    Remove auto-launch hook
@@ -211,7 +211,7 @@ export MOBILECLI_NO_AUTO_LAUNCH=1
 |----------|--------|-----------------|------------|
 | **Linux** | Fully supported | systemd user service | bash, zsh, fish |
 | **macOS** | Fully supported | launchd agent | bash, zsh, fish |
-| **Windows** | Fully supported | *(manual)* | PowerShell, cmd.exe |
+| **Windows** | Fully supported | Task Scheduler task | PowerShell, cmd.exe |
 
 ### Mobile App
 
@@ -288,7 +288,7 @@ MobileCLI/
 │       ├── detection.rs        # AI CLI detection, wait-state parsing
 │       ├── setup.rs            # Interactive setup wizard
 │       ├── shell_hook.rs       # Shell auto-launch hook
-│       ├── autostart.rs        # systemd / launchd integration
+│       ├── autostart.rs        # systemd / launchd / Task Scheduler integration
 │       ├── filesystem/         # Remote file operations
 │       └── protocol.rs         # WebSocket message types
 ├── mobile/                     # React Native app (Expo)
