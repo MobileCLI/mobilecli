@@ -376,8 +376,8 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                                             if saved_local_size.is_none() {
                                                 saved_local_size = get_terminal_size_opt();
                                             }
-                                            let cols = cols as u16;
-                                            let rows = rows as u16;
+                                            let cols = cols.min(u16::MAX as u64) as u16;
+                                            let rows = rows.min(u16::MAX as u64) as u16;
                                             request_terminal_resize(cols, rows);
                                             (cols, rows)
                                         };

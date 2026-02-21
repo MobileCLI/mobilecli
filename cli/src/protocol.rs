@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     Hello {
-        auth_token: Option<String>,
         client_version: String,
     },
     Subscribe {
@@ -178,7 +177,6 @@ pub enum ClientMessage {
 pub enum ServerMessage {
     Welcome {
         server_version: String,
-        authenticated: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         device_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -485,12 +483,6 @@ pub struct ConnectionInfo {
     pub session_name: Option<String>,
     /// Optional encryption key (base64)
     pub encryption_key: Option<String>,
-    /// Optional auth token included in pairing QR metadata.
-    ///
-    /// This can be stored on-device for convenience, but direct URL/IP connections
-    /// are also supported without a token.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub auth_token: Option<String>,
     /// Server version
     pub version: String,
     /// Device UUID (for multi-device support)

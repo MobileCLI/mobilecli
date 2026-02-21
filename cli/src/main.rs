@@ -438,7 +438,6 @@ async fn show_pair_qr() -> Result<(), Box<dyn std::error::Error>> {
             session_id: String::new(), // Not session-specific
             session_name: None,
             encryption_key: None,
-            auth_token: None,
             version: env!("CARGO_PKG_VERSION").to_string(),
             device_id: Some(config.device_id),
             device_name: Some(config.device_name),

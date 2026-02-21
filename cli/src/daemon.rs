@@ -137,7 +137,7 @@ pub struct PtySession {
 /// Daemon shared state
 pub struct DaemonState {
     pub sessions: HashMap<String, PtySession>,
-    pub mobile_clients: HashMap<SocketAddr, mpsc::UnboundedSender<Message>>,
+    pub mobile_clients: HashMap<SocketAddr, mpsc::Sender<Message>>,
     pub pty_broadcast: broadcast::Sender<(String, Vec<u8>)>,
     pub port: u16, // The actual port the daemon is running on
     pub push_tokens: Vec<PushToken>,
@@ -151,9 +151,6 @@ pub struct DaemonState {
     pub device_id: Option<String>,
     /// Device name (hostname)
     pub device_name: Option<String>,
-    /// Optional pairing token embedded in QR codes (from `~/.mobilecli/config.json`).
-    /// Direct URL/IP connections are allowed without this token.
-    pub auth_token: Option<String>,
 }
 
 impl DaemonState {
@@ -162,17 +159,13 @@ impl DaemonState {
         let file_system = std::sync::Arc::new(FileSystemService::new(FileSystemConfig::default()));
 
         // Load device info from config. If missing, create a default config so we always
-        // have a stable device_id + auth_token for pairing/auth.
+        // have a stable device_id for pairing.
         let cfg = crate::setup::load_config().unwrap_or_else(|| {
             let cfg = crate::setup::Config::default();
             let _ = crate::setup::save_config(&cfg);
             cfg
         });
-        let (device_id, device_name, auth_token) = (
-            Some(cfg.device_id),
-            Some(cfg.device_name),
-            Some(cfg.auth_token),
-        );
+        let (device_id, device_name) = (Some(cfg.device_id), Some(cfg.device_name));
 
         Self {
             sessions: HashMap::new(),
@@ -188,7 +181,6 @@ impl DaemonState {
             file_rate_limiters: HashMap::new(),
             device_id,
             device_name,
-            auth_token,
         }
     }
 }
@@ -210,6 +202,9 @@ pub async fn run(port: u16) -> std::io::Result<()> {
 
     let state: SharedState = Arc::new(RwLock::new(DaemonState::new(port)));
 
+    // Limit concurrent connections to prevent resource exhaustion
+    let conn_limit = Arc::new(tokio::sync::Semaphore::new(64));
+
     // Start WebSocket server on all interfaces (0.0.0.0)
     // This is intentional - mobile clients need network access to connect.
     // Security model: Access is controlled at the network level via:
@@ -221,10 +216,10 @@ pub async fn run(port: u16) -> std::io::Result<()> {
 
     // Run the main loop with platform-specific signal handling
     #[cfg(unix)]
-    run_server_loop_unix(listener, state).await;
+    run_server_loop_unix(listener, state, conn_limit).await;
 
     #[cfg(not(unix))]
-    run_server_loop_ctrlc_only(listener, state).await;
+    run_server_loop_ctrlc_only(listener, state, conn_limit).await;
 
     // Cleanup
     let _ = std::fs::remove_file(&pid_path);
@@ -234,7 +229,11 @@ pub async fn run(port: u16) -> std::io::Result<()> {
 
 /// Server loop with Unix signal handling (SIGTERM + Ctrl+C)
 #[cfg(unix)]
-async fn run_server_loop_unix(listener: TcpListener, state: SharedState) {
+async fn run_server_loop_unix(
+    listener: TcpListener,
+    state: SharedState,
+    conn_limit: Arc<tokio::sync::Semaphore>,
+) {
     use tokio::signal::unix::{signal, SignalKind};
 
     // Try to set up SIGTERM handler, fall back to Ctrl+C only if it fails
@@ -245,7 +244,7 @@ async fn run_server_loop_unix(listener: TcpListener, state: SharedState) {
             sigterm_result.err()
         );
         // Fall back to generic loop with just Ctrl+C
-        run_server_loop_ctrlc_only(listener, state).await;
+        run_server_loop_ctrlc_only(listener, state, conn_limit).await;
         return;
     }
     let mut sigterm = sigterm_result.unwrap();
@@ -255,7 +254,18 @@ async fn run_server_loop_unix(listener: TcpListener, state: SharedState) {
             result = listener.accept() => {
                 if let Ok((stream, addr)) = result {
                     let state = state.clone();
-                    tokio::spawn(handle_connection(stream, addr, state));
+                    let permit = conn_limit.clone().try_acquire_owned();
+                    match permit {
+                        Ok(permit) => {
+                            tokio::spawn(async move {
+                                let _permit = permit; // held until connection ends
+                                let _ = handle_connection(stream, addr, state).await;
+                            });
+                        }
+                        Err(_) => {
+                            tracing::warn!("Connection limit reached, rejecting {}", addr);
+                        }
+                    }
                 }
             }
             _ = tokio::signal::ctrl_c() => {
@@ -271,13 +281,28 @@ async fn run_server_loop_unix(listener: TcpListener, state: SharedState) {
 }
 
 /// Server loop with Ctrl+C only (fallback or non-Unix)
-async fn run_server_loop_ctrlc_only(listener: TcpListener, state: SharedState) {
+async fn run_server_loop_ctrlc_only(
+    listener: TcpListener,
+    state: SharedState,
+    conn_limit: Arc<tokio::sync::Semaphore>,
+) {
     loop {
         tokio::select! {
             result = listener.accept() => {
                 if let Ok((stream, addr)) = result {
                     let state = state.clone();
-                    tokio::spawn(handle_connection(stream, addr, state));
+                    let permit = conn_limit.clone().try_acquire_owned();
+                    match permit {
+                        Ok(permit) => {
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                let _ = handle_connection(stream, addr, state).await;
+                            });
+                        }
+                        Err(_) => {
+                            tracing::warn!("Connection limit reached, rejecting {}", addr);
+                        }
+                    }
                 }
             }
             _ = tokio::signal::ctrl_c() => {
@@ -339,43 +364,7 @@ async fn handle_mobile_client(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing::info!("Mobile client connected: {}", addr);
 
-    // Pairing token from QR is optional. Direct URL/IP entry should work without QR.
-    // If a token is provided, we log mismatches for diagnostics but do not reject.
-    let expected_token = {
-        let st = state.read().await;
-        st.auth_token.clone()
-    }
-    .filter(|t| !t.trim().is_empty());
-
-    let hello_msg = first_msg
-        .as_deref()
-        .and_then(|text| serde_json::from_str::<ClientMessage>(text).ok());
-    let provided_token = match hello_msg {
-        Some(ClientMessage::Hello { auth_token, .. }) => auth_token,
-        _ => None,
-    };
-
-    if let Some(expected) = expected_token.as_deref() {
-        match provided_token.as_deref() {
-            Some(provided) if provided != expected => {
-                tracing::warn!(
-                    "Mobile client provided mismatched pairing token: {} (allowing direct connection)",
-                    addr
-                );
-            }
-            Some(_) => {
-                tracing::debug!("Mobile client provided matching pairing token: {}", addr);
-            }
-            None => {
-                tracing::debug!(
-                    "Mobile client connected without pairing token: {} (direct/manual connect)",
-                    addr
-                );
-            }
-        }
-    }
-
-    let (client_tx, mut client_rx) = mpsc::unbounded_channel::<Message>();
+    let (client_tx, mut client_rx) = mpsc::channel::<Message>(4096);
     let watch_tx = client_tx.clone();
     let (disconnect_tx, mut disconnect_rx) = tokio::sync::watch::channel(false);
 
@@ -456,7 +445,7 @@ async fn handle_mobile_client(
                 new_entry,
             };
             if let Ok(text) = serde_json::to_string(&msg) {
-                if watch_tx.send(Message::Text(text)).is_err() {
+                if watch_tx.try_send(Message::Text(text)).is_err() {
                     break;
                 }
             }
@@ -470,7 +459,6 @@ async fn handle_mobile_client(
     };
     let welcome = ServerMessage::Welcome {
         server_version: env!("CARGO_PKG_VERSION").to_string(),
-        authenticated: true,
         device_id,
         device_name,
     };
@@ -788,7 +776,7 @@ async fn handle_pty_session(
         };
         let msg_str = serde_json::to_string(&msg)?;
         for client in st.mobile_clients.values() {
-            let _ = client.send(Message::Text(msg_str.clone()));
+            let _ = client.try_send(Message::Text(msg_str.clone()));
         }
     }
 
@@ -867,6 +855,14 @@ fn shell_args_for_command(shell: &str, command: &str) -> Vec<String> {
     args.push("-c".to_string());
     args.push(command.to_string());
     args
+}
+
+/// Escape a string for embedding inside AppleScript double-quoted literals.
+/// Handles backslashes, double quotes, and strips newlines to prevent injection.
+fn escape_for_applescript(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace(['\n', '\r'], " ")
 }
 
 fn shell_command_line(shell: &str, args: &[String]) -> String {
@@ -1058,28 +1054,26 @@ async fn spawn_session_from_mobile(
             }
             "iterm" => {
                 // macOS iTerm2 - use osascript to open a new window
-                let shell_cmd = shell_command_line(&shell, &shell_args);
+                let shell_cmd = escape_for_applescript(&shell_command_line(&shell, &shell_args));
                 let script = format!(
                     r#"tell application "iTerm"
                         create window with default profile
                         tell current session of current window
-                            write text "{}"
+                            write text "{shell_cmd}"
                         end tell
                     end tell"#,
-                    shell_cmd.replace('\\', "\\\\").replace('"', "\\\"")
                 );
                 c = std::process::Command::new("osascript");
                 c.args(["-e", &script]);
             }
             "terminal" => {
                 // macOS Terminal.app
-                let shell_cmd = shell_command_line(&shell, &shell_args);
+                let shell_cmd = escape_for_applescript(&shell_command_line(&shell, &shell_args));
                 let script = format!(
                     r#"tell application "Terminal"
-                        do script "{}"
+                        do script "{shell_cmd}"
                         activate
                     end tell"#,
-                    shell_cmd.replace('\\', "\\\\").replace('"', "\\\"")
                 );
                 c = std::process::Command::new("osascript");
                 c.args(["-e", &script]);
@@ -2263,7 +2257,7 @@ async fn broadcast_sessions_update(state: &SharedState) {
     let msg = ServerMessage::Sessions { sessions: items };
     if let Ok(msg_str) = serde_json::to_string(&msg) {
         for client in st.mobile_clients.values() {
-            let _ = client.send(Message::Text(msg_str.clone()));
+            let _ = client.try_send(Message::Text(msg_str.clone()));
         }
     }
 }
@@ -2312,7 +2306,7 @@ async fn broadcast_waiting_for_input(state: &SharedState, session_id: &str) {
     };
     if let Ok(msg_str) = serde_json::to_string(&msg) {
         for client in st.mobile_clients.values() {
-            let _ = client.send(Message::Text(msg_str.clone()));
+            let _ = client.try_send(Message::Text(msg_str.clone()));
         }
     }
 }
@@ -2326,7 +2320,7 @@ async fn broadcast_waiting_cleared(state: &SharedState, session_id: &str) {
     };
     if let Ok(msg_str) = serde_json::to_string(&msg) {
         for client in st.mobile_clients.values() {
-            let _ = client.send(Message::Text(msg_str.clone()));
+            let _ = client.try_send(Message::Text(msg_str.clone()));
         }
     }
 }

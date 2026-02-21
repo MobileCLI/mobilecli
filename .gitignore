@@ -40,6 +40,8 @@ npm-debug.log*
 *.tmp
 *.temp
 ~
+__pycache__/
+*.pyc
 
 # Auth keys
 AuthKey_*.p8

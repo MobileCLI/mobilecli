@@ -27,10 +27,6 @@ pub struct Config {
     pub connection_mode: ConnectionMode,
     pub tailscale_ip: Option<String>,
     pub local_ip: Option<String>,
-    /// Optional token embedded into pairing QR metadata.
-    ///
-    /// Stored locally in `~/.mobilecli/config.json`.
-    pub auth_token: String,
 }
 
 impl Default for Config {
@@ -41,7 +37,6 @@ impl Default for Config {
             connection_mode: ConnectionMode::Local,
             tailscale_ip: None,
             local_ip: None,
-            auth_token: uuid::Uuid::new_v4().to_string(),
         }
     }
 }
@@ -100,17 +95,6 @@ pub fn load_config() -> Option<Config> {
         .map(|s| s.to_string())
         .unwrap_or_else(get_hostname);
 
-    let mut needs_save = false;
-    let auth_token = json
-        .get("auth_token")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            needs_save = true;
-            uuid::Uuid::new_v4().to_string()
-        });
-
     let config = Config {
         device_id,
         device_name,
@@ -123,12 +107,7 @@ pub fn load_config() -> Option<Config> {
             .get("local_ip")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
-        auth_token,
     };
-
-    if needs_save {
-        let _ = save_config(&config);
-    }
 
     Some(config)
 }
@@ -152,7 +131,6 @@ pub fn save_config(config: &Config) -> io::Result<()> {
         "connection_mode": mode_str,
         "tailscale_ip": config.tailscale_ip,
         "local_ip": config.local_ip,
-        "auth_token": config.auth_token,
     });
 
     std::fs::write(&config_path, serde_json::to_string_pretty(&json)?)?;
