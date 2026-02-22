@@ -724,67 +724,84 @@ async fn handle_pty_session(
             }
 
             // Input from mobile to send to PTY
-            Some(input) = input_rx.recv() => {
-                let msg = serde_json::json!({
-                    "type": "input",
-                    "data": BASE64.encode(&input),
-                });
-                if tx.send(Message::Text(msg.to_string())).await.is_err() {
-                    break;
-                }
-
-                // Clear waiting state when user sends input
-                {
-                    let mut st = state.write().await;
-                    if let Some(session) = st.sessions.get_mut(&session_id) {
-                        if session.waiting_state.is_some() {
-                            session.waiting_state = None;
-                            session.last_wait_hash = None;
-                            drop(st);
-                            broadcast_waiting_cleared(&state, &session_id).await;
+            result = input_rx.recv() => {
+                match result {
+                    Some(input) => {
+                        let msg = serde_json::json!({
+                            "type": "input",
+                            "data": BASE64.encode(&input),
+                        });
+                        if tx.send(Message::Text(msg.to_string())).await.is_err() {
+                            break;
                         }
-                    }
-                }
 
-                // Clear output buffer on input
-                output_buffer.clear();
+                        // Clear waiting state when user sends input
+                        {
+                            let mut st = state.write().await;
+                            if let Some(session) = st.sessions.get_mut(&session_id) {
+                                if session.waiting_state.is_some() {
+                                    session.waiting_state = None;
+                                    session.last_wait_hash = None;
+                                    drop(st);
+                                    broadcast_waiting_cleared(&state, &session_id).await;
+                                }
+                            }
+                        }
+
+                        // Clear output buffer on input
+                        output_buffer.clear();
+                    }
+                    // Channel closed — session was removed (e.g. CloseSession)
+                    None => break,
+                }
             }
 
             // Resize from mobile
-            Some((cols, rows)) = resize_rx.recv() => {
-                let msg = serde_json::json!({
-                    "type": "resize",
-                    "cols": cols,
-                    "rows": rows,
-                });
-                if tx.send(Message::Text(msg.to_string())).await.is_err() {
-                    break;
+            result = resize_rx.recv() => {
+                match result {
+                    Some((cols, rows)) => {
+                        let msg = serde_json::json!({
+                            "type": "resize",
+                            "cols": cols,
+                            "rows": rows,
+                        });
+                        if tx.send(Message::Text(msg.to_string())).await.is_err() {
+                            break;
+                        }
+                    }
+                    // Channel closed — session was removed (e.g. CloseSession)
+                    None => break,
                 }
             }
         }
     }
 
-    // Unregister session
-    {
+    // Unregister session (skip if already removed by CloseSession)
+    let was_present = {
         let mut st = state.write().await;
-        st.sessions.remove(&session_id);
-
-        // Notify about session end
-        let msg = ServerMessage::SessionEnded {
-            session_id: session_id.clone(),
-            exit_code,
-        };
-        let msg_str = serde_json::to_string(&msg)?;
-        for client in st.mobile_clients.values() {
-            let _ = client.try_send(Message::Text(msg_str.clone()));
+        if st.sessions.remove(&session_id).is_some() {
+            // Notify about session end
+            let msg = ServerMessage::SessionEnded {
+                session_id: session_id.clone(),
+                exit_code,
+            };
+            let msg_str = serde_json::to_string(&msg)?;
+            for client in st.mobile_clients.values() {
+                let _ = client.try_send(Message::Text(msg_str.clone()));
+            }
+            true
+        } else {
+            false
         }
+    };
+
+    if was_present {
+        // Broadcast updated sessions list to all clients
+        broadcast_sessions_update(&state).await;
+
+        // Update persisted sessions
+        persist_sessions_to_file(&state).await;
     }
-
-    // Broadcast updated sessions list to all clients
-    broadcast_sessions_update(&state).await;
-
-    // Update persisted sessions
-    persist_sessions_to_file(&state).await;
 
     tracing::info!("PTY session ended: {}", session_id);
     Ok(())
@@ -1312,6 +1329,58 @@ async fn process_client_msg(
                 persist_sessions_to_file(state).await;
 
                 tracing::info!("Session {} renamed to '{}'", session_id, new_name);
+            } else {
+                let msg = ServerMessage::Error {
+                    code: "session_not_found".to_string(),
+                    message: format!("Session {} not found", session_id),
+                };
+                tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+            }
+        }
+        ClientMessage::CloseSession { session_id } => {
+            // Drop the session's channels so the PTY task exits naturally,
+            // then remove it from state and notify all clients.
+            let closed = {
+                let mut st = state.write().await;
+                if let Some(session) = st.sessions.remove(&session_id) {
+                    // Dropping input_tx/resize_tx causes the PTY read loop to break
+                    drop(session);
+                    // Clean up view counts for this session
+                    st.session_view_counts.remove(&session_id);
+                    for views in st.mobile_views.values_mut() {
+                        views.remove(&session_id);
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+
+            if closed {
+                // Confirm to requesting client
+                let msg = ServerMessage::SessionClosed {
+                    session_id: session_id.clone(),
+                };
+                tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+
+                // Broadcast session ended to all clients
+                {
+                    let st = state.read().await;
+                    let end_msg = ServerMessage::SessionEnded {
+                        session_id: session_id.clone(),
+                        exit_code: -1,
+                    };
+                    let end_str = serde_json::to_string(&end_msg)?;
+                    for client in st.mobile_clients.values() {
+                        let _ = client.try_send(Message::Text(end_str.clone()));
+                    }
+                }
+
+                // Broadcast updated sessions list and persist
+                broadcast_sessions_update(state).await;
+                persist_sessions_to_file(state).await;
+
+                tracing::info!("Session {} closed by mobile client", session_id);
             } else {
                 let msg = ServerMessage::Error {
                     code: "session_not_found".to_string(),
