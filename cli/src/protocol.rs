@@ -40,6 +40,10 @@ pub enum ClientMessage {
         session_id: String,
         new_name: String,
     },
+    /// Close/kill a session
+    CloseSession {
+        session_id: String,
+    },
     /// Register push notification token
     RegisterPushToken {
         token: String,
@@ -212,6 +216,10 @@ pub enum ServerMessage {
     SessionRenamed {
         session_id: String,
         new_name: String,
+    },
+    /// Session closed by client request
+    SessionClosed {
+        session_id: String,
     },
     /// PTY resized confirmation
     PtyResized {
