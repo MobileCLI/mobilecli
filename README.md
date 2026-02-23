@@ -162,6 +162,7 @@ The terminal view is a full xterm.js 5.3 instance running inside a WebView:
 - **Scrollable history** — scroll up through output, auto-scroll follows new content at the bottom
 - **Touch keyboard** with a toolbar providing Esc, arrow keys (for CLI history), paste, and file attachment buttons
 - **Responsive resize** — terminal dimensions adapt to your phone/tablet screen and send the new size to the PTY so output reflows correctly
+- **Desktop-safe by default** — mobile resizing changes the child PTY dimensions without forcing your desktop terminal window to physically resize (`MOBILECLI_DESKTOP_RESIZE_POLICY=mirror` restores legacy mirroring)
 - **Low latency** — WebSocket streaming over LAN is typically sub-10ms
 
 ### File browser and editor *(Pro)*
@@ -414,7 +415,8 @@ MobileCLI/
 
 1. MobileCLI uses xterm.js with full ANSI 256-color support. Ensure your CLI sets `TERM=xterm-256color` (this is the default).
 2. The terminal auto-resizes to fit your phone screen. TUI applications (like `htop` or `vim`) should adapt automatically.
-3. If a session looks garbled after switching tabs, tap the session to re-enter it — the terminal refits on activation.
+3. Desktop terminal geometry is preserved by default. If you explicitly want mirrored desktop window resizing, launch with `MOBILECLI_DESKTOP_RESIZE_POLICY=mirror`.
+4. If a session looks garbled after switching tabs, tap the session to re-enter it — the terminal refits on activation.
 </details>
 
 <details>

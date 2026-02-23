@@ -114,6 +114,9 @@ pub struct PushToken {
 
 /// Default scrollback buffer size (64KB)
 const DEFAULT_SCROLLBACK_MAX_BYTES: usize = 64 * 1024;
+const ALT_ENTER_SEQS: &[&[u8]] = &[b"\x1b[?1049h", b"\x1b[?1047h", b"\x1b[?47h"];
+const ALT_LEAVE_SEQS: &[&[u8]] = &[b"\x1b[?1049l", b"\x1b[?1047l", b"\x1b[?47l"];
+const ALT_TRACK_TAIL_BYTES: usize = 7;
 
 /// Active PTY session
 pub struct PtySession {
@@ -123,7 +126,7 @@ pub struct PtySession {
     pub project_path: String,
     pub started_at: chrono::DateTime<Utc>,
     pub input_tx: mpsc::UnboundedSender<Vec<u8>>,
-    pub resize_tx: mpsc::UnboundedSender<(u16, u16)>,
+    pub resize_tx: mpsc::UnboundedSender<(u16, u16, Option<u64>)>,
     pub waiting_state: Option<WaitingState>,
     pub cli_tracker: CliTracker,
     pub last_wait_hash: Option<u64>,
@@ -134,6 +137,11 @@ pub struct PtySession {
     pub scrollback_max_bytes: usize,
     /// Whether the CLI is currently in alternate screen buffer mode
     pub in_alt_screen: bool,
+    /// Tail bytes from prior chunk used to detect alt-screen escape sequences
+    /// split across PTY read boundaries.
+    pub alt_track_tail: Vec<u8>,
+    /// Latest accepted resize epoch from mobile (for stale resize rejection).
+    pub last_resize_epoch: u64,
 }
 
 /// Daemon shared state
@@ -561,7 +569,7 @@ async fn handle_pty_session(
     tracing::info!("PTY session registered: {} ({})", name, session_id);
 
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let (resize_tx, mut resize_rx) = mpsc::unbounded_channel::<(u16, u16)>();
+    let (resize_tx, mut resize_rx) = mpsc::unbounded_channel::<(u16, u16, Option<u64>)>();
 
     // Register session
     let pty_broadcast = {
@@ -585,6 +593,8 @@ async fn handle_pty_session(
                 scrollback: VecDeque::new(),
                 scrollback_max_bytes: DEFAULT_SCROLLBACK_MAX_BYTES,
                 in_alt_screen: false,
+                alt_track_tail: Vec::new(),
+                last_resize_epoch: 0,
             },
         );
         st.pty_broadcast.clone()
@@ -623,19 +633,14 @@ async fn handle_pty_session(
                                                 while session.scrollback.len() > session.scrollback_max_bytes {
                                                     session.scrollback.pop_front();
                                                 }
-                                                // Track alt screen transitions
-                                                const ALT_ENTER: &[u8] = b"\x1b[?1049h";
-                                                const ALT_LEAVE: &[u8] = b"\x1b[?1049l";
-                                                if bytes.len() >= ALT_ENTER.len() {
-                                                    for w in bytes.windows(ALT_ENTER.len()) {
-                                                        if w == ALT_ENTER {
-                                                            session.in_alt_screen = true;
-                                                        }
-                                                        if w == ALT_LEAVE {
-                                                            session.in_alt_screen = false;
-                                                        }
-                                                    }
-                                                }
+                                                // Track alt-screen transitions across chunk
+                                                // boundaries so subscribe_ack reflects the
+                                                // current rendering mode reliably.
+                                                update_alt_screen_state(
+                                                    &mut session.in_alt_screen,
+                                                    &mut session.alt_track_tail,
+                                                    &bytes,
+                                                );
                                             }
                                         }
 
@@ -723,6 +728,11 @@ async fn handle_pty_session(
                                         }
                                     }
                                 }
+                            } else if msg["type"].as_str() == Some("pty_resized") {
+                                let cols = msg["cols"].as_u64().unwrap_or(0).min(u16::MAX as u64) as u16;
+                                let rows = msg["rows"].as_u64().unwrap_or(0).min(u16::MAX as u64) as u16;
+                                let epoch = msg["epoch"].as_u64();
+                                broadcast_pty_resized(&state, &session_id, cols, rows, epoch).await;
                             } else if msg["type"].as_str() == Some("session_ended") {
                                 exit_code = msg["exit_code"].as_i64().unwrap_or(0) as i32;
                                 tracing::info!("PTY session {} ended (exit_code={})", session_id, exit_code);
@@ -774,12 +784,15 @@ async fn handle_pty_session(
             // Resize from mobile
             result = resize_rx.recv() => {
                 match result {
-                    Some((cols, rows)) => {
-                        let msg = serde_json::json!({
+                    Some((cols, rows, epoch)) => {
+                        let mut msg = serde_json::json!({
                             "type": "resize",
                             "cols": cols,
                             "rows": rows,
                         });
+                        if let Some(epoch) = epoch {
+                            msg["epoch"] = serde_json::json!(epoch);
+                        }
                         if tx.send(Message::Text(msg.to_string())).await.is_err() {
                             break;
                         }
@@ -1326,24 +1339,55 @@ async fn process_client_msg(
             session_id,
             cols,
             rows,
+            epoch,
         } => {
-            let st = state.read().await;
+            let mut st = state.write().await;
             let is_restore = cols == 0 && rows == 0;
-            let has_viewers = st
+            let viewer_count = st
                 .session_view_counts
                 .get(&session_id)
                 .copied()
-                .unwrap_or(0)
-                > 0;
-            if !is_restore && !has_viewers {
+                .unwrap_or(0);
+            let sender_is_viewing = st
+                .mobile_views
+                .get(&addr)
+                .map(|views| views.contains(&session_id))
+                .unwrap_or(false);
+
+            if !is_restore && viewer_count == 0 {
                 tracing::debug!(
                     "Ignoring PTY resize for {} (no active mobile viewers)",
                     session_id
                 );
                 return Ok(());
             }
-            if let Some(session) = st.sessions.get(&session_id) {
-                let _ = session.resize_tx.send((cols, rows));
+
+            // A restore request (0x0) must not override active dimensions while
+            // other viewers are still attached to this session.
+            if should_ignore_restore_resize(is_restore, viewer_count, sender_is_viewing) {
+                tracing::debug!(
+                    "Ignoring PTY restore for {} (viewer_count={}, sender_is_viewing={})",
+                    session_id,
+                    viewer_count,
+                    sender_is_viewing
+                );
+                return Ok(());
+            }
+
+            if let Some(session) = st.sessions.get_mut(&session_id) {
+                if is_stale_resize_epoch(session.last_resize_epoch, epoch) {
+                    tracing::debug!(
+                        "Ignoring stale PTY resize for {} (epoch={:?}, last={})",
+                        session_id,
+                        epoch,
+                        session.last_resize_epoch
+                    );
+                    return Ok(());
+                }
+                if let Some(epoch) = epoch {
+                    session.last_resize_epoch = epoch;
+                }
+                let _ = session.resize_tx.send((cols, rows, epoch));
             }
         }
         ClientMessage::Ping => {
@@ -2447,6 +2491,35 @@ async fn broadcast_waiting_cleared(state: &SharedState, session_id: &str) {
     }
 }
 
+/// Broadcast pty_resized to clients actively viewing this session.
+async fn broadcast_pty_resized(
+    state: &SharedState,
+    session_id: &str,
+    cols: u16,
+    rows: u16,
+    epoch: Option<u64>,
+) {
+    let st = state.read().await;
+    let msg = ServerMessage::PtyResized {
+        session_id: session_id.to_string(),
+        cols,
+        rows,
+        epoch,
+    };
+    if let Ok(msg_str) = serde_json::to_string(&msg) {
+        for (addr, client) in &st.mobile_clients {
+            let is_viewing = st
+                .mobile_views
+                .get(addr)
+                .map(|views| views.contains(session_id))
+                .unwrap_or(false);
+            if is_viewing {
+                let _ = client.try_send(Message::Text(msg_str.clone()));
+            }
+        }
+    }
+}
+
 /// Send current waiting states to a newly connected mobile client.
 async fn send_waiting_states(
     state: &SharedState,
@@ -2501,6 +2574,41 @@ fn truncate_to_max_chars(input: &mut String, max_chars: usize) {
     }
     let trimmed: String = input.chars().skip(len - max_chars).collect();
     *input = trimmed;
+}
+
+fn should_ignore_restore_resize(is_restore: bool, viewer_count: usize, sender_is_viewing: bool) -> bool {
+    is_restore && (viewer_count > 1 || (viewer_count == 1 && !sender_is_viewing))
+}
+
+fn is_stale_resize_epoch(last_epoch: u64, incoming_epoch: Option<u64>) -> bool {
+    incoming_epoch.is_some_and(|epoch| epoch <= last_epoch)
+}
+
+/// Update alternate-screen state from a PTY chunk, including sequences split
+/// across chunk boundaries.
+fn update_alt_screen_state(in_alt_screen: &mut bool, tail: &mut Vec<u8>, chunk: &[u8]) {
+    if chunk.is_empty() {
+        return;
+    }
+
+    let mut scan = Vec::with_capacity(tail.len() + chunk.len());
+    scan.extend_from_slice(tail);
+    scan.extend_from_slice(chunk);
+
+    for i in 0..scan.len() {
+        let rem = &scan[i..];
+        if ALT_ENTER_SEQS.iter().any(|seq| rem.starts_with(seq)) {
+            *in_alt_screen = true;
+            continue;
+        }
+        if ALT_LEAVE_SEQS.iter().any(|seq| rem.starts_with(seq)) {
+            *in_alt_screen = false;
+        }
+    }
+
+    let keep = ALT_TRACK_TAIL_BYTES.min(scan.len());
+    tail.clear();
+    tail.extend_from_slice(&scan[scan.len() - keep..]);
 }
 
 fn build_notification_text(
@@ -2608,7 +2716,7 @@ fn is_path_watched(changed_path: &str, watched: &std::collections::HashSet<Strin
 async fn restore_pty_size(state: &SharedState, session_id: &str) {
     let st = state.read().await;
     if let Some(session) = st.sessions.get(session_id) {
-        let _ = session.resize_tx.send((0, 0));
+        let _ = session.resize_tx.send((0, 0, None));
     }
 }
 
@@ -2666,7 +2774,8 @@ async fn send_push_notifications(tokens: &[PushToken], title: &str, body: &str, 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_upload_destination_path, is_windows_reserved_device_name, sanitize_upload_file_name,
+        build_upload_destination_path, is_stale_resize_epoch, is_windows_reserved_device_name,
+        sanitize_upload_file_name, should_ignore_restore_resize, update_alt_screen_state,
         MAX_UPLOAD_FILE_NAME_BYTES,
     };
     use tempfile::TempDir;
@@ -2736,5 +2845,36 @@ mod tests {
         tokio::fs::write(&path, b"x")
             .await
             .expect("unicode path should be writable");
+    }
+
+    #[test]
+    fn update_alt_screen_state_detects_split_enter_and_leave_sequences() {
+        let mut in_alt = false;
+        let mut tail = Vec::new();
+
+        update_alt_screen_state(&mut in_alt, &mut tail, b"\x1b[?10");
+        assert!(!in_alt);
+
+        update_alt_screen_state(&mut in_alt, &mut tail, b"49h");
+        assert!(in_alt);
+
+        update_alt_screen_state(&mut in_alt, &mut tail, b"\x1b[?1049l");
+        assert!(!in_alt);
+    }
+
+    #[test]
+    fn restore_resize_rules_protect_active_viewers() {
+        assert!(should_ignore_restore_resize(true, 2, true));
+        assert!(should_ignore_restore_resize(true, 1, false));
+        assert!(!should_ignore_restore_resize(true, 1, true));
+        assert!(!should_ignore_restore_resize(false, 2, true));
+    }
+
+    #[test]
+    fn stale_epoch_detection_rejects_older_or_equal_epochs() {
+        assert!(!is_stale_resize_epoch(0, None));
+        assert!(!is_stale_resize_epoch(5, Some(6)));
+        assert!(is_stale_resize_epoch(5, Some(5)));
+        assert!(is_stale_resize_epoch(5, Some(4)));
     }
 }
