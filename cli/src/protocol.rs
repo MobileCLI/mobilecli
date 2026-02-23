@@ -221,6 +221,11 @@ pub enum ServerMessage {
     SessionClosed {
         session_id: String,
     },
+    /// Acknowledge subscription with session metadata
+    SubscribeAck {
+        session_id: String,
+        in_alt_screen: bool,
+    },
     /// PTY resized confirmation
     PtyResized {
         session_id: String,

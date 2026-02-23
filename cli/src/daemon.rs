@@ -132,6 +132,8 @@ pub struct PtySession {
     pub scrollback: VecDeque<u8>,
     /// Maximum scrollback buffer size
     pub scrollback_max_bytes: usize,
+    /// Whether the CLI is currently in alternate screen buffer mode
+    pub in_alt_screen: bool,
 }
 
 /// Daemon shared state
@@ -582,6 +584,7 @@ async fn handle_pty_session(
                 last_wait_hash: None,
                 scrollback: VecDeque::new(),
                 scrollback_max_bytes: DEFAULT_SCROLLBACK_MAX_BYTES,
+                in_alt_screen: false,
             },
         );
         st.pty_broadcast.clone()
@@ -611,8 +614,7 @@ async fn handle_pty_session(
                                     if let Ok(bytes) = BASE64.decode(data) {
                                         let _ = pty_broadcast.send((session_id.clone(), bytes.clone()));
 
-                                        // Accumulate scrollback for session history (linked terminals)
-                                        // Uses VecDeque for efficient front truncation
+                                        // Accumulate scrollback and track alt screen state
                                         {
                                             let mut st = state.write().await;
                                             if let Some(session) = st.sessions.get_mut(&session_id) {
@@ -620,6 +622,19 @@ async fn handle_pty_session(
                                                 // Truncate from front if over limit (VecDeque is O(1) per pop)
                                                 while session.scrollback.len() > session.scrollback_max_bytes {
                                                     session.scrollback.pop_front();
+                                                }
+                                                // Track alt screen transitions
+                                                const ALT_ENTER: &[u8] = b"\x1b[?1049h";
+                                                const ALT_LEAVE: &[u8] = b"\x1b[?1049l";
+                                                if bytes.len() >= ALT_ENTER.len() {
+                                                    for w in bytes.windows(ALT_ENTER.len()) {
+                                                        if w == ALT_ENTER {
+                                                            session.in_alt_screen = true;
+                                                        }
+                                                        if w == ALT_LEAVE {
+                                                            session.in_alt_screen = false;
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -1240,6 +1255,44 @@ async fn process_client_msg(
                     .entry(session_id.clone())
                     .or_insert(0);
                 *count += 1;
+            }
+
+            // Collect session state under one lock, then drop it before sending.
+            let (scrollback_bytes, in_alt_screen) =
+                if let Some(session) = st.sessions.get(&session_id) {
+                    let alt = session.in_alt_screen;
+                    let sb = if !alt && !session.scrollback.is_empty() {
+                        Some(session.scrollback.iter().copied().collect::<Vec<u8>>())
+                    } else {
+                        None
+                    };
+                    (sb, alt)
+                } else {
+                    (None, false)
+                };
+            drop(st);
+
+            // Replay scrollback for text CLIs so chat history is visible.
+            // TUI apps (alt screen) get a clean redraw from SIGWINCH when
+            // the mobile resize arrives, so no replay needed.
+            if let Some(bytes) = scrollback_bytes {
+                let msg = ServerMessage::PtyBytes {
+                    session_id: session_id.clone(),
+                    data: BASE64.encode(&bytes),
+                };
+                if let Ok(text) = serde_json::to_string(&msg) {
+                    let _ = tx.send(Message::Text(text)).await;
+                }
+            }
+
+            // Always send SubscribeAck so mobile knows whether to suppress
+            // stale bytes and enter alt-screen mode before resizing.
+            let ack = ServerMessage::SubscribeAck {
+                session_id,
+                in_alt_screen,
+            };
+            if let Ok(text) = serde_json::to_string(&ack) {
+                let _ = tx.send(Message::Text(text)).await;
             }
         }
         ClientMessage::Unsubscribe { session_id } => {
