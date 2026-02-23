@@ -105,6 +105,27 @@ fn request_terminal_resize(cols: u16, rows: u16) {
     set_stdout_winsize(cols, rows);
 }
 
+/// Scan raw PTY output for alternate screen buffer enter/exit sequences.
+/// Returns updated alt-screen state (last transition wins if multiple in one chunk).
+fn scan_alt_screen_state(data: &[u8], currently_in_alt: bool) -> bool {
+    const ENTER: &[u8] = b"\x1b[?1049h";
+    const LEAVE: &[u8] = b"\x1b[?1049l";
+
+    if data.len() < ENTER.len() {
+        return currently_in_alt;
+    }
+
+    let mut in_alt = currently_in_alt;
+    for window in data.windows(ENTER.len()) {
+        if window == ENTER {
+            in_alt = true;
+        } else if window == LEAVE {
+            in_alt = false;
+        }
+    }
+    in_alt
+}
+
 /// Normalize newline input sequences before writing into the PTY.
 ///
 /// Different environments (raw/canonical mode, ICRNL, etc.) may send Enter as
@@ -311,7 +332,10 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
 
     // Main event loop
     let mut stdout = std::io::stdout();
+    let is_tty = std::io::stdout().is_terminal();
     let mut saved_local_size: Option<(u16, u16)> = None;
+    let mut mobile_alt_screen_active = false; // We entered alt screen to protect desktop
+    let mut cli_in_alt_screen = false; // CLI has entered alternate screen buffer
     let mut exit_code: i32 = 0;
 
     loop {
@@ -321,6 +345,9 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                 // Write to local terminal
                 let _ = stdout.write_all(&data);
                 let _ = stdout.flush();
+
+                // Track CLI alternate screen state for mobile resize protection
+                cli_in_alt_screen = scan_alt_screen_state(&data, cli_in_alt_screen);
 
                 // Send to daemon
                 let msg = serde_json::json!({
@@ -364,7 +391,21 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                                         msg["rows"].as_u64(),
                                     ) {
                                         let (cols, rows) = if cols == 0 || rows == 0 {
-                                            // Mobile disconnected: restore local size if we captured it.
+                                            // Mobile disconnected: restore desktop terminal.
+                                            if is_tty {
+                                                if mobile_alt_screen_active {
+                                                    // Exit alt screen — pops desktop back to clean main buffer.
+                                                    let _ = stdout.write_all(b"\x1b[?1049l");
+                                                    let _ = stdout.flush();
+                                                    mobile_alt_screen_active = false;
+                                                } else if cli_in_alt_screen {
+                                                    // TUI CLI owns alt screen — just clear so the
+                                                    // desktop-sized redraw starts fresh.
+                                                    let _ = stdout.write_all(b"\x1b[2J\x1b[H");
+                                                    let _ = stdout.flush();
+                                                }
+                                            }
+
                                             if let Some((local_cols, local_rows)) = saved_local_size.take() {
                                                 request_terminal_resize(local_cols, local_rows);
                                                 (local_cols, local_rows)
@@ -372,9 +413,18 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                                                 get_terminal_size()
                                             }
                                         } else {
-                                            // Mobile active: resize PTY to mobile dimensions and request local terminal resize
+                                            // Mobile active: resize PTY to mobile dimensions.
                                             if saved_local_size.is_none() {
                                                 saved_local_size = get_terminal_size_opt();
+
+                                                // Protect desktop main buffer with alt screen so all
+                                                // mobile-sized rendering is contained there. Skip if
+                                                // the CLI already owns alt screen (avoids nesting).
+                                                if is_tty && !cli_in_alt_screen {
+                                                    let _ = stdout.write_all(b"\x1b[?1049h");
+                                                    let _ = stdout.flush();
+                                                    mobile_alt_screen_active = true;
+                                                }
                                             }
                                             let cols = cols.min(u16::MAX as u64) as u16;
                                             let rows = rows.min(u16::MAX as u64) as u16;
@@ -416,6 +466,12 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                 }
             }
         }
+    }
+
+    // Exit alt screen if we're still holding it (mobile was connected when session ended)
+    if mobile_alt_screen_active && is_tty {
+        let _ = stdout.write_all(b"\x1b[?1049l");
+        let _ = stdout.flush();
     }
 
     // Restore terminal mode
