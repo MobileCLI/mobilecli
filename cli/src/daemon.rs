@@ -630,7 +630,8 @@ async fn handle_pty_session(
                                                     for w in bytes.windows(ALT_ENTER.len()) {
                                                         if w == ALT_ENTER {
                                                             session.in_alt_screen = true;
-                                                        } else if w == ALT_LEAVE {
+                                                        }
+                                                        if w == ALT_LEAVE {
                                                             session.in_alt_screen = false;
                                                         }
                                                     }
