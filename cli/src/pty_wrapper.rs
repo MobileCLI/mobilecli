@@ -334,6 +334,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
     let mut stdout = std::io::stdout();
     let mut saved_local_size: Option<(u16, u16)> = None;
     let mut cli_in_alt_screen = false; // CLI has entered alternate screen buffer
+    let mut last_pty_size: Option<(u16, u16)> = None;
     let mut exit_code: i32 = 0;
 
     loop {
@@ -392,32 +393,38 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                                         msg["cols"].as_u64(),
                                         msg["rows"].as_u64(),
                                     ) {
-                                        let (cols, rows) = if cols == 0 || rows == 0 {
+                                        if cols == 0 || rows == 0 {
                                             // Mobile disconnected: restore desktop terminal size.
-                                            // PTY output to stdout resumes automatically (saved_local_size becomes None).
-                                            if let Some((local_cols, local_rows)) = saved_local_size.take() {
-                                                request_terminal_resize(local_cols, local_rows);
-                                                (local_cols, local_rows)
+                                            // PTY output to stdout resumes automatically
+                                            // (saved_local_size becomes None via .take()).
+                                            let (c, r) = if let Some((lc, lr)) = saved_local_size.take() {
+                                                request_terminal_resize(lc, lr);
+                                                (lc, lr)
                                             } else {
                                                 get_terminal_size()
-                                            }
+                                            };
+                                            last_pty_size = Some((c, r));
+                                            let _ = master.resize(PtySize {
+                                                rows: r, cols: c,
+                                                pixel_width: 0, pixel_height: 0,
+                                            });
                                         } else {
-                                            // Mobile active: resize PTY to mobile dimensions.
-                                            // Desktop stdout is suppressed while saved_local_size is Some.
+                                            // Mobile active: resize only the PTY to mobile
+                                            // dimensions. Do NOT resize the desktop terminal
+                                            // window — stdout is suppressed anyway.
                                             if saved_local_size.is_none() {
                                                 saved_local_size = get_terminal_size_opt();
                                             }
-                                            let cols = cols.min(u16::MAX as u64) as u16;
-                                            let rows = rows.min(u16::MAX as u64) as u16;
-                                            request_terminal_resize(cols, rows);
-                                            (cols, rows)
-                                        };
-                                        let _ = master.resize(PtySize {
-                                            rows,
-                                            cols,
-                                            pixel_width: 0,
-                                            pixel_height: 0,
-                                        });
+                                            let c = cols.min(u16::MAX as u64) as u16;
+                                            let r = rows.min(u16::MAX as u64) as u16;
+                                            if last_pty_size != Some((c, r)) {
+                                                last_pty_size = Some((c, r));
+                                                let _ = master.resize(PtySize {
+                                                    rows: r, cols: c,
+                                                    pixel_width: 0, pixel_height: 0,
+                                                });
+                                            }
+                                        }
                                     }
                                 }
                                 _ => {}
