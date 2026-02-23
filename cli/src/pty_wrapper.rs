@@ -133,6 +133,34 @@ fn request_terminal_resize(cols: u16, rows: u16) {
     set_stdout_winsize(cols, rows);
 }
 
+fn clear_local_terminal_view(stdout: &mut std::io::Stdout) {
+    if !stdout.is_terminal() {
+        return;
+    }
+    let _ = stdout.write_all(b"\x1b[2J\x1b[H");
+    let _ = stdout.flush();
+}
+
+fn should_clear_local_before_resize(
+    reason: PtyResizeReason,
+    previous: Option<(u16, u16)>,
+    cols: u16,
+) -> bool {
+    match reason {
+        PtyResizeReason::AttachInit
+        | PtyResizeReason::ReconnectSync
+        | PtyResizeReason::DetachRestore => true,
+        PtyResizeReason::GeometryChange => previous.is_some_and(|(prev_cols, _)| prev_cols != cols),
+        PtyResizeReason::KeyboardOverlay | PtyResizeReason::Unknown => false,
+    }
+}
+
+fn jitter_resize_target(cols: u16, rows: u16) -> (u16, u16) {
+    let jitter_cols = if cols > 1 { cols - 1 } else { cols + 1 };
+    let jitter_rows = if rows > 1 { rows - 1 } else { rows + 1 };
+    (jitter_cols, jitter_rows)
+}
+
 fn resolve_resize_reason(cols: u16, rows: u16, reason: Option<&str>) -> PtyResizeReason {
     if cols == 0 || rows == 0 {
         return PtyResizeReason::DetachRestore;
@@ -481,8 +509,47 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                                             }
                                         }
 
-                                        let should_resize = last_applied_pty_size != Some((c, r));
+                                        let force_noop_refresh = matches!(
+                                            reason,
+                                            PtyResizeReason::AttachInit | PtyResizeReason::ReconnectSync
+                                        ) && last_applied_pty_size == Some((c, r));
+
+                                        if should_clear_local_before_resize(reason, last_applied_pty_size, c) {
+                                            tracing::debug!(
+                                                session_id = %session_id,
+                                                cols = c,
+                                                rows = r,
+                                                epoch = ?epoch,
+                                                reason = reason.as_str(),
+                                                "Clearing local terminal before semantic resize"
+                                            );
+                                            clear_local_terminal_view(&mut stdout);
+                                        }
+
+                                        let should_resize =
+                                            force_noop_refresh || last_applied_pty_size != Some((c, r));
                                         if should_resize {
+                                            if force_noop_refresh {
+                                                let (jitter_c, jitter_r) = jitter_resize_target(c, r);
+                                                tracing::debug!(
+                                                    session_id = %session_id,
+                                                    cols = c,
+                                                    rows = r,
+                                                    jitter_cols = jitter_c,
+                                                    jitter_rows = jitter_r,
+                                                    epoch = ?epoch,
+                                                    reason = reason.as_str(),
+                                                    decision = "force_noop_redraw",
+                                                    "Applying jitter resize before final target to force redraw"
+                                                );
+                                                let _ = master.resize(PtySize {
+                                                    rows: jitter_r,
+                                                    cols: jitter_c,
+                                                    pixel_width: 0,
+                                                    pixel_height: 0,
+                                                });
+                                            }
+
                                             let resized = master.resize(PtySize {
                                                 rows: r,
                                                 cols: c,
@@ -640,7 +707,9 @@ fn restore_terminal_mode(_original: Option<()>) {}
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_resize_reason;
+    use super::{
+        jitter_resize_target, resolve_resize_reason, should_clear_local_before_resize,
+    };
     use crate::protocol::PtyResizeReason;
 
     #[test]
@@ -669,5 +738,45 @@ mod tests {
             resolve_resize_reason(80, 24, Some("future_reason")),
             PtyResizeReason::GeometryChange
         );
+    }
+
+    #[test]
+    fn clear_policy_prefers_attach_detach_and_width_changes() {
+        assert!(should_clear_local_before_resize(
+            PtyResizeReason::AttachInit,
+            Some((80, 24)),
+            80
+        ));
+        assert!(should_clear_local_before_resize(
+            PtyResizeReason::ReconnectSync,
+            Some((80, 24)),
+            80
+        ));
+        assert!(should_clear_local_before_resize(
+            PtyResizeReason::DetachRestore,
+            Some((80, 24)),
+            120
+        ));
+        assert!(should_clear_local_before_resize(
+            PtyResizeReason::GeometryChange,
+            Some((80, 24)),
+            100
+        ));
+        assert!(!should_clear_local_before_resize(
+            PtyResizeReason::GeometryChange,
+            Some((80, 24)),
+            80
+        ));
+        assert!(!should_clear_local_before_resize(
+            PtyResizeReason::KeyboardOverlay,
+            Some((80, 24)),
+            80
+        ));
+    }
+
+    #[test]
+    fn jitter_target_always_changes_dimensions() {
+        assert_eq!(jitter_resize_target(80, 24), (79, 23));
+        assert_eq!(jitter_resize_target(1, 1), (2, 2));
     }
 }

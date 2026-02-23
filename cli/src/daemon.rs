@@ -1461,19 +1461,40 @@ async fn process_client_msg(
                     );
                     synthetic_ack = Some((ack_dims.0, ack_dims.1, epoch));
                 } else if is_noop_resize(session.last_applied_size, cols, rows) {
-                    tracing::debug!(
-                        session_id = %session_id,
-                        cols,
-                        rows,
-                        epoch = ?epoch,
-                        reason = reason.as_str(),
-                        viewer_count,
-                        sender_is_viewing,
-                        alt_screen = session.in_alt_screen,
-                        decision = "ignored_noop",
-                        "Ignoring no-op PTY resize"
-                    );
-                    synthetic_ack = Some((ack_dims.0, ack_dims.1, epoch));
+                    if should_force_noop_resize(reason) {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            cols,
+                            rows,
+                            epoch = ?epoch,
+                            reason = reason.as_str(),
+                            viewer_count,
+                            sender_is_viewing,
+                            alt_screen = session.in_alt_screen,
+                            decision = "forwarded_noop_refresh",
+                            "Forwarding no-op PTY resize to force redraw"
+                        );
+                        let _ = session.resize_tx.send(ResizeRequest {
+                            cols,
+                            rows,
+                            epoch,
+                            reason,
+                        });
+                    } else {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            cols,
+                            rows,
+                            epoch = ?epoch,
+                            reason = reason.as_str(),
+                            viewer_count,
+                            sender_is_viewing,
+                            alt_screen = session.in_alt_screen,
+                            decision = "ignored_noop",
+                            "Ignoring no-op PTY resize"
+                        );
+                        synthetic_ack = Some((ack_dims.0, ack_dims.1, epoch));
+                    }
                 } else {
                     tracing::debug!(
                         session_id = %session_id,
@@ -2719,6 +2740,13 @@ fn is_noop_resize(last_applied: Option<(u16, u16)>, cols: u16, rows: u16) -> boo
     last_applied == Some((cols, rows))
 }
 
+fn should_force_noop_resize(reason: PtyResizeReason) -> bool {
+    matches!(
+        reason,
+        PtyResizeReason::AttachInit | PtyResizeReason::ReconnectSync
+    )
+}
+
 fn is_stale_resize_epoch(last_epoch: u64, incoming_epoch: Option<u64>) -> bool {
     incoming_epoch.is_some_and(|epoch| epoch <= last_epoch)
 }
@@ -2920,7 +2948,8 @@ mod tests {
     use super::{
         build_upload_destination_path, is_noop_resize, is_stale_resize_epoch,
         is_windows_reserved_device_name, resolve_resize_reason, sanitize_upload_file_name,
-        should_ignore_restore_resize, update_alt_screen_state, PtyResizeReason,
+        should_force_noop_resize, should_ignore_restore_resize, update_alt_screen_state,
+        PtyResizeReason,
         MAX_UPLOAD_FILE_NAME_BYTES,
     };
     use tempfile::TempDir;
@@ -3056,5 +3085,15 @@ mod tests {
         assert!(is_noop_resize(Some((80, 24)), 80, 24));
         assert!(!is_noop_resize(Some((80, 24)), 81, 24));
         assert!(!is_noop_resize(None, 80, 24));
+    }
+
+    #[test]
+    fn force_noop_resize_only_for_attach_and_reconnect() {
+        assert!(should_force_noop_resize(PtyResizeReason::AttachInit));
+        assert!(should_force_noop_resize(PtyResizeReason::ReconnectSync));
+        assert!(!should_force_noop_resize(PtyResizeReason::GeometryChange));
+        assert!(!should_force_noop_resize(PtyResizeReason::DetachRestore));
+        assert!(!should_force_noop_resize(PtyResizeReason::KeyboardOverlay));
+        assert!(!should_force_noop_resize(PtyResizeReason::Unknown));
     }
 }
