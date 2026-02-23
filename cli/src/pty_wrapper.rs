@@ -318,13 +318,11 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
         tokio::select! {
             // PTY output
             Some(data) = output_rx.recv() => {
-                // Write to local terminal only when mobile is NOT connected.
-                // When mobile is connected the PTY is resized to phone dimensions;
-                // writing that output to the desktop terminal would garble it.
-                if saved_local_size.is_none() {
-                    let _ = stdout.write_all(&data);
-                    let _ = stdout.flush();
-                }
+                // Always write to local terminal. When mobile is connected the
+                // desktop terminal is physically resized to match mobile dims
+                // via request_terminal_resize(), so both views stay in sync.
+                let _ = stdout.write_all(&data);
+                let _ = stdout.flush();
 
                 // Send to daemon
                 let msg = serde_json::json!({
@@ -382,14 +380,15 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                                                 pixel_width: 0, pixel_height: 0,
                                             });
                                         } else {
-                                            // Mobile active: resize only the PTY to mobile
-                                            // dimensions. Do NOT resize the desktop terminal
-                                            // window — stdout is suppressed anyway.
+                                            // Mobile active: resize both PTY and desktop
+                                            // terminal to mobile dimensions so both views
+                                            // show identical output simultaneously.
                                             if saved_local_size.is_none() {
                                                 saved_local_size = get_terminal_size_opt();
                                             }
                                             let c = cols.min(u16::MAX as u64) as u16;
                                             let r = rows.min(u16::MAX as u64) as u16;
+                                            request_terminal_resize(c, r);
                                             let _ = master.resize(PtySize {
                                                 rows: r, cols: c,
                                                 pixel_width: 0, pixel_height: 0,
