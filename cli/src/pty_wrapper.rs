@@ -105,27 +105,6 @@ fn request_terminal_resize(cols: u16, rows: u16) {
     set_stdout_winsize(cols, rows);
 }
 
-/// Scan raw PTY output for alternate screen buffer enter/exit sequences.
-/// Returns updated alt-screen state (last transition wins if multiple in one chunk).
-fn scan_alt_screen_state(data: &[u8], currently_in_alt: bool) -> bool {
-    const ENTER: &[u8] = b"\x1b[?1049h";
-    const LEAVE: &[u8] = b"\x1b[?1049l";
-
-    if data.len() < ENTER.len() {
-        return currently_in_alt;
-    }
-
-    let mut in_alt = currently_in_alt;
-    for window in data.windows(ENTER.len()) {
-        if window == ENTER {
-            in_alt = true;
-        } else if window == LEAVE {
-            in_alt = false;
-        }
-    }
-    in_alt
-}
-
 /// Normalize newline input sequences before writing into the PTY.
 ///
 /// Different environments (raw/canonical mode, ICRNL, etc.) may send Enter as
@@ -333,8 +312,6 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
     // Main event loop
     let mut stdout = std::io::stdout();
     let mut saved_local_size: Option<(u16, u16)> = None;
-    let mut cli_in_alt_screen = false; // CLI has entered alternate screen buffer
-    let mut last_pty_size: Option<(u16, u16)> = None;
     let mut exit_code: i32 = 0;
 
     loop {
@@ -348,9 +325,6 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                     let _ = stdout.write_all(&data);
                     let _ = stdout.flush();
                 }
-
-                // Track CLI alternate screen state
-                cli_in_alt_screen = scan_alt_screen_state(&data, cli_in_alt_screen);
 
                 // Send to daemon
                 let msg = serde_json::json!({
@@ -403,7 +377,6 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                                             } else {
                                                 get_terminal_size()
                                             };
-                                            last_pty_size = Some((c, r));
                                             let _ = master.resize(PtySize {
                                                 rows: r, cols: c,
                                                 pixel_width: 0, pixel_height: 0,
@@ -417,13 +390,10 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                                             }
                                             let c = cols.min(u16::MAX as u64) as u16;
                                             let r = rows.min(u16::MAX as u64) as u16;
-                                            if last_pty_size != Some((c, r)) {
-                                                last_pty_size = Some((c, r));
-                                                let _ = master.resize(PtySize {
-                                                    rows: r, cols: c,
-                                                    pixel_width: 0, pixel_height: 0,
-                                                });
-                                            }
+                                            let _ = master.resize(PtySize {
+                                                rows: r, cols: c,
+                                                pixel_width: 0, pixel_height: 0,
+                                            });
                                         }
                                     }
                                 }
