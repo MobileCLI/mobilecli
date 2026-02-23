@@ -30,6 +30,8 @@ pub enum ClientMessage {
         session_id: String,
         cols: u16,
         rows: u16,
+        #[serde(default)]
+        epoch: Option<u64>,
     },
     /// Heartbeat ping
     Ping,
@@ -231,6 +233,8 @@ pub enum ServerMessage {
         session_id: String,
         cols: u16,
         rows: u16,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        epoch: Option<u64>,
     },
     /// Heartbeat pong
     Pong,

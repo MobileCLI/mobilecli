@@ -41,6 +41,33 @@ pub struct WrapConfig {
     pub working_dir: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DesktopResizePolicy {
+    /// Keep the host terminal window unchanged; only resize the child PTY.
+    Preserve,
+    /// Mirror mobile dimensions into the host terminal window.
+    Mirror,
+}
+
+impl DesktopResizePolicy {
+    fn from_env() -> Self {
+        let raw = std::env::var("MOBILECLI_DESKTOP_RESIZE_POLICY")
+            .unwrap_or_else(|_| "preserve".to_string())
+            .to_lowercase();
+        match raw.as_str() {
+            "mirror" | "strict" | "legacy" => Self::Mirror,
+            "preserve" | "off" | "none" | "" => Self::Preserve,
+            other => {
+                tracing::warn!(
+                    "Unknown MOBILECLI_DESKTOP_RESIZE_POLICY='{}'. Defaulting to 'preserve'.",
+                    other
+                );
+                Self::Preserve
+            }
+        }
+    }
+}
+
 /// Resolve a command to its full path
 fn resolve_command(cmd: &str) -> Option<String> {
     // First check if it's already an absolute path
@@ -311,6 +338,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
 
     // Main event loop
     let mut stdout = std::io::stdout();
+    let desktop_resize_policy = DesktopResizePolicy::from_env();
     let mut saved_local_size: Option<(u16, u16)> = None;
     let mut exit_code: i32 = 0;
 
@@ -318,9 +346,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
         tokio::select! {
             // PTY output
             Some(data) = output_rx.recv() => {
-                // Always write to local terminal. When mobile is connected the
-                // desktop terminal is physically resized to match mobile dims
-                // via request_terminal_resize(), so both views stay in sync.
+                // Always write to local terminal output.
                 let _ = stdout.write_all(&data);
                 let _ = stdout.flush();
 
@@ -365,34 +391,71 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                                         msg["cols"].as_u64(),
                                         msg["rows"].as_u64(),
                                     ) {
+                                        let epoch = msg["epoch"].as_u64();
                                         if cols == 0 || rows == 0 {
-                                            // Mobile disconnected: restore desktop terminal size.
-                                            // PTY output to stdout resumes automatically
-                                            // (saved_local_size becomes None via .take()).
-                                            let (c, r) = if let Some((lc, lr)) = saved_local_size.take() {
-                                                request_terminal_resize(lc, lr);
-                                                (lc, lr)
-                                            } else {
-                                                get_terminal_size()
+                                            // Mobile detached. Restore PTY dimensions to the
+                                            // host terminal's current size. In mirror mode,
+                                            // also restore the host window to the original size.
+                                            let (c, r) = match desktop_resize_policy {
+                                                DesktopResizePolicy::Mirror => {
+                                                    if let Some((lc, lr)) = saved_local_size.take() {
+                                                        request_terminal_resize(lc, lr);
+                                                        (lc, lr)
+                                                    } else {
+                                                        get_terminal_size()
+                                                    }
+                                                }
+                                                DesktopResizePolicy::Preserve => {
+                                                    saved_local_size = None;
+                                                    get_terminal_size()
+                                                }
                                             };
-                                            let _ = master.resize(PtySize {
+
+                                            let resized = master.resize(PtySize {
                                                 rows: r, cols: c,
                                                 pixel_width: 0, pixel_height: 0,
                                             });
+                                            if resized.is_ok() {
+                                                let mut resized_msg = serde_json::json!({
+                                                    "type": "pty_resized",
+                                                    "cols": c,
+                                                    "rows": r,
+                                                });
+                                                if let Some(epoch) = epoch {
+                                                    resized_msg["epoch"] = serde_json::json!(epoch);
+                                                }
+                                                let _ = ws_tx.send(Message::Text(resized_msg.to_string())).await;
+                                            }
                                         } else {
-                                            // Mobile active: resize both PTY and desktop
-                                            // terminal to mobile dimensions so both views
-                                            // show identical output simultaneously.
-                                            if saved_local_size.is_none() {
+                                            // Mobile active: always resize child PTY to mobile
+                                            // dimensions. Host terminal mirroring is opt-in via
+                                            // MOBILECLI_DESKTOP_RESIZE_POLICY=mirror.
+                                            if desktop_resize_policy == DesktopResizePolicy::Mirror
+                                                && saved_local_size.is_none()
+                                            {
                                                 saved_local_size = get_terminal_size_opt();
                                             }
                                             let c = cols.min(u16::MAX as u64) as u16;
                                             let r = rows.min(u16::MAX as u64) as u16;
-                                            request_terminal_resize(c, r);
-                                            let _ = master.resize(PtySize {
+                                            if desktop_resize_policy == DesktopResizePolicy::Mirror {
+                                                request_terminal_resize(c, r);
+                                            }
+
+                                            let resized = master.resize(PtySize {
                                                 rows: r, cols: c,
                                                 pixel_width: 0, pixel_height: 0,
                                             });
+                                            if resized.is_ok() {
+                                                let mut resized_msg = serde_json::json!({
+                                                    "type": "pty_resized",
+                                                    "cols": c,
+                                                    "rows": r,
+                                                });
+                                                if let Some(epoch) = epoch {
+                                                    resized_msg["epoch"] = serde_json::json!(epoch);
+                                                }
+                                                let _ = ws_tx.send(Message::Text(resized_msg.to_string())).await;
+                                            }
                                         }
                                     }
                                 }
