@@ -4,6 +4,35 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Semantic reason for a PTY resize request.
+///
+/// `Unknown` allows forward compatibility when newer clients introduce
+/// additional reasons.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PtyResizeReason {
+    AttachInit,
+    GeometryChange,
+    ReconnectSync,
+    DetachRestore,
+    KeyboardOverlay,
+    #[serde(other)]
+    Unknown,
+}
+
+impl PtyResizeReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AttachInit => "attach_init",
+            Self::GeometryChange => "geometry_change",
+            Self::ReconnectSync => "reconnect_sync",
+            Self::DetachRestore => "detach_restore",
+            Self::KeyboardOverlay => "keyboard_overlay",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Messages sent from mobile client to server
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -32,6 +61,8 @@ pub enum ClientMessage {
         rows: u16,
         #[serde(default)]
         epoch: Option<u64>,
+        #[serde(default)]
+        reason: Option<PtyResizeReason>,
     },
     /// Heartbeat ping
     Ping,

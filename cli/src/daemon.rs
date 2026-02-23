@@ -9,7 +9,8 @@ use crate::detection::{
 use crate::filesystem::{config::FileSystemConfig, rate_limit::RateLimiter, FileSystemService};
 use crate::platform;
 use crate::protocol::{
-    ChangeType, ClientMessage, FileEncoding, FileSystemError, ServerMessage, SessionListItem,
+    ChangeType, ClientMessage, FileEncoding, FileSystemError, PtyResizeReason, ServerMessage,
+    SessionListItem,
 };
 use crate::session::{self, SessionInfo};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -118,6 +119,14 @@ const ALT_ENTER_SEQS: &[&[u8]] = &[b"\x1b[?1049h", b"\x1b[?1047h", b"\x1b[?47h"]
 const ALT_LEAVE_SEQS: &[&[u8]] = &[b"\x1b[?1049l", b"\x1b[?1047l", b"\x1b[?47l"];
 const ALT_TRACK_TAIL_BYTES: usize = 7;
 
+#[derive(Debug, Clone, Copy)]
+pub struct ResizeRequest {
+    pub cols: u16,
+    pub rows: u16,
+    pub epoch: Option<u64>,
+    pub reason: PtyResizeReason,
+}
+
 /// Active PTY session
 pub struct PtySession {
     pub session_id: String,
@@ -126,7 +135,7 @@ pub struct PtySession {
     pub project_path: String,
     pub started_at: chrono::DateTime<Utc>,
     pub input_tx: mpsc::UnboundedSender<Vec<u8>>,
-    pub resize_tx: mpsc::UnboundedSender<(u16, u16, Option<u64>)>,
+    pub resize_tx: mpsc::UnboundedSender<ResizeRequest>,
     pub waiting_state: Option<WaitingState>,
     pub cli_tracker: CliTracker,
     pub last_wait_hash: Option<u64>,
@@ -142,6 +151,8 @@ pub struct PtySession {
     pub alt_track_tail: Vec<u8>,
     /// Latest accepted resize epoch from mobile (for stale resize rejection).
     pub last_resize_epoch: u64,
+    /// Last dimensions acknowledged by the PTY wrapper.
+    pub last_applied_size: Option<(u16, u16)>,
 }
 
 /// Daemon shared state
@@ -569,7 +580,7 @@ async fn handle_pty_session(
     tracing::info!("PTY session registered: {} ({})", name, session_id);
 
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let (resize_tx, mut resize_rx) = mpsc::unbounded_channel::<(u16, u16, Option<u64>)>();
+    let (resize_tx, mut resize_rx) = mpsc::unbounded_channel::<ResizeRequest>();
 
     // Register session
     let pty_broadcast = {
@@ -595,6 +606,7 @@ async fn handle_pty_session(
                 in_alt_screen: false,
                 alt_track_tail: Vec::new(),
                 last_resize_epoch: 0,
+                last_applied_size: None,
             },
         );
         st.pty_broadcast.clone()
@@ -732,6 +744,12 @@ async fn handle_pty_session(
                                 let cols = msg["cols"].as_u64().unwrap_or(0).min(u16::MAX as u64) as u16;
                                 let rows = msg["rows"].as_u64().unwrap_or(0).min(u16::MAX as u64) as u16;
                                 let epoch = msg["epoch"].as_u64();
+                                {
+                                    let mut st = state.write().await;
+                                    if let Some(session) = st.sessions.get_mut(&session_id) {
+                                        session.last_applied_size = Some((cols, rows));
+                                    }
+                                }
                                 broadcast_pty_resized(&state, &session_id, cols, rows, epoch).await;
                             } else if msg["type"].as_str() == Some("session_ended") {
                                 exit_code = msg["exit_code"].as_i64().unwrap_or(0) as i32;
@@ -784,13 +802,30 @@ async fn handle_pty_session(
             // Resize from mobile
             result = resize_rx.recv() => {
                 match result {
-                    Some((cols, rows, epoch)) => {
+                    Some(mut req) => {
+                        let mut coalesced = 0usize;
+                        while let Ok(next) = resize_rx.try_recv() {
+                            req = next;
+                            coalesced += 1;
+                        }
+                        if coalesced > 0 {
+                            tracing::debug!(
+                                session_id = %session_id,
+                                coalesced,
+                                cols = req.cols,
+                                rows = req.rows,
+                                epoch = ?req.epoch,
+                                reason = req.reason.as_str(),
+                                "Coalesced resize burst to latest request"
+                            );
+                        }
                         let mut msg = serde_json::json!({
                             "type": "resize",
-                            "cols": cols,
-                            "rows": rows,
+                            "cols": req.cols,
+                            "rows": req.rows,
+                            "reason": req.reason.as_str(),
                         });
-                        if let Some(epoch) = epoch {
+                        if let Some(epoch) = req.epoch {
                             msg["epoch"] = serde_json::json!(epoch);
                         }
                         if tx.send(Message::Text(msg.to_string())).await.is_err() {
@@ -1340,9 +1375,11 @@ async fn process_client_msg(
             cols,
             rows,
             epoch,
+            reason,
         } => {
+            let reason = resolve_resize_reason(cols, rows, reason);
             let mut st = state.write().await;
-            let is_restore = cols == 0 && rows == 0;
+            let is_restore = reason == PtyResizeReason::DetachRestore;
             let viewer_count = st
                 .session_view_counts
                 .get(&session_id)
@@ -1353,11 +1390,19 @@ async fn process_client_msg(
                 .get(&addr)
                 .map(|views| views.contains(&session_id))
                 .unwrap_or(false);
+            let mut synthetic_ack: Option<(u16, u16, Option<u64>)> = None;
 
             if !is_restore && viewer_count == 0 {
                 tracing::debug!(
-                    "Ignoring PTY resize for {} (no active mobile viewers)",
-                    session_id
+                    session_id = %session_id,
+                    cols,
+                    rows,
+                    epoch = ?epoch,
+                    reason = reason.as_str(),
+                    viewer_count,
+                    sender_is_viewing,
+                    decision = "ignored_no_active_viewers",
+                    "Ignoring PTY resize with no active mobile viewers"
                 );
                 return Ok(());
             }
@@ -1366,10 +1411,15 @@ async fn process_client_msg(
             // other viewers are still attached to this session.
             if should_ignore_restore_resize(is_restore, viewer_count, sender_is_viewing) {
                 tracing::debug!(
-                    "Ignoring PTY restore for {} (viewer_count={}, sender_is_viewing={})",
-                    session_id,
+                    session_id = %session_id,
+                    cols,
+                    rows,
+                    epoch = ?epoch,
+                    reason = reason.as_str(),
                     viewer_count,
-                    sender_is_viewing
+                    sender_is_viewing,
+                    decision = "ignored_restore_guard",
+                    "Ignoring PTY restore while active viewers remain"
                 );
                 return Ok(());
             }
@@ -1377,17 +1427,77 @@ async fn process_client_msg(
             if let Some(session) = st.sessions.get_mut(&session_id) {
                 if is_stale_resize_epoch(session.last_resize_epoch, epoch) {
                     tracing::debug!(
-                        "Ignoring stale PTY resize for {} (epoch={:?}, last={})",
-                        session_id,
-                        epoch,
-                        session.last_resize_epoch
+                        session_id = %session_id,
+                        cols,
+                        rows,
+                        epoch = ?epoch,
+                        reason = reason.as_str(),
+                        viewer_count,
+                        sender_is_viewing,
+                        alt_screen = session.in_alt_screen,
+                        last_epoch = session.last_resize_epoch,
+                        decision = "ignored_stale_epoch",
+                        "Ignoring stale PTY resize"
                     );
                     return Ok(());
                 }
                 if let Some(epoch) = epoch {
                     session.last_resize_epoch = epoch;
                 }
-                let _ = session.resize_tx.send((cols, rows, epoch));
+
+                let ack_dims = session.last_applied_size.unwrap_or((cols, rows));
+                if reason == PtyResizeReason::KeyboardOverlay {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        cols,
+                        rows,
+                        epoch = ?epoch,
+                        reason = reason.as_str(),
+                        viewer_count,
+                        sender_is_viewing,
+                        alt_screen = session.in_alt_screen,
+                        decision = "ignored_keyboard_overlay",
+                        "Ignoring keyboard-overlay resize (local UX only)"
+                    );
+                    synthetic_ack = Some((ack_dims.0, ack_dims.1, epoch));
+                } else if is_noop_resize(session.last_applied_size, cols, rows) {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        cols,
+                        rows,
+                        epoch = ?epoch,
+                        reason = reason.as_str(),
+                        viewer_count,
+                        sender_is_viewing,
+                        alt_screen = session.in_alt_screen,
+                        decision = "ignored_noop",
+                        "Ignoring no-op PTY resize"
+                    );
+                    synthetic_ack = Some((ack_dims.0, ack_dims.1, epoch));
+                } else {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        cols,
+                        rows,
+                        epoch = ?epoch,
+                        reason = reason.as_str(),
+                        viewer_count,
+                        sender_is_viewing,
+                        alt_screen = session.in_alt_screen,
+                        decision = "forwarded",
+                        "Forwarding PTY resize to wrapper"
+                    );
+                    let _ = session.resize_tx.send(ResizeRequest {
+                        cols,
+                        rows,
+                        epoch,
+                        reason,
+                    });
+                }
+            }
+            drop(st);
+            if let Some((ack_cols, ack_rows, ack_epoch)) = synthetic_ack {
+                broadcast_pty_resized(state, &session_id, ack_cols, ack_rows, ack_epoch).await;
             }
         }
         ClientMessage::Ping => {
@@ -2576,8 +2686,37 @@ fn truncate_to_max_chars(input: &mut String, max_chars: usize) {
     *input = trimmed;
 }
 
-fn should_ignore_restore_resize(is_restore: bool, viewer_count: usize, sender_is_viewing: bool) -> bool {
+fn should_ignore_restore_resize(
+    is_restore: bool,
+    viewer_count: usize,
+    sender_is_viewing: bool,
+) -> bool {
     is_restore && (viewer_count > 1 || (viewer_count == 1 && !sender_is_viewing))
+}
+
+fn resolve_resize_reason(
+    cols: u16,
+    rows: u16,
+    incoming: Option<PtyResizeReason>,
+) -> PtyResizeReason {
+    if cols == 0 || rows == 0 {
+        return PtyResizeReason::DetachRestore;
+    }
+
+    match incoming {
+        Some(reason @ PtyResizeReason::AttachInit)
+        | Some(reason @ PtyResizeReason::GeometryChange)
+        | Some(reason @ PtyResizeReason::ReconnectSync)
+        | Some(reason @ PtyResizeReason::KeyboardOverlay) => reason,
+        Some(PtyResizeReason::DetachRestore | PtyResizeReason::Unknown) => {
+            PtyResizeReason::GeometryChange
+        }
+        None => PtyResizeReason::GeometryChange,
+    }
+}
+
+fn is_noop_resize(last_applied: Option<(u16, u16)>, cols: u16, rows: u16) -> bool {
+    last_applied == Some((cols, rows))
 }
 
 fn is_stale_resize_epoch(last_epoch: u64, incoming_epoch: Option<u64>) -> bool {
@@ -2716,7 +2855,12 @@ fn is_path_watched(changed_path: &str, watched: &std::collections::HashSet<Strin
 async fn restore_pty_size(state: &SharedState, session_id: &str) {
     let st = state.read().await;
     if let Some(session) = st.sessions.get(session_id) {
-        let _ = session.resize_tx.send((0, 0, None));
+        let _ = session.resize_tx.send(ResizeRequest {
+            cols: 0,
+            rows: 0,
+            epoch: None,
+            reason: PtyResizeReason::DetachRestore,
+        });
     }
 }
 
@@ -2774,8 +2918,9 @@ async fn send_push_notifications(tokens: &[PushToken], title: &str, body: &str, 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_upload_destination_path, is_stale_resize_epoch, is_windows_reserved_device_name,
-        sanitize_upload_file_name, should_ignore_restore_resize, update_alt_screen_state,
+        build_upload_destination_path, is_noop_resize, is_stale_resize_epoch,
+        is_windows_reserved_device_name, resolve_resize_reason, sanitize_upload_file_name,
+        should_ignore_restore_resize, update_alt_screen_state, PtyResizeReason,
         MAX_UPLOAD_FILE_NAME_BYTES,
     };
     use tempfile::TempDir;
@@ -2876,5 +3021,40 @@ mod tests {
         assert!(!is_stale_resize_epoch(5, Some(6)));
         assert!(is_stale_resize_epoch(5, Some(5)));
         assert!(is_stale_resize_epoch(5, Some(4)));
+    }
+
+    #[test]
+    fn resolve_resize_reason_prefers_restore_for_zero_dimensions() {
+        assert_eq!(
+            resolve_resize_reason(0, 24, Some(PtyResizeReason::GeometryChange)),
+            PtyResizeReason::DetachRestore
+        );
+        assert_eq!(
+            resolve_resize_reason(80, 0, Some(PtyResizeReason::AttachInit)),
+            PtyResizeReason::DetachRestore
+        );
+    }
+
+    #[test]
+    fn resolve_resize_reason_defaults_unknown_to_geometry_change() {
+        assert_eq!(
+            resolve_resize_reason(80, 24, None),
+            PtyResizeReason::GeometryChange
+        );
+        assert_eq!(
+            resolve_resize_reason(80, 24, Some(PtyResizeReason::Unknown)),
+            PtyResizeReason::GeometryChange
+        );
+        assert_eq!(
+            resolve_resize_reason(80, 24, Some(PtyResizeReason::DetachRestore)),
+            PtyResizeReason::GeometryChange
+        );
+    }
+
+    #[test]
+    fn noop_resize_detection_matches_last_applied_dimensions() {
+        assert!(is_noop_resize(Some((80, 24)), 80, 24));
+        assert!(!is_noop_resize(Some((80, 24)), 81, 24));
+        assert!(!is_noop_resize(None, 80, 24));
     }
 }
