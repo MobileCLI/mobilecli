@@ -113,13 +113,13 @@ pub struct PushToken {
     pub platform: String, // "ios" | "android"
 }
 
-/// Default scrollback buffer size (512KB).
+/// Default scrollback buffer size (2MB).
 ///
 /// Codex/OpenCode-style frame UIs emit high-volume ANSI redraw traffic. A
 /// 64KB tail can roll over quickly and make reopened sessions appear to have
 /// "lost" earlier chat. Retaining a larger buffer keeps substantially more
 /// recoverable history while still bounding memory.
-const DEFAULT_SCROLLBACK_MAX_BYTES: usize = 512 * 1024;
+const DEFAULT_SCROLLBACK_MAX_BYTES: usize = 2 * 1024 * 1024;
 const ALT_ENTER_SEQS: &[&[u8]] = &[b"\x1b[?1049h", b"\x1b[?1047h", b"\x1b[?47h"];
 const ALT_LEAVE_SEQS: &[&[u8]] = &[b"\x1b[?1049l", b"\x1b[?1047l", b"\x1b[?47l"];
 const ALT_TRACK_TAIL_BYTES: usize = 7;
@@ -137,6 +137,8 @@ pub struct ResizeRequest {
 /// Active PTY session
 pub struct PtySession {
     pub session_id: String,
+    /// Execution runtime used by the wrapper (`pty` or `tmux`).
+    pub runtime: String,
     pub name: String,
     pub command: String,
     pub project_path: String,
@@ -594,8 +596,14 @@ async fn handle_pty_session(
     let name = reg_msg["name"].as_str().unwrap_or("Terminal").to_string();
     let command = reg_msg["command"].as_str().unwrap_or("shell").to_string();
     let project_path = reg_msg["project_path"].as_str().unwrap_or("").to_string();
+    let runtime = reg_msg["runtime"].as_str().unwrap_or("pty").to_lowercase();
 
-    tracing::info!("PTY session registered: {} ({})", name, session_id);
+    tracing::info!(
+        "PTY session registered: {} ({}) runtime={}",
+        name,
+        session_id,
+        runtime
+    );
 
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (resize_tx, mut resize_rx) = mpsc::unbounded_channel::<ResizeRequest>();
@@ -611,6 +619,7 @@ async fn handle_pty_session(
             session_id.clone(),
             PtySession {
                 session_id: session_id.clone(),
+                runtime: runtime.clone(),
                 name: name.clone(),
                 command,
                 project_path,
@@ -2605,6 +2614,7 @@ async fn send_sessions_list(
             ws_port: port,
             started_at: s.started_at.to_rfc3339(),
             cli_type: s.cli_tracker.current().as_str().to_string(),
+            runtime: Some(s.runtime.clone()),
         })
         .collect();
     let msg = ServerMessage::Sessions { sessions: items };
@@ -2627,6 +2637,7 @@ async fn broadcast_sessions_update(state: &SharedState) {
             ws_port: port,
             started_at: s.started_at.to_rfc3339(),
             cli_type: s.cli_tracker.current().as_str().to_string(),
+            runtime: Some(s.runtime.clone()),
         })
         .collect();
     let msg = ServerMessage::Sessions { sessions: items };
@@ -3195,7 +3206,7 @@ mod tests {
 
     #[test]
     fn default_scrollback_is_large_enough_for_frame_clis() {
-        assert_eq!(DEFAULT_SCROLLBACK_MAX_BYTES, 512 * 1024);
+        assert_eq!(DEFAULT_SCROLLBACK_MAX_BYTES, 2 * 1024 * 1024);
         assert!(DEFAULT_SCROLLBACK_MAX_BYTES > 64 * 1024);
     }
 
@@ -3416,6 +3427,7 @@ mod tests {
                 session_id.clone(),
                 PtySession {
                     session_id: session_id.clone(),
+                    runtime: "pty".to_string(),
                     name: "Codex".to_string(),
                     command: "codex".to_string(),
                     project_path: "/tmp".to_string(),

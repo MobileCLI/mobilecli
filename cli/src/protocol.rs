@@ -377,6 +377,9 @@ pub struct SessionListItem {
     pub started_at: String,
     /// Explicit CLI type identifier for mobile app disambiguation
     pub cli_type: String,
+    /// Runtime backend for this session (`pty` or `tmux`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
