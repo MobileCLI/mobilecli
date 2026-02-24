@@ -260,8 +260,12 @@ fn setup_tmux_session(
     rows: u16,
 ) -> Result<(), WrapError> {
     // Bootstrap a dedicated tmux server first so global options apply before
-    // the wrapped CLI starts. This avoids races where frame CLIs enter
-    // alternate-screen at launch and drop scrollback history.
+    // the wrapped CLI starts. We also disable alternate-screen globally here
+    // because the pty_wrapper runs tmux attach-session inside the host
+    // terminal (e.g. Konsole). If alternate-screen is enabled, tmux forwards
+    // \x1b[?1049h to the host terminal when TUI apps run, causing the host to
+    // enter its own alt-screen and lose its scrollback. Disabling it keeps
+    // all output in the main buffer where capture-pane can reach it.
     let mut start_server = tmux_base_command(socket_name);
     start_server.arg("start-server");
     let _ = run_tmux_checked(&mut start_server, "start-server");
@@ -278,6 +282,25 @@ fn setup_tmux_session(
             session = session_name,
             error = %err,
             "Ignoring non-fatal pre-session alternate-screen option failure"
+        );
+    }
+
+    // Set history-limit globally BEFORE creating the session. tmux allocates
+    // each pane's history buffer at window-creation time using the current
+    // history-limit value; setting it after new-session has no effect on the
+    // window that was already created with the default 2000 lines.
+    let mut pre_history = tmux_base_command(socket_name);
+    pre_history
+        .arg("set-option")
+        .arg("-g")
+        .arg("history-limit")
+        .arg("200000");
+    if let Err(err) = run_tmux_checked(&mut pre_history, "history-limit") {
+        tracing::debug!(
+            socket = socket_name,
+            session = session_name,
+            error = %err,
+            "Ignoring non-fatal pre-session history-limit option failure"
         );
     }
 
@@ -303,10 +326,28 @@ fn setup_tmux_session(
     // NOTE: window-size must remain dynamic so wrapper PTY resizes propagate
     // into tmux panes when mobile dimensions change.
     let window_target = format!("{}:0", session_name);
-    let option_sets: [(&str, &str, &str, &str); 5] = [
+    // Disable smcup/rmcup so tmux itself does NOT enter Konsole's alternate
+    // screen on attach. Without this, Konsole has zero scrollback while tmux
+    // is attached (alt-screen has no history buffer). With it disabled, tmux
+    // renders in Konsole's main buffer and the scrollbar works.
+    let mut disable_altscreen_client = tmux_base_command(socket_name);
+    disable_altscreen_client
+        .arg("set-option")
+        .arg("-g")
+        .arg("terminal-overrides")
+        .arg("xterm*:smcup@:rmcup@");
+    let _ = run_tmux_checked(&mut disable_altscreen_client, "terminal-overrides");
+
+    // Enable mouse so scroll wheel works with tmux's history buffer.
+    let mut mouse_on = tmux_base_command(socket_name);
+    mouse_on.arg("set-option").arg("-g").arg("mouse").arg("on");
+    let _ = run_tmux_checked(&mut mouse_on, "mouse");
+
+    // history-limit is set globally before new-session so the window is
+    // allocated with the full 200K-line buffer from the start.
+    let option_sets: [(&str, &str, &str, &str); 4] = [
         ("set-option", session_name, "status", "off"),
         ("set-option", session_name, "allow-rename", "off"),
-        ("set-option", session_name, "history-limit", "200000"),
         ("set-window-option", &window_target, "alternate-screen", "off"),
         ("set-window-option", &window_target, "window-size", "latest"),
     ];
@@ -1057,7 +1098,7 @@ mod tests {
         let alt_screen_mode = String::from_utf8_lossy(&output.stdout).trim().to_string();
         assert_eq!(
             alt_screen_mode, "off",
-            "expected tmux alternate-screen to be disabled so scrollback is preserved"
+            "expected tmux alternate-screen to be disabled to protect host terminal scrollback"
         );
 
         cleanup_tmux_session(&ctx);

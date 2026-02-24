@@ -120,6 +120,18 @@ pub struct PushToken {
 /// "lost" earlier chat. Retaining a larger buffer keeps substantially more
 /// recoverable history while still bounding memory.
 const DEFAULT_SCROLLBACK_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Maximum tmux scrollback lines fetched via capture-pane on the subscribe path.
+///
+/// Mobile xterm.js holds 20 000 lines. Desktop sessions are typically 160–240 cols
+/// while mobile is 80–100 cols, giving a worst-case wrap ratio of ~3×. So 10 000
+/// tmux lines → up to ~30 000 visual lines, which keeps the buffer well-fed without
+/// sending megabytes of scrollback that will immediately be discarded by xterm.js.
+///
+/// For on-demand `GetSessionHistory` requests the full 200 000-line depth is used.
+const SUBSCRIBE_SCROLLBACK_LINES: usize = 10_000;
+const HISTORY_SCROLLBACK_LINES: usize = 200_000;
+
 const ALT_ENTER_SEQS: &[&[u8]] = &[b"\x1b[?1049h", b"\x1b[?1047h", b"\x1b[?47h"];
 const ALT_LEAVE_SEQS: &[&[u8]] = &[b"\x1b[?1049l", b"\x1b[?1047l", b"\x1b[?47l"];
 const ALT_TRACK_TAIL_BYTES: usize = 7;
@@ -1171,8 +1183,16 @@ async fn spawn_session_from_mobile(
     } else {
         "/bin/sh".to_string()
     };
+    // Default to home directory when no working_dir is specified.
+    // Without this, the spawned terminal inherits the daemon's CWD,
+    // which is wherever the daemon was launched from (often the project dir).
+    let home_dir_buf = dirs_next::home_dir();
+    let effective_working_dir: Option<&str> = working_dir.or_else(|| {
+        home_dir_buf.as_ref().and_then(|p| p.to_str())
+    });
+
     let wrap_cmd =
-        build_wrap_shell_command(&mobilecli_bin, session_name, command, args, working_dir);
+        build_wrap_shell_command(&mobilecli_bin, session_name, command, args, effective_working_dir);
     let shell_args = shell_args_for_command(&shell, &wrap_cmd);
 
     let mut cmd = if let Some(ref terminal) = terminal {
@@ -1256,8 +1276,8 @@ async fn spawn_session_from_mobile(
         }
     };
 
-    // Set working directory if specified
-    if let Some(dir) = working_dir {
+    // Set working directory (defaults to home dir when not specified by caller)
+    if let Some(dir) = effective_working_dir {
         cmd.current_dir(dir);
     }
 
@@ -1402,11 +1422,11 @@ async fn process_client_msg(
                 scrollback_bytes,
                 render_as_tui,
                 in_alt_screen,
-                frame_render_mode,
                 queue_deferred_replay,
                 scrollback_len,
                 runtime,
                 tmux_snapshot_req,
+                tmux_fallback_bytes,
             ) = if let Some(session) = st.sessions.get(&session_id) {
                 let render_as_tui = should_treat_as_tui_for_mobile(
                     &session.runtime,
@@ -1415,15 +1435,33 @@ async fn process_client_msg(
                 );
                 let has_scrollback = !session.scrollback.is_empty();
                 let runtime = session.runtime.clone();
-                let tmux_snapshot_req = if runtime == "tmux" && !render_as_tui {
-                    match (&session.tmux_socket, &session.tmux_session) {
-                        (Some(socket), Some(name)) => Some((
-                            socket.clone(),
-                            name.clone(),
-                            session.scrollback_max_bytes,
-                            true,
-                        )),
-                        _ => None,
+                // alternate-screen is disabled in tmux so the host terminal (e.g.
+                // Konsole) never enters its own alt-screen and loses scrollback.
+                // This means in_alt_screen is always false for tmux sessions; we
+                // instead use frame_render_mode to distinguish between text CLIs
+                // (which get real scrollback history) and frame-rendering TUIs
+                // (which flood scrollback with cursor-home+clear frames and should
+                // instead get a visible-pane snapshot of their current screen state).
+                // frame_render_mode is detected from observable output patterns —
+                // any app that emits heavy cursor-repositioning qualifies, regardless
+                // of what the app is called.
+                let frame_render = session.frame_render_mode;
+                let tmux_snapshot_req = if runtime == "tmux" {
+                    if frame_render {
+                        // Frame-rendering TUIs redraw their entire screen on SIGWINCH.
+                        // Skip capture — it would be at desktop dimensions and get
+                        // immediately overwritten by the resize-triggered redraw.
+                        None
+                    } else {
+                        match (&session.tmux_socket, &session.tmux_session) {
+                            (Some(socket), Some(name)) => Some((
+                                socket.clone(),
+                                name.clone(),
+                                session.scrollback_max_bytes,
+                                true,
+                            )),
+                            _ => None,
+                        }
                     }
                 } else {
                     None
@@ -1433,20 +1471,27 @@ async fn process_client_msg(
                 } else {
                     None
                 };
+                // Daemon in-memory scrollback fallback for tmux text sessions when
+                // capture-pane is unavailable (socket startup race, etc.).
+                let tmux_fallback = if runtime == "tmux" && !frame_render && has_scrollback {
+                    Some(session.scrollback.iter().copied().collect::<Vec<u8>>())
+                } else {
+                    None
+                };
                 (
                     sb,
                     render_as_tui,
                     session.in_alt_screen,
-                    session.frame_render_mode,
                     // tmux sessions use capture-pane snapshots; raw deferred replay
-                    // of daemon scrollback corrupts frame TUIs on reconnect.
+                    // of daemon scrollback corrupts TUIs on reconnect.
                     runtime != "tmux" && render_as_tui && has_scrollback,
                     session.scrollback.len(),
                     runtime,
                     tmux_snapshot_req,
+                    tmux_fallback,
                 )
             } else {
-                (None, false, false, false, false, 0, "pty".to_string(), None)
+                (None, false, false, false, 0, "pty".to_string(), None, None)
             };
 
             if queue_deferred_replay {
@@ -1470,7 +1515,6 @@ async fn process_client_msg(
                 runtime = %runtime,
                 render_as_tui,
                 in_alt_screen,
-                frame_render_mode,
                 queue_deferred_replay,
                 scrollback_len,
                 text_replay_bytes = scrollback_bytes.as_ref().map(|b| b.len()).unwrap_or(0),
@@ -1492,8 +1536,16 @@ async fn process_client_msg(
             }
 
             if let Some((socket, name, max_bytes, include_scrollback)) = tmux_snapshot_req {
+                // Text sessions use capped subscribe depth; visible-pane captures
+                // (TUI sessions in alt-screen) pass max_lines=0 which is ignored.
+                let max_lines = if include_scrollback {
+                    SUBSCRIBE_SCROLLBACK_LINES
+                } else {
+                    0
+                };
                 if let Some(snapshot) =
-                    capture_tmux_history_with_retry(socket, name, include_scrollback).await
+                    capture_tmux_history_with_retry(socket, name, include_scrollback, max_lines)
+                        .await
                 {
                     let total_bytes = snapshot.len();
                     let skip = total_bytes.saturating_sub(max_bytes);
@@ -1501,6 +1553,24 @@ async fn process_client_msg(
                     let msg = ServerMessage::SessionHistory {
                         session_id: session_id.clone(),
                         data: BASE64.encode(bytes),
+                        total_bytes,
+                    };
+                    if let Ok(text) = serde_json::to_string(&msg) {
+                        let _ = tx.send(Message::Text(text)).await;
+                    }
+                } else if let Some(fallback) = tmux_fallback_bytes {
+                    // capture-pane unavailable (socket not yet ready, tmux startup
+                    // race, etc.) – fall back to the daemon's in-memory PTY stream
+                    // so mobile at least sees recent output rather than a blank terminal.
+                    tracing::debug!(
+                        session_id = %session_id,
+                        fallback_bytes = fallback.len(),
+                        "capture-pane failed on subscribe; using daemon scrollback fallback"
+                    );
+                    let total_bytes = fallback.len();
+                    let msg = ServerMessage::SessionHistory {
+                        session_id: session_id.clone(),
+                        data: BASE64.encode(&fallback),
                         total_bytes,
                     };
                     if let Ok(text) = serde_json::to_string(&msg) {
@@ -1925,8 +1995,16 @@ async fn process_client_msg(
 
             let (data, total_bytes) =
                 if let Some((socket, name, max, include_scrollback)) = tmux_capture_req {
+                    // On-demand history requests use the full depth so users can
+                    // retrieve the maximum available scrollback from tmux.
+                    let max_lines = if include_scrollback {
+                        HISTORY_SCROLLBACK_LINES
+                    } else {
+                        0
+                    };
                     if let Some(snapshot) =
-                        capture_tmux_history_with_retry(socket, name, include_scrollback).await
+                        capture_tmux_history_with_retry(socket, name, include_scrollback, max_lines)
+                            .await
                     {
                         let total = snapshot.len();
                         let skip = total.saturating_sub(max);
@@ -3064,6 +3142,8 @@ fn capture_tmux_history_blocking(
     socket: &str,
     session: &str,
     include_scrollback: bool,
+    // Lines to request via `-S -N`. Ignored when include_scrollback is false.
+    max_scrollback_lines: usize,
 ) -> Option<Vec<u8>> {
     let targets = [
         format!("{}:0.0", session),
@@ -3081,7 +3161,7 @@ fn capture_tmux_history_blocking(
             .arg("-p")
             .arg("-e");
         if include_scrollback {
-            cmd.arg("-S").arg("-200000");
+            cmd.arg("-S").arg(format!("-{}", max_scrollback_lines));
         }
         cmd.arg("-t").arg(&target);
         let output = cmd.output();
@@ -3098,9 +3178,10 @@ async fn capture_tmux_history(
     socket: String,
     session: String,
     include_scrollback: bool,
+    max_scrollback_lines: usize,
 ) -> Option<Vec<u8>> {
     tokio::task::spawn_blocking(move || {
-        capture_tmux_history_blocking(&socket, &session, include_scrollback)
+        capture_tmux_history_blocking(&socket, &session, include_scrollback, max_scrollback_lines)
     })
     .await
     .ok()
@@ -3117,15 +3198,18 @@ async fn capture_tmux_history_with_retry(
     socket: String,
     session: String,
     include_scrollback: bool,
+    max_scrollback_lines: usize,
 ) -> Option<Vec<u8>> {
     if include_scrollback {
-        return capture_tmux_history(socket, session, true).await;
+        return capture_tmux_history(socket, session, true, max_scrollback_lines).await;
     }
 
     const MAX_ATTEMPTS: usize = 8;
     const RETRY_DELAY_MS: u64 = 120;
     for attempt in 0..MAX_ATTEMPTS {
-        if let Some(snapshot) = capture_tmux_history(socket.clone(), session.clone(), false).await {
+        if let Some(snapshot) =
+            capture_tmux_history(socket.clone(), session.clone(), false, 0).await
+        {
             if snapshot_has_visible_content(&snapshot) || attempt + 1 == MAX_ATTEMPTS {
                 return Some(snapshot);
             }
@@ -3323,8 +3407,11 @@ fn update_alt_screen_state(in_alt_screen: &mut bool, tail: &mut Vec<u8>, chunk: 
     tail.extend_from_slice(&scan[scan.len() - keep..]);
 }
 
-fn cli_defaults_to_frame_mode(cli: CliType) -> bool {
-    matches!(cli, CliType::Codex | CliType::OpenCode)
+fn cli_defaults_to_frame_mode(_cli: CliType) -> bool {
+    // Do not pre-set frame mode based on app identity. The heuristic
+    // (heavy cursor-repositioning ops in output) detects frame-rendering
+    // behavior universally, regardless of which application is running.
+    false
 }
 
 fn should_enable_frame_mode(cursor_ops: u32, erase_ops: u32) -> bool {
@@ -3702,7 +3789,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(150)).await;
 
-        let snapshot = capture_tmux_history(socket.clone(), session.clone(), true)
+        let snapshot = capture_tmux_history(socket.clone(), session.clone(), true, 1_000)
             .await
             .expect("tmux snapshot");
         let text = String::from_utf8_lossy(&snapshot);
@@ -3939,9 +4026,11 @@ mod tests {
     }
 
     #[test]
-    fn codex_and_opencode_default_to_frame_mode() {
-        assert!(super::cli_defaults_to_frame_mode(CliType::Codex));
-        assert!(super::cli_defaults_to_frame_mode(CliType::OpenCode));
+    fn frame_mode_not_preset_by_app_name() {
+        // frame_render_mode must be detected from observable output patterns,
+        // not pre-set based on which application is being launched.
+        assert!(!super::cli_defaults_to_frame_mode(CliType::Codex));
+        assert!(!super::cli_defaults_to_frame_mode(CliType::OpenCode));
         assert!(!super::cli_defaults_to_frame_mode(CliType::Claude));
         assert!(!super::cli_defaults_to_frame_mode(CliType::Terminal));
     }
