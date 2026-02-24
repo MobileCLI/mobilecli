@@ -125,3 +125,72 @@ Result:
 
 Next action:
 - Open/submit daemon PR and request Greptile review.
+
+## Task T-005 - Reopen history loss root-cause and daemon-only fix
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- Reopen history loss was caused by two daemon-side gaps:
+  - frame-rendered sessions skipped subscribe replay and could return with only tiny redraw output,
+  - 64KB scrollback rolled over too quickly for high-ANSI Codex/OpenCode flows.
+
+Changes:
+- `cli/src/daemon.rs`:
+  - increased `DEFAULT_SCROLLBACK_MAX_BYTES` from `64 * 1024` to `512 * 1024`.
+  - added deferred per-client replay queue for frame-rendered sessions: `pending_tui_replay`.
+  - on `subscribe` for frame-rendered sessions with existing scrollback, queue one replay for post-resize ack.
+  - on `broadcast_pty_resized`, send one replay payload (full scrollback) to queued viewers, then clear queue entry.
+  - added cleanup for deferred replay state on unsubscribe/disconnect/session close/end.
+
+Commands:
+- `cargo check --manifest-path cli/Cargo.toml`
+- `cargo test --manifest-path cli/Cargo.toml daemon::tests:: -- --nocapture`
+- `cargo test --manifest-path cli/Cargo.toml pty_wrapper::tests:: -- --nocapture`
+- websocket probe scripts (Python `websockets`) for attach/detach/reconnect flows with `get_session_history` + chunk-size capture.
+
+Evidence:
+- With old runtime binary path (`/home/bigphoot/.local/bin/mobilecli`) still active, reconnect showed:
+  - `history_before = 3894`
+  - post-resize `pty_bytes` sum = `323` (no full replay), matching user-visible "missing history".
+- After installing patched binary to runtime path and restarting daemon:
+  - reconnect showed `history_before = 3389` and first post-resize `pty_bytes` chunk = `3389` (full replay delivered).
+  - follow-up test: replay occurs only once per reattach (first resize replayed, second resize in same attach did not replay).
+- Scrollback-cap verification with high-volume bash output:
+  - `get_session_history.total_bytes = 143392` (> 65536), confirming rollover headroom increase.
+
+Result:
+- pass
+
+Next action:
+- Add regression tests for one-shot deferred replay and larger default scrollback, then reinstall daemon binary for local runtime parity.
+
+## Task T-006 - Regression tests and runtime parity install
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- Dedicated tests will prevent regression on the exact reconnect-history failure mode.
+
+Changes:
+- `cli/src/daemon.rs` tests:
+  - added `default_scrollback_is_large_enough_for_frame_clis`.
+  - added `pty_resized_replays_pending_tui_scrollback_only_once` (async test).
+
+Commands:
+- `cargo test --manifest-path cli/Cargo.toml daemon::tests::pty_resized_replays_pending_tui_scrollback_only_once -- --nocapture`
+- `cargo test --manifest-path cli/Cargo.toml daemon::tests::default_scrollback_is_large_enough_for_frame_clis -- --nocapture`
+- `cargo test --manifest-path cli/Cargo.toml daemon::tests:: -- --nocapture`
+- `cargo test --manifest-path cli/Cargo.toml pty_wrapper::tests:: -- --nocapture`
+- `install -m 755 cli/target/debug/mobilecli /home/bigphoot/.local/bin/mobilecli`
+
+Evidence:
+- New daemon tests pass.
+- Full targeted daemon/wrapper suites pass.
+- Runtime probe on installed daemon binary confirms reconnect first chunk equals pre-subscribe history bytes (`3219`), demonstrating working one-shot replay on actual running daemon.
+
+Result:
+- pass
+
+Next action:
+- Commit daemon-only patchset and continue mobile-side validation with no additional mobile code changes.

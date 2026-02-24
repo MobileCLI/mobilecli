@@ -113,8 +113,13 @@ pub struct PushToken {
     pub platform: String, // "ios" | "android"
 }
 
-/// Default scrollback buffer size (64KB)
-const DEFAULT_SCROLLBACK_MAX_BYTES: usize = 64 * 1024;
+/// Default scrollback buffer size (512KB).
+///
+/// Codex/OpenCode-style frame UIs emit high-volume ANSI redraw traffic. A
+/// 64KB tail can roll over quickly and make reopened sessions appear to have
+/// "lost" earlier chat. Retaining a larger buffer keeps substantially more
+/// recoverable history while still bounding memory.
+const DEFAULT_SCROLLBACK_MAX_BYTES: usize = 512 * 1024;
 const ALT_ENTER_SEQS: &[&[u8]] = &[b"\x1b[?1049h", b"\x1b[?1047h", b"\x1b[?47h"];
 const ALT_LEAVE_SEQS: &[&[u8]] = &[b"\x1b[?1049l", b"\x1b[?1047l", b"\x1b[?47l"];
 const ALT_TRACK_TAIL_BYTES: usize = 7;
@@ -173,6 +178,9 @@ pub struct DaemonState {
     pub push_tokens: Vec<PushToken>,
     pub mobile_views: HashMap<SocketAddr, std::collections::HashSet<String>>,
     pub session_view_counts: HashMap<String, usize>,
+    /// Sessions that should receive one deferred replay after first
+    /// post-subscribe PTY resize ack (per mobile client).
+    pub pending_tui_replay: HashMap<SocketAddr, std::collections::HashSet<String>>,
     pub file_system: std::sync::Arc<FileSystemService>,
     pub file_watch_subscriptions: HashMap<SocketAddr, std::collections::HashSet<String>>,
     pub file_watch_counts: HashMap<String, usize>,
@@ -205,6 +213,7 @@ impl DaemonState {
             push_tokens: Vec::new(),
             mobile_views: HashMap::new(),
             session_view_counts: HashMap::new(),
+            pending_tui_replay: HashMap::new(),
             file_system,
             file_watch_subscriptions: HashMap::new(),
             file_watch_counts: HashMap::new(),
@@ -871,6 +880,7 @@ async fn handle_pty_session(
     let was_present = {
         let mut st = state.write().await;
         if st.sessions.remove(&session_id).is_some() {
+            clear_pending_tui_replay_for_session(&mut st, &session_id);
             // Notify about session end
             let msg = ServerMessage::SessionEnded {
                 session_id: session_id.clone(),
@@ -1334,18 +1344,49 @@ async fn process_client_msg(
             }
 
             // Collect session state under one lock, then drop it before sending.
-            let (scrollback_bytes, render_as_tui) =
+            let (scrollback_bytes, render_as_tui, queue_deferred_replay, scrollback_len) =
                 if let Some(session) = st.sessions.get(&session_id) {
                     let render_as_tui = session.in_alt_screen || session.frame_render_mode;
-                    let sb = if !render_as_tui && !session.scrollback.is_empty() {
+                    let has_scrollback = !session.scrollback.is_empty();
+                    let sb = if !render_as_tui && has_scrollback {
                         Some(session.scrollback.iter().copied().collect::<Vec<u8>>())
                     } else {
                         None
                     };
-                    (sb, render_as_tui)
+                    (
+                        sb,
+                        render_as_tui,
+                        render_as_tui && has_scrollback,
+                        session.scrollback.len(),
+                    )
                 } else {
-                    (None, false)
+                    (None, false, false, 0)
                 };
+
+            if queue_deferred_replay {
+                st.pending_tui_replay
+                    .entry(addr)
+                    .or_default()
+                    .insert(session_id.clone());
+            } else {
+                let mut remove_entry = false;
+                if let Some(pending) = st.pending_tui_replay.get_mut(&addr) {
+                    pending.remove(&session_id);
+                    remove_entry = pending.is_empty();
+                }
+                if remove_entry {
+                    st.pending_tui_replay.remove(&addr);
+                }
+            }
+            tracing::debug!(
+                session_id = %session_id,
+                addr = %addr,
+                render_as_tui,
+                queue_deferred_replay,
+                scrollback_len,
+                text_replay_bytes = scrollback_bytes.as_ref().map(|b| b.len()).unwrap_or(0),
+                "Subscribe replay decision"
+            );
             drop(st);
 
             // Replay scrollback for text CLIs so chat history is visible.
@@ -1374,6 +1415,14 @@ async fn process_client_msg(
         ClientMessage::Unsubscribe { session_id } => {
             tracing::debug!("Client unsubscribed from session: {}", session_id);
             let mut st = state.write().await;
+            let mut remove_entry = false;
+            if let Some(pending) = st.pending_tui_replay.get_mut(&addr) {
+                pending.remove(&session_id);
+                remove_entry = pending.is_empty();
+            }
+            if remove_entry {
+                st.pending_tui_replay.remove(&addr);
+            }
             if let Some(entry) = st.mobile_views.get_mut(&addr) {
                 if entry.remove(&session_id) {
                     if let Some(count) = st.session_view_counts.get_mut(&session_id) {
@@ -1603,6 +1652,7 @@ async fn process_client_msg(
                     drop(session);
                     // Clean up view counts for this session
                     st.session_view_counts.remove(&session_id);
+                    clear_pending_tui_replay_for_session(&mut st, &session_id);
                     for views in st.mobile_views.values_mut() {
                         views.remove(&session_id);
                     }
@@ -2658,23 +2708,95 @@ async fn broadcast_pty_resized(
     rows: u16,
     epoch: Option<u64>,
 ) {
-    let st = state.read().await;
     let msg = ServerMessage::PtyResized {
         session_id: session_id.to_string(),
         cols,
         rows,
         epoch,
     };
-    if let Ok(msg_str) = serde_json::to_string(&msg) {
-        for (addr, client) in &st.mobile_clients {
-            let is_viewing = st
-                .mobile_views
-                .get(addr)
-                .map(|views| views.contains(session_id))
-                .unwrap_or(false);
-            if is_viewing {
-                let _ = client.try_send(Message::Text(msg_str.clone()));
+    let Ok(msg_str) = serde_json::to_string(&msg) else {
+        return;
+    };
+
+    let mut ack_clients: Vec<mpsc::Sender<Message>> = Vec::new();
+    let mut replay_clients: Vec<mpsc::Sender<Message>> = Vec::new();
+    let mut replay_payload: Option<String> = None;
+    let mut replay_scrollback_len = 0usize;
+
+    {
+        let mut st = state.write().await;
+        let viewing_addrs: Vec<SocketAddr> = st
+            .mobile_views
+            .iter()
+            .filter_map(|(addr, views)| views.contains(session_id).then_some(*addr))
+            .collect();
+
+        if !viewing_addrs.is_empty() {
+            for addr in &viewing_addrs {
+                if let Some(client) = st.mobile_clients.get(addr) {
+                    ack_clients.push(client.clone());
+                }
             }
+
+            let replay_addrs: Vec<SocketAddr> = viewing_addrs
+                .iter()
+                .copied()
+                .filter(|addr| {
+                    st.pending_tui_replay
+                        .get(addr)
+                        .map(|pending| pending.contains(session_id))
+                        .unwrap_or(false)
+                })
+                .collect();
+
+            if !replay_addrs.is_empty() {
+                if let Some(session) = st.sessions.get(session_id) {
+                    if !session.scrollback.is_empty() {
+                        replay_scrollback_len = session.scrollback.len();
+                        let bytes: Vec<u8> = session.scrollback.iter().copied().collect();
+                        let replay_msg = ServerMessage::PtyBytes {
+                            session_id: session_id.to_string(),
+                            data: BASE64.encode(&bytes),
+                        };
+                        replay_payload = serde_json::to_string(&replay_msg).ok();
+                    }
+                }
+
+                for addr in replay_addrs {
+                    if let Some(client) = st.mobile_clients.get(&addr) {
+                        replay_clients.push(client.clone());
+                    }
+                    let mut remove_entry = false;
+                    if let Some(pending) = st.pending_tui_replay.get_mut(&addr) {
+                        pending.remove(session_id);
+                        remove_entry = pending.is_empty();
+                    }
+                    if remove_entry {
+                        st.pending_tui_replay.remove(&addr);
+                    }
+                }
+            }
+        }
+    }
+
+    tracing::debug!(
+        session_id = %session_id,
+        cols,
+        rows,
+        epoch = ?epoch,
+        ack_clients = ack_clients.len(),
+        replay_clients = replay_clients.len(),
+        replay_scrollback_len,
+        replay_payload_len = replay_payload.as_ref().map(|s| s.len()).unwrap_or(0),
+        "Broadcasted pty_resized"
+    );
+
+    for client in ack_clients {
+        let _ = client.try_send(Message::Text(msg_str.clone()));
+    }
+    if let Some(payload) = replay_payload {
+        for client in replay_clients {
+            let _ = client.try_send(Message::Text(payload.clone()));
         }
     }
 }
@@ -2826,8 +2948,7 @@ fn scan_frame_sequences(chunk: &[u8]) -> (u32, u32) {
         }
 
         let mut j = i + 2;
-        while j < chunk.len()
-            && (chunk[j].is_ascii_digit() || chunk[j] == b';' || chunk[j] == b'?')
+        while j < chunk.len() && (chunk[j].is_ascii_digit() || chunk[j] == b';' || chunk[j] == b'?')
         {
             j += 1;
         }
@@ -2910,6 +3031,7 @@ fn build_notification_text(
 async fn cleanup_client_state(state: &SharedState, addr: SocketAddr) {
     let (sessions_to_restore, to_unwatch) = {
         let mut st = state.write().await;
+        st.pending_tui_replay.remove(&addr);
 
         let sessions_to_restore = match st.mobile_views.remove(&addr) {
             Some(sessions) => {
@@ -2973,6 +3095,19 @@ fn is_path_watched(changed_path: &str, watched: &std::collections::HashSet<Strin
         return watched.contains(&parent);
     }
     false
+}
+
+fn clear_pending_tui_replay_for_session(st: &mut DaemonState, session_id: &str) {
+    let mut empty_addrs = Vec::new();
+    for (addr, pending) in st.pending_tui_replay.iter_mut() {
+        pending.remove(session_id);
+        if pending.is_empty() {
+            empty_addrs.push(*addr);
+        }
+    }
+    for addr in empty_addrs {
+        st.pending_tui_replay.remove(&addr);
+    }
 }
 
 async fn restore_pty_size(state: &SharedState, session_id: &str) {
@@ -3041,15 +3176,28 @@ async fn send_push_notifications(tokens: &[PushToken], title: &str, body: &str, 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_upload_destination_path, is_noop_resize, is_stale_resize_epoch,
-        is_windows_reserved_device_name, resolve_resize_reason, sanitize_upload_file_name,
-        scan_frame_sequences, should_enable_frame_mode, should_force_noop_resize,
-        should_ignore_restore_resize, update_alt_screen_state, update_frame_render_state,
-        PtyResizeReason,
-        MAX_UPLOAD_FILE_NAME_BYTES,
+        broadcast_pty_resized, build_upload_destination_path, is_noop_resize,
+        is_stale_resize_epoch, is_windows_reserved_device_name, resolve_resize_reason,
+        sanitize_upload_file_name, scan_frame_sequences, should_enable_frame_mode,
+        should_force_noop_resize, should_ignore_restore_resize, update_alt_screen_state,
+        update_frame_render_state, DaemonState, PtyResizeReason, PtySession,
+        DEFAULT_SCROLLBACK_MAX_BYTES, MAX_UPLOAD_FILE_NAME_BYTES,
     };
-    use crate::detection::CliType;
+    use crate::detection::{CliTracker, CliType};
+    use base64::Engine as _;
+    use chrono::Utc;
+    use std::collections::VecDeque;
+    use std::sync::Arc;
     use tempfile::TempDir;
+    use tokio::sync::{mpsc, RwLock};
+    use tokio::time::{timeout, Duration};
+    use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn default_scrollback_is_large_enough_for_frame_clis() {
+        assert_eq!(DEFAULT_SCROLLBACK_MAX_BYTES, 512 * 1024);
+        assert!(DEFAULT_SCROLLBACK_MAX_BYTES > 64 * 1024);
+    }
 
     #[test]
     fn sanitize_upload_file_name_replaces_invalid_chars() {
@@ -3232,5 +3380,128 @@ mod tests {
         assert!(super::cli_defaults_to_frame_mode(CliType::OpenCode));
         assert!(!super::cli_defaults_to_frame_mode(CliType::Claude));
         assert!(!super::cli_defaults_to_frame_mode(CliType::Terminal));
+    }
+
+    #[tokio::test]
+    async fn pty_resized_replays_pending_tui_scrollback_only_once() {
+        let state = Arc::new(RwLock::new(DaemonState::new(9847)));
+        let addr: std::net::SocketAddr = "127.0.0.1:40001".parse().expect("socket addr");
+        let session_id = "test-session".to_string();
+        let replay_bytes = b"REPLAY-ME".to_vec();
+
+        let (client_tx, mut client_rx) = mpsc::channel::<Message>(32);
+        let (input_tx, _input_rx) = mpsc::unbounded_channel();
+        let (resize_tx, _resize_rx) = mpsc::unbounded_channel();
+
+        {
+            let mut st = state.write().await;
+            st.mobile_clients.insert(addr, client_tx);
+            st.mobile_views
+                .entry(addr)
+                .or_default()
+                .insert(session_id.clone());
+            st.session_view_counts.insert(session_id.clone(), 1);
+            st.pending_tui_replay
+                .entry(addr)
+                .or_default()
+                .insert(session_id.clone());
+
+            let mut scrollback = VecDeque::new();
+            scrollback.extend(replay_bytes.iter().copied());
+
+            let mut cli_tracker = CliTracker::new();
+            cli_tracker.update_from_command("codex");
+
+            st.sessions.insert(
+                session_id.clone(),
+                PtySession {
+                    session_id: session_id.clone(),
+                    name: "Codex".to_string(),
+                    command: "codex".to_string(),
+                    project_path: "/tmp".to_string(),
+                    started_at: Utc::now(),
+                    input_tx,
+                    resize_tx,
+                    waiting_state: None,
+                    cli_tracker,
+                    last_wait_hash: None,
+                    scrollback,
+                    scrollback_max_bytes: DEFAULT_SCROLLBACK_MAX_BYTES,
+                    in_alt_screen: false,
+                    alt_track_tail: Vec::new(),
+                    frame_cursor_pos_count: 0,
+                    frame_erase_line_count: 0,
+                    frame_render_mode: true,
+                    last_resize_epoch: 0,
+                    last_applied_size: Some((95, 27)),
+                },
+            );
+        }
+
+        broadcast_pty_resized(&state, &session_id, 95, 27, Some(1)).await;
+
+        let mut first_ack = 0usize;
+        let mut first_replay = Vec::new();
+        loop {
+            match timeout(Duration::from_millis(50), client_rx.recv()).await {
+                Ok(Some(Message::Text(text))) => {
+                    let msg: serde_json::Value =
+                        serde_json::from_str(text.as_ref()).expect("valid json");
+                    match msg.get("type").and_then(|t| t.as_str()) {
+                        Some("pty_resized") => first_ack += 1,
+                        Some("pty_bytes") => {
+                            let data = msg
+                                .get("data")
+                                .and_then(|d| d.as_str())
+                                .expect("pty bytes data");
+                            first_replay.push(
+                                base64::engine::general_purpose::STANDARD
+                                    .decode(data)
+                                    .expect("base64 decode"),
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        assert_eq!(first_ack, 1);
+        assert_eq!(first_replay.len(), 1);
+        assert_eq!(first_replay[0], replay_bytes);
+
+        {
+            let st = state.read().await;
+            assert!(!st
+                .pending_tui_replay
+                .get(&addr)
+                .map(|pending| pending.contains(&session_id))
+                .unwrap_or(false));
+        }
+
+        broadcast_pty_resized(&state, &session_id, 96, 27, Some(2)).await;
+
+        let mut second_ack = 0usize;
+        let mut second_replay = 0usize;
+        loop {
+            match timeout(Duration::from_millis(50), client_rx.recv()).await {
+                Ok(Some(Message::Text(text))) => {
+                    let msg: serde_json::Value =
+                        serde_json::from_str(text.as_ref()).expect("valid json");
+                    match msg.get("type").and_then(|t| t.as_str()) {
+                        Some("pty_resized") => second_ack += 1,
+                        Some("pty_bytes") => second_replay += 1,
+                        _ => {}
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+
+        assert_eq!(second_ack, 1);
+        assert_eq!(second_replay, 0);
     }
 }
