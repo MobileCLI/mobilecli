@@ -1522,59 +1522,91 @@ async fn process_client_msg(
             );
             drop(st);
 
-            // Replay scrollback for text CLIs so chat history is visible.
-            // TUI apps (alt screen) get a clean redraw from SIGWINCH when
-            // the mobile resize arrives, so no replay needed.
-            if let Some(bytes) = scrollback_bytes {
-                let msg = ServerMessage::PtyBytes {
-                    session_id: session_id.clone(),
-                    data: BASE64.encode(&bytes),
+            // ── Step 1: wipe mobile's xterm.js buffer ──────────────────
+            //
+            // On every (re-)subscribe we first clear the client terminal so
+            // that replay data doesn't append to stale content from a prior
+            // subscribe.  TUI sessions enter alternate-screen (no scrollback,
+            // overwritten by the SIGWINCH-triggered redraw).  Text sessions
+            // erase the display *and* the scrollback buffer (\x1b[3J) so that
+            // the SessionHistory that follows is the only content.
+            {
+                let clear: &[u8] = if render_as_tui {
+                    // \x1b[?1049h  enter alternate screen
+                    // \x1b[2J      erase display
+                    // \x1b[H       cursor home
+                    b"\x1b[?1049h\x1b[2J\x1b[H"
+                } else {
+                    // \x1b[2J      erase display
+                    // \x1b[3J      erase scrollback (xterm extension, supported by xterm.js)
+                    // \x1b[H       cursor home
+                    b"\x1b[2J\x1b[3J\x1b[H"
                 };
-                if let Ok(text) = serde_json::to_string(&msg) {
+                let clear_msg = ServerMessage::PtyBytes {
+                    session_id: session_id.clone(),
+                    data: BASE64.encode(clear),
+                };
+                if let Ok(text) = serde_json::to_string(&clear_msg) {
                     let _ = tx.send(Message::Text(text)).await;
                 }
             }
 
-            if let Some((socket, name, max_bytes, include_scrollback)) = tmux_snapshot_req {
-                // Text sessions use capped subscribe depth; visible-pane captures
-                // (TUI sessions in alt-screen) pass max_lines=0 which is ignored.
-                let max_lines = if include_scrollback {
-                    SUBSCRIBE_SCROLLBACK_LINES
-                } else {
-                    0
-                };
-                if let Some(snapshot) =
-                    capture_tmux_history_with_retry(socket, name, include_scrollback, max_lines)
-                        .await
-                {
-                    let total_bytes = snapshot.len();
-                    let skip = total_bytes.saturating_sub(max_bytes);
-                    let bytes = &snapshot[skip..];
-                    let msg = ServerMessage::SessionHistory {
+            // ── Step 2: replay history (text sessions only) ─────────────
+            //
+            // TUI sessions skip all replay — the app redraws its full screen
+            // after the SIGWINCH triggered by the mobile resize.
+            if !render_as_tui {
+                if let Some(bytes) = scrollback_bytes {
+                    let msg = ServerMessage::PtyBytes {
                         session_id: session_id.clone(),
-                        data: BASE64.encode(bytes),
-                        total_bytes,
+                        data: BASE64.encode(&bytes),
                     };
                     if let Ok(text) = serde_json::to_string(&msg) {
                         let _ = tx.send(Message::Text(text)).await;
                     }
-                } else if let Some(fallback) = tmux_fallback_bytes {
-                    // capture-pane unavailable (socket not yet ready, tmux startup
-                    // race, etc.) – fall back to the daemon's in-memory PTY stream
-                    // so mobile at least sees recent output rather than a blank terminal.
-                    tracing::debug!(
-                        session_id = %session_id,
-                        fallback_bytes = fallback.len(),
-                        "capture-pane failed on subscribe; using daemon scrollback fallback"
-                    );
-                    let total_bytes = fallback.len();
-                    let msg = ServerMessage::SessionHistory {
-                        session_id: session_id.clone(),
-                        data: BASE64.encode(&fallback),
-                        total_bytes,
+                }
+
+                if let Some((socket, name, max_bytes, include_scrollback)) = tmux_snapshot_req {
+                    let max_lines = if include_scrollback {
+                        SUBSCRIBE_SCROLLBACK_LINES
+                    } else {
+                        0
                     };
-                    if let Ok(text) = serde_json::to_string(&msg) {
-                        let _ = tx.send(Message::Text(text)).await;
+                    if let Some(snapshot) =
+                        capture_tmux_history_with_retry(
+                            socket,
+                            name,
+                            include_scrollback,
+                            max_lines,
+                        )
+                        .await
+                    {
+                        let total_bytes = snapshot.len();
+                        let skip = total_bytes.saturating_sub(max_bytes);
+                        let bytes = &snapshot[skip..];
+                        let msg = ServerMessage::SessionHistory {
+                            session_id: session_id.clone(),
+                            data: BASE64.encode(bytes),
+                            total_bytes,
+                        };
+                        if let Ok(text) = serde_json::to_string(&msg) {
+                            let _ = tx.send(Message::Text(text)).await;
+                        }
+                    } else if let Some(fallback) = tmux_fallback_bytes {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            fallback_bytes = fallback.len(),
+                            "capture-pane failed; using daemon scrollback fallback"
+                        );
+                        let total_bytes = fallback.len();
+                        let msg = ServerMessage::SessionHistory {
+                            session_id: session_id.clone(),
+                            data: BASE64.encode(&fallback),
+                            total_bytes,
+                        };
+                        if let Ok(text) = serde_json::to_string(&msg) {
+                            let _ = tx.send(Message::Text(text)).await;
+                        }
                     }
                 }
             }
@@ -1977,17 +2009,22 @@ async fn process_client_msg(
                         session.in_alt_screen,
                         session.frame_render_mode,
                     );
-                    if session.runtime == "tmux" && !render_as_tui {
+                    if render_as_tui {
+                        // TUI sessions redraw completely after SIGWINCH.
+                        // The daemon's scrollback for frame-rendering apps is
+                        // raw cursor-positioned output that renders as jumbled
+                        // content at any different terminal size.  Return empty.
+                        (Vec::new(), 0)
+                    } else if session.runtime == "tmux" {
                         if let (Some(socket), Some(name)) =
                             (session.tmux_socket.clone(), session.tmux_session.clone())
                         {
-                            // Non-alt tmux sessions use capture-pane with scrollback.
-                            // Alt-screen sessions fall back to daemon PTY scrollback because
-                            // tmux capture-pane history is viewport-limited there.
                             tmux_capture_req = Some((socket, name, max, true));
                         }
+                        tail_scrollback_bytes(session, max)
+                    } else {
+                        tail_scrollback_bytes(session, max)
                     }
-                    tail_scrollback_bytes(session, max)
                 } else {
                     (Vec::new(), 0)
                 }
@@ -3363,16 +3400,15 @@ fn should_ignore_resize_without_viewers(
 }
 
 fn should_treat_as_tui_for_mobile(
-    runtime: &str,
+    _runtime: &str,
     in_alt_screen: bool,
     frame_render_mode: bool,
 ) -> bool {
-    // tmux sessions preserve pane state across reattach and can safely stream
-    // frame-rendered (non-alt) CLIs without forcing mobile suppression/reset.
-    // True alternate-screen sessions still need suppression semantics.
-    if runtime == "tmux" {
-        return in_alt_screen;
-    }
+    // alternate-screen is disabled in tmux to preserve host terminal
+    // scrollback, so in_alt_screen is always false for tmux sessions.
+    // Use frame_render_mode so mobile's xterm.js enters alternate screen
+    // for TUI apps — without it, every frame draw pollutes main-buffer
+    // scrollback and the user sees jumbled content when scrolling up.
     in_alt_screen || frame_render_mode
 }
 
@@ -3407,11 +3443,12 @@ fn update_alt_screen_state(in_alt_screen: &mut bool, tail: &mut Vec<u8>, chunk: 
     tail.extend_from_slice(&scan[scan.len() - keep..]);
 }
 
-fn cli_defaults_to_frame_mode(_cli: CliType) -> bool {
-    // Do not pre-set frame mode based on app identity. The heuristic
-    // (heavy cursor-repositioning ops in output) detects frame-rendering
-    // behavior universally, regardless of which application is running.
-    false
+fn cli_defaults_to_frame_mode(cli: CliType) -> bool {
+    // Pre-set frame mode for known full-screen TUI apps so the very first
+    // mobile subscribe (before the output heuristic has seen enough frames)
+    // skips the desktop-width capture-pane and enters alt-screen immediately.
+    // The heuristic still runs and will detect any other frame-rendering app.
+    matches!(cli, CliType::Codex | CliType::OpenCode | CliType::Claude)
 }
 
 fn should_enable_frame_mode(cursor_ops: u32, erase_ops: u32) -> bool {
@@ -4026,12 +4063,10 @@ mod tests {
     }
 
     #[test]
-    fn frame_mode_not_preset_by_app_name() {
-        // frame_render_mode must be detected from observable output patterns,
-        // not pre-set based on which application is being launched.
-        assert!(!super::cli_defaults_to_frame_mode(CliType::Codex));
-        assert!(!super::cli_defaults_to_frame_mode(CliType::OpenCode));
-        assert!(!super::cli_defaults_to_frame_mode(CliType::Claude));
+    fn known_tui_apps_preset_frame_mode() {
+        assert!(super::cli_defaults_to_frame_mode(CliType::Codex));
+        assert!(super::cli_defaults_to_frame_mode(CliType::OpenCode));
+        assert!(super::cli_defaults_to_frame_mode(CliType::Claude));
         assert!(!super::cli_defaults_to_frame_mode(CliType::Terminal));
     }
 
