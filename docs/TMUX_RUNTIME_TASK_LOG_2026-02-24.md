@@ -365,3 +365,43 @@ Result:
 
 Next action:
 - Restart daemon with updated binary (when safe, since active sessions are currently running) and re-test mobile attach/reopen sizing behavior.
+
+## Task T-011 - Attach resize race fix + mobile TUI surface stabilization
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- Two independent issues still produce clipped/unnatural mobile terminal output:
+  1) daemon may ignore initial `attach_init` resize when it arrives before subscribe view-count registration (race), leaving tmux at desktop geometry;
+  2) mobile forces local `ESC[?1049h` for frame-rendered TUIs, creating visual artifacts/duplication on CLIs that are frame-mode but not true alt-screen.
+
+Changes:
+- Updated `cli/src/daemon.rs`:
+  - Added `should_ignore_resize_without_viewers(...)`.
+  - Viewer-count guard now allows `attach_init` and `reconnect_sync` bootstrap resizes even when current viewer count is still zero.
+  - Added test: `no_viewer_guard_allows_bootstrap_resizes`.
+- Updated `mobile/components/TerminalView.tsx`:
+  - Removed forced local `\x1b[?1049h` injection on subscribe-ack paths.
+  - Keep local terminal reset behavior so stale frame remnants are cleared without faking alternate-screen state.
+- Updated `mobile/components/XTermView.tsx`:
+  - Added forced post-ready refit (immediate + delayed) to recover from early-fit layout races that can produce undersized row/col calculations.
+
+Commands:
+- `npx tsc --noEmit` (mobile)
+- `cargo fmt --manifest-path cli/Cargo.toml`
+- `cargo check --manifest-path cli/Cargo.toml`
+- `cargo test --manifest-path cli/Cargo.toml --bin mobilecli -- --skip test_list_directory_sorts_directories_first`
+
+Evidence:
+- Rust tests now: `42 passed; 0 failed` (1 filtered known filesystem test).
+- TypeScript compile clean.
+- Code paths directly address:
+  - ignored bootstrap resize race,
+  - forced faux-alt-screen injection for frame-mode TUIs,
+  - pre-layout fit timing race in WebView.
+
+Result:
+- pass
+
+Next action:
+- Deploy daemon update (restart required) and mobile update (new build required), then re-test with targeted scenarios: open session, rotate, keyboard show/hide, leave/reopen.

@@ -1562,7 +1562,9 @@ async fn process_client_msg(
                 .unwrap_or(false);
             let mut synthetic_ack: Option<(u16, u16, Option<u64>)> = None;
 
-            if !is_restore && viewer_count == 0 {
+            let ignore_no_viewer_resize =
+                should_ignore_resize_without_viewers(is_restore, viewer_count, reason);
+            if ignore_no_viewer_resize {
                 tracing::debug!(
                     session_id = %session_id,
                     cols,
@@ -1571,6 +1573,7 @@ async fn process_client_msg(
                     reason = reason.as_str(),
                     viewer_count,
                     sender_is_viewing,
+                    bootstrap_reason = matches!(reason, PtyResizeReason::AttachInit | PtyResizeReason::ReconnectSync),
                     decision = "ignored_no_active_viewers",
                     "Ignoring PTY resize with no active mobile viewers"
                 );
@@ -3206,6 +3209,21 @@ fn should_force_noop_resize(reason: PtyResizeReason) -> bool {
     )
 }
 
+fn should_ignore_resize_without_viewers(
+    is_restore: bool,
+    viewer_count: usize,
+    reason: PtyResizeReason,
+) -> bool {
+    if is_restore || viewer_count > 0 {
+        return false;
+    }
+
+    !matches!(
+        reason,
+        PtyResizeReason::AttachInit | PtyResizeReason::ReconnectSync
+    )
+}
+
 fn is_stale_resize_epoch(last_epoch: u64, incoming_epoch: Option<u64>) -> bool {
     incoming_epoch.is_some_and(|epoch| epoch <= last_epoch)
 }
@@ -3488,7 +3506,8 @@ mod tests {
         broadcast_pty_resized, build_upload_destination_path, capture_tmux_history, is_noop_resize,
         is_stale_resize_epoch, is_windows_reserved_device_name, resolve_resize_reason,
         sanitize_upload_file_name, scan_frame_sequences, should_enable_frame_mode,
-        should_force_noop_resize, should_ignore_restore_resize, strip_terminal_report_sequences,
+        should_force_noop_resize, should_ignore_resize_without_viewers,
+        should_ignore_restore_resize, strip_terminal_report_sequences,
         strip_terminal_report_sequences_stateful, update_alt_screen_state,
         update_frame_render_state, DaemonState, PtyResizeReason, PtySession,
         DEFAULT_SCROLLBACK_MAX_BYTES, MAX_UPLOAD_FILE_NAME_BYTES,
@@ -3755,6 +3774,35 @@ mod tests {
         assert!(!should_force_noop_resize(PtyResizeReason::DetachRestore));
         assert!(!should_force_noop_resize(PtyResizeReason::KeyboardOverlay));
         assert!(!should_force_noop_resize(PtyResizeReason::Unknown));
+    }
+
+    #[test]
+    fn no_viewer_guard_allows_bootstrap_resizes() {
+        assert!(should_ignore_resize_without_viewers(
+            false,
+            0,
+            PtyResizeReason::GeometryChange
+        ));
+        assert!(!should_ignore_resize_without_viewers(
+            false,
+            0,
+            PtyResizeReason::AttachInit
+        ));
+        assert!(!should_ignore_resize_without_viewers(
+            false,
+            0,
+            PtyResizeReason::ReconnectSync
+        ));
+        assert!(!should_ignore_resize_without_viewers(
+            true,
+            0,
+            PtyResizeReason::DetachRestore
+        ));
+        assert!(!should_ignore_resize_without_viewers(
+            false,
+            1,
+            PtyResizeReason::GeometryChange
+        ));
     }
 
     #[test]
