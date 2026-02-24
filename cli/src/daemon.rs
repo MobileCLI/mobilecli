@@ -1426,7 +1426,7 @@ async fn process_client_msg(
             let (
                 scrollback_bytes,
                 render_as_tui,
-                in_alt_screen,
+                mobile_in_alt_screen,
                 queue_deferred_replay,
                 scrollback_len,
                 runtime,
@@ -1434,6 +1434,11 @@ async fn process_client_msg(
                 tmux_fallback_bytes,
             ) = if let Some(session) = st.sessions.get(&session_id) {
                 let render_as_tui = should_treat_as_tui_for_mobile(
+                    &session.runtime,
+                    session.in_alt_screen,
+                    session.frame_render_mode,
+                );
+                let mobile_in_alt_screen = should_mobile_enter_alt_screen(
                     &session.runtime,
                     session.in_alt_screen,
                     session.frame_render_mode,
@@ -1486,7 +1491,7 @@ async fn process_client_msg(
                 (
                     sb,
                     render_as_tui,
-                    session.in_alt_screen,
+                    mobile_in_alt_screen,
                     // tmux sessions use capture-pane snapshots; raw deferred replay
                     // of daemon scrollback corrupts TUIs on reconnect.
                     runtime != "tmux" && render_as_tui && has_scrollback,
@@ -1519,7 +1524,7 @@ async fn process_client_msg(
                 addr = %addr,
                 runtime = %runtime,
                 render_as_tui,
-                in_alt_screen,
+                mobile_in_alt_screen,
                 queue_deferred_replay,
                 scrollback_len,
                 text_replay_bytes = scrollback_bytes.as_ref().map(|b| b.len()).unwrap_or(0),
@@ -1531,12 +1536,18 @@ async fn process_client_msg(
             //
             // On every (re-)subscribe we first clear the client terminal so
             // that replay data doesn't append to stale content from a prior
-            // subscribe.  TUI sessions enter alternate-screen (no scrollback,
-            // overwritten by the SIGWINCH-triggered redraw).  Text sessions
+            // subscribe. Sessions in mobile alternate-screen use 1049h clear.
+            // Main-buffer sessions erase display+scrollback so the next render
+            // starts from a deterministic baseline.
+            //
+            // tmux frame sessions intentionally stay in the main buffer to
+            // preserve mobile-side scrollback and manual panning.
+            //
+            // Text sessions
             // erase the display *and* the scrollback buffer (\x1b[3J) so that
             // the SessionHistory that follows is the only content.
             {
-                let clear: &[u8] = if render_as_tui {
+                let clear: &[u8] = if mobile_in_alt_screen {
                     // \x1b[?1049h  enter alternate screen
                     // \x1b[2J      erase display
                     // \x1b[H       cursor home
@@ -1615,7 +1626,7 @@ async fn process_client_msg(
             // stale bytes and enter alt-screen mode before resizing.
             let ack = ServerMessage::SubscribeAck {
                 session_id,
-                in_alt_screen: render_as_tui,
+                in_alt_screen: mobile_in_alt_screen,
                 runtime: Some(runtime),
             };
             if let Ok(text) = serde_json::to_string(&ack) {
@@ -3396,6 +3407,24 @@ fn should_treat_as_tui_for_mobile(
     in_alt_screen || frame_render_mode
 }
 
+fn should_mobile_enter_alt_screen(
+    runtime: &str,
+    in_alt_screen: bool,
+    frame_render_mode: bool,
+) -> bool {
+    // Preserve real alternate-screen behavior when the app explicitly requests it.
+    if in_alt_screen {
+        return true;
+    }
+    // tmux runtime intentionally disables alternate-screen at the host level.
+    // For frame-rendering apps under tmux we keep mobile in the main buffer so
+    // users can retain scrollback and pan through prior output.
+    if runtime == "tmux" {
+        return false;
+    }
+    frame_render_mode
+}
+
 fn is_stale_resize_epoch(last_epoch: u64, incoming_epoch: Option<u64>) -> bool {
     incoming_epoch.is_some_and(|epoch| epoch <= last_epoch)
 }
@@ -3432,7 +3461,10 @@ fn cli_defaults_to_frame_mode(cli: CliType) -> bool {
     // mobile subscribe (before the output heuristic has seen enough frames)
     // skips the desktop-width capture-pane and enters alt-screen immediately.
     // The heuristic still runs and will detect any other frame-rendering app.
-    matches!(cli, CliType::Codex | CliType::OpenCode | CliType::Claude)
+    matches!(
+        cli,
+        CliType::Codex | CliType::OpenCode | CliType::Claude | CliType::Gemini
+    )
 }
 
 fn should_enable_frame_mode(cursor_ops: u32, erase_ops: u32) -> bool {
@@ -3706,10 +3738,11 @@ mod tests {
         is_stale_resize_epoch, is_windows_reserved_device_name, resolve_resize_reason,
         sanitize_upload_file_name, scan_frame_sequences, should_enable_frame_mode,
         should_force_noop_resize, should_ignore_resize_without_viewers,
-        should_ignore_restore_resize, should_treat_as_tui_for_mobile,
-        strip_terminal_report_sequences, strip_terminal_report_sequences_stateful,
-        update_alt_screen_state, update_frame_render_state, DaemonState, PtyResizeReason,
-        PtySession, DEFAULT_SCROLLBACK_MAX_BYTES, MAX_UPLOAD_FILE_NAME_BYTES,
+        should_ignore_restore_resize, should_mobile_enter_alt_screen,
+        should_treat_as_tui_for_mobile, strip_terminal_report_sequences,
+        strip_terminal_report_sequences_stateful, update_alt_screen_state,
+        update_frame_render_state, DaemonState, PtyResizeReason, PtySession,
+        DEFAULT_SCROLLBACK_MAX_BYTES, MAX_UPLOAD_FILE_NAME_BYTES,
     };
     use crate::detection::{CliTracker, CliType};
     use base64::Engine as _;
@@ -4007,14 +4040,22 @@ mod tests {
     #[test]
     fn tui_gating_uses_frame_render_for_all_runtimes() {
         // alternate-screen is disabled in tmux so in_alt_screen is always
-        // false there.  frame_render_mode must trigger TUI treatment for
-        // tmux sessions too, otherwise mobile never enters alt-screen and
-        // every TUI frame pollutes main-buffer scrollback.
+        // false there. frame_render_mode must still gate replay behavior for
+        // tmux sessions to avoid dumping raw frame redraw traffic as history.
         assert!(should_treat_as_tui_for_mobile("tmux", false, true));
         assert!(!should_treat_as_tui_for_mobile("tmux", false, false));
         assert!(should_treat_as_tui_for_mobile("tmux", true, false));
         assert!(should_treat_as_tui_for_mobile("pty", false, true));
         assert!(!should_treat_as_tui_for_mobile("pty", false, false));
+    }
+
+    #[test]
+    fn mobile_alt_screen_policy_preserves_tmux_scrollback() {
+        assert!(!should_mobile_enter_alt_screen("tmux", false, true));
+        assert!(!should_mobile_enter_alt_screen("tmux", false, false));
+        assert!(should_mobile_enter_alt_screen("tmux", true, false));
+        assert!(should_mobile_enter_alt_screen("pty", false, true));
+        assert!(!should_mobile_enter_alt_screen("pty", false, false));
     }
 
     #[test]
@@ -4054,6 +4095,7 @@ mod tests {
         assert!(super::cli_defaults_to_frame_mode(CliType::Codex));
         assert!(super::cli_defaults_to_frame_mode(CliType::OpenCode));
         assert!(super::cli_defaults_to_frame_mode(CliType::Claude));
+        assert!(super::cli_defaults_to_frame_mode(CliType::Gemini));
         assert!(!super::cli_defaults_to_frame_mode(CliType::Terminal));
     }
 
