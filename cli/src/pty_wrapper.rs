@@ -259,6 +259,28 @@ fn setup_tmux_session(
     cols: u16,
     rows: u16,
 ) -> Result<(), WrapError> {
+    // Bootstrap a dedicated tmux server first so global options apply before
+    // the wrapped CLI starts. This avoids races where frame CLIs enter
+    // alternate-screen at launch and drop scrollback history.
+    let mut start_server = tmux_base_command(socket_name);
+    start_server.arg("start-server");
+    let _ = run_tmux_checked(&mut start_server, "start-server");
+
+    let mut pre_alt_screen = tmux_base_command(socket_name);
+    pre_alt_screen
+        .arg("set-window-option")
+        .arg("-g")
+        .arg("alternate-screen")
+        .arg("off");
+    if let Err(err) = run_tmux_checked(&mut pre_alt_screen, "alternate-screen") {
+        tracing::debug!(
+            socket = socket_name,
+            session = session_name,
+            error = %err,
+            "Ignoring non-fatal pre-session alternate-screen option failure"
+        );
+    }
+
     let mut new_session = tmux_base_command(socket_name);
     new_session
         .arg("new-session")
@@ -281,10 +303,11 @@ fn setup_tmux_session(
     // NOTE: window-size must remain dynamic so wrapper PTY resizes propagate
     // into tmux panes when mobile dimensions change.
     let window_target = format!("{}:0", session_name);
-    let option_sets: [(&str, &str, &str, &str); 4] = [
+    let option_sets: [(&str, &str, &str, &str); 5] = [
         ("set-option", session_name, "status", "off"),
         ("set-option", session_name, "allow-rename", "off"),
         ("set-option", session_name, "history-limit", "200000"),
+        ("set-window-option", &window_target, "alternate-screen", "off"),
         ("set-window-option", &window_target, "window-size", "latest"),
     ];
     for (command, target, key, value) in option_sets {
@@ -1007,6 +1030,26 @@ mod tests {
         assert_eq!(
             window_size_mode, "latest",
             "expected tmux window-size to remain dynamic for client-driven resize propagation"
+        );
+
+        let mut show_alt_screen = tmux_base_command(&ctx.socket_name);
+        let output = show_alt_screen
+            .arg("show-window-options")
+            .arg("-v")
+            .arg("-t")
+            .arg(format!("{}:0", &ctx.session_name))
+            .arg("alternate-screen")
+            .output()
+            .expect("show-window-options alternate-screen output");
+        assert!(
+            output.status.success(),
+            "expected alternate-screen query success: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let alt_screen_mode = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert_eq!(
+            alt_screen_mode, "off",
+            "expected tmux alternate-screen to be disabled so scrollback is preserved"
         );
 
         cleanup_tmux_session(&ctx);
