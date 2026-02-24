@@ -173,6 +173,9 @@ pub struct PtySession {
     pub last_resize_epoch: u64,
     /// Last dimensions acknowledged by the PTY wrapper.
     pub last_applied_size: Option<(u16, u16)>,
+    /// Tail for raw mobile input filtering to handle escape sequences split
+    /// across websocket messages.
+    pub raw_input_tail: Vec<u8>,
 }
 
 /// Daemon shared state
@@ -651,6 +654,7 @@ async fn handle_pty_session(
                 frame_render_mode: initial_frame_mode,
                 last_resize_epoch: 0,
                 last_applied_size: None,
+                raw_input_tail: Vec::new(),
             },
         );
         st.pty_broadcast.clone()
@@ -1450,7 +1454,8 @@ async fn process_client_msg(
             }
 
             if let Some((socket, name, max_bytes, include_scrollback)) = tmux_snapshot_req {
-                if let Some(snapshot) = capture_tmux_history(socket, name, include_scrollback).await
+                if let Some(snapshot) =
+                    capture_tmux_history_with_retry(socket, name, include_scrollback).await
                 {
                     let total_bytes = snapshot.len();
                     let skip = total_bytes.saturating_sub(max_bytes);
@@ -1509,11 +1514,14 @@ async fn process_client_msg(
             raw,
             ..
         } => {
-            let st = state.read().await;
-            if let Some(session) = st.sessions.get(&session_id) {
+            let mut st = state.write().await;
+            if let Some(session) = st.sessions.get_mut(&session_id) {
                 let mut payload = text.into_bytes();
                 if raw {
-                    let (filtered, dropped) = strip_terminal_report_sequences(&payload);
+                    let (filtered, dropped) = strip_terminal_report_sequences_stateful(
+                        &mut session.raw_input_tail,
+                        &payload,
+                    );
                     if dropped > 0 {
                         tracing::debug!(
                             session_id = %session_id,
@@ -1868,20 +1876,20 @@ async fn process_client_msg(
                 }
             };
 
-            let (data, total_bytes) = if let Some((socket, name, max, include_scrollback)) =
-                tmux_capture_req
-            {
-                if let Some(snapshot) = capture_tmux_history(socket, name, include_scrollback).await
-                {
-                    let total = snapshot.len();
-                    let skip = total.saturating_sub(max);
-                    (BASE64.encode(&snapshot[skip..]), total)
+            let (data, total_bytes) =
+                if let Some((socket, name, max, include_scrollback)) = tmux_capture_req {
+                    if let Some(snapshot) =
+                        capture_tmux_history_with_retry(socket, name, include_scrollback).await
+                    {
+                        let total = snapshot.len();
+                        let skip = total.saturating_sub(max);
+                        (BASE64.encode(&snapshot[skip..]), total)
+                    } else {
+                        (BASE64.encode(&fallback_bytes), fallback_total_bytes)
+                    }
                 } else {
                     (BASE64.encode(&fallback_bytes), fallback_total_bytes)
-                }
-            } else {
-                (BASE64.encode(&fallback_bytes), fallback_total_bytes)
-            };
+                };
 
             let msg = ServerMessage::SessionHistory {
                 session_id,
@@ -3042,6 +3050,34 @@ async fn capture_tmux_history(
     .flatten()
 }
 
+fn snapshot_has_visible_content(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .any(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+}
+
+async fn capture_tmux_history_with_retry(
+    socket: String,
+    session: String,
+    include_scrollback: bool,
+) -> Option<Vec<u8>> {
+    if include_scrollback {
+        return capture_tmux_history(socket, session, true).await;
+    }
+
+    const MAX_ATTEMPTS: usize = 8;
+    const RETRY_DELAY_MS: u64 = 120;
+    for attempt in 0..MAX_ATTEMPTS {
+        if let Some(snapshot) = capture_tmux_history(socket.clone(), session.clone(), false).await {
+            if snapshot_has_visible_content(&snapshot) || attempt + 1 == MAX_ATTEMPTS {
+                return Some(snapshot);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+    }
+    None
+}
+
 fn is_terminal_report_csi(body: &[u8], final_byte: u8) -> bool {
     match final_byte {
         // Device Attributes response (e.g. ESC[>0;276;0c from xterm.js)
@@ -3056,46 +3092,75 @@ fn is_terminal_report_csi(body: &[u8], final_byte: u8) -> bool {
     }
 }
 
+#[cfg(test)]
 fn strip_terminal_report_sequences(input: &[u8]) -> (Vec<u8>, usize) {
-    let mut out = Vec::with_capacity(input.len());
+    let mut tail = Vec::new();
+    let (mut out, dropped) = strip_terminal_report_sequences_stateful(&mut tail, input);
+    if !tail.is_empty() {
+        out.extend_from_slice(&tail);
+    }
+    (out, dropped)
+}
+
+fn strip_terminal_report_sequences_stateful(tail: &mut Vec<u8>, input: &[u8]) -> (Vec<u8>, usize) {
+    let mut scan = Vec::with_capacity(tail.len() + input.len());
+    scan.extend_from_slice(tail);
+    scan.extend_from_slice(input);
+    tail.clear();
+
+    let mut out = Vec::with_capacity(scan.len());
     let mut i = 0usize;
     let mut dropped = 0usize;
 
-    while i < input.len() {
-        if input[i] == 0x1b && i + 2 < input.len() && input[i + 1] == b'[' {
-            let mut j = i + 2;
-            while j < input.len() {
-                let b = input[j];
-                // End of CSI sequence.
-                if b.is_ascii_alphabetic() || b == b'~' {
-                    let body = &input[i + 2..j];
-                    if is_terminal_report_csi(body, b) {
-                        dropped += 1;
+    while i < scan.len() {
+        if scan[i] == 0x1b {
+            if i + 1 >= scan.len() {
+                tail.extend_from_slice(&scan[i..]);
+                break;
+            }
+
+            if scan[i + 1] == b'[' {
+                let mut j = i + 2;
+                let mut handled = false;
+                while j < scan.len() {
+                    let b = scan[j];
+                    if b.is_ascii_alphabetic() || b == b'~' {
+                        let body = &scan[i + 2..j];
+                        if is_terminal_report_csi(body, b) {
+                            dropped += 1;
+                        } else {
+                            out.extend_from_slice(&scan[i..=j]);
+                        }
                         i = j + 1;
+                        handled = true;
                         break;
                     }
-                    // Not a report sequence; keep original bytes.
-                    out.extend_from_slice(&input[i..=j]);
-                    i = j + 1;
+                    if b == 0x1b || (j - i) > 64 {
+                        // Malformed sequence. Keep byte-for-byte fallback behavior.
+                        out.push(scan[i]);
+                        i += 1;
+                        handled = true;
+                        break;
+                    }
+                    j += 1;
+                }
+
+                if !handled {
+                    // Sequence is incomplete across websocket frames.
+                    tail.extend_from_slice(&scan[i..]);
                     break;
                 }
-                // Malformed / too long sequence; stop scanning to avoid pathological loops.
-                if b == 0x1b || (j - i) > 64 {
-                    out.push(input[i]);
-                    i += 1;
-                    break;
-                }
-                j += 1;
+                continue;
             }
-            if j >= input.len() {
-                out.push(input[i]);
-                i += 1;
-            }
-            continue;
         }
 
-        out.push(input[i]);
+        out.push(scan[i]);
         i += 1;
+    }
+
+    if tail.len() > 64 {
+        let keep = tail.len() - 64;
+        tail.drain(..keep);
     }
 
     (out, dropped)
@@ -3424,8 +3489,9 @@ mod tests {
         is_stale_resize_epoch, is_windows_reserved_device_name, resolve_resize_reason,
         sanitize_upload_file_name, scan_frame_sequences, should_enable_frame_mode,
         should_force_noop_resize, should_ignore_restore_resize, strip_terminal_report_sequences,
-        update_alt_screen_state, update_frame_render_state, DaemonState, PtyResizeReason,
-        PtySession, DEFAULT_SCROLLBACK_MAX_BYTES, MAX_UPLOAD_FILE_NAME_BYTES,
+        strip_terminal_report_sequences_stateful, update_alt_screen_state,
+        update_frame_render_state, DaemonState, PtyResizeReason, PtySession,
+        DEFAULT_SCROLLBACK_MAX_BYTES, MAX_UPLOAD_FILE_NAME_BYTES,
     };
     use crate::detection::{CliTracker, CliType};
     use base64::Engine as _;
@@ -3465,6 +3531,34 @@ mod tests {
         let (out, dropped) = strip_terminal_report_sequences(input);
         assert_eq!(dropped, 1);
         assert_eq!(out, b"helloworld");
+    }
+
+    #[test]
+    fn strip_terminal_reports_stateful_drops_split_da_reply() {
+        let mut tail = Vec::new();
+        let (out1, dropped1) = strip_terminal_report_sequences_stateful(&mut tail, b"\x1b[>");
+        assert_eq!(dropped1, 0);
+        assert!(out1.is_empty());
+        assert!(!tail.is_empty());
+
+        let (out2, dropped2) = strip_terminal_report_sequences_stateful(&mut tail, b"0;276;0c");
+        assert_eq!(dropped2, 1);
+        assert!(out2.is_empty());
+        assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn strip_terminal_reports_stateful_preserves_split_arrow_key() {
+        let mut tail = Vec::new();
+        let (out1, dropped1) = strip_terminal_report_sequences_stateful(&mut tail, b"\x1b[");
+        assert_eq!(dropped1, 0);
+        assert!(out1.is_empty());
+        assert!(!tail.is_empty());
+
+        let (out2, dropped2) = strip_terminal_report_sequences_stateful(&mut tail, b"A");
+        assert_eq!(dropped2, 0);
+        assert_eq!(out2, b"\x1b[A");
+        assert!(tail.is_empty());
     }
 
     #[tokio::test]
@@ -3758,6 +3852,7 @@ mod tests {
                     frame_render_mode: true,
                     last_resize_epoch: 0,
                     last_applied_size: Some((95, 27)),
+                    raw_input_tail: Vec::new(),
                 },
             );
         }

@@ -249,3 +249,89 @@ Next action:
   - no injected `0;276;0c`,
   - no black blank on repeated reopen,
   - stable Codex scroll/render behavior.
+
+## Task T-008 - Stateful split-sequence filtering + tmux TUI capture retry
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- `0;276;0c` injection persists when xterm emits DA reply split across websocket frames (e.g. `ESC[>` then `0;276;0c`). Stateless filtering misses this. Intermittent black reattach also occurs when pane snapshot is captured before TUI redraw settles.
+
+Changes:
+- Updated `cli/src/daemon.rs`:
+  - Added per-session `raw_input_tail` state to `PtySession`.
+  - Replaced stateless raw-input filter path with stateful filter:
+    - `strip_terminal_report_sequences_stateful`
+    - preserves normal split key escapes, drops split terminal report replies.
+  - `SendInput(raw=true)` now mutates per-session tail and filters before forwarding.
+  - Added `capture_tmux_history_with_retry` + `snapshot_has_visible_content`.
+  - TUI pane snapshot path now retries capture up to 3x with short delay to avoid post-resize blank captures.
+- Added tests:
+  - `strip_terminal_reports_stateful_drops_split_da_reply`
+  - `strip_terminal_reports_stateful_preserves_split_arrow_key`
+
+Commands:
+- `cargo fmt --manifest-path cli/Cargo.toml`
+- `cargo check --manifest-path cli/Cargo.toml`
+- `cargo test --manifest-path cli/Cargo.toml --bin mobilecli -- --skip test_list_directory_sorts_directories_first`
+
+Evidence:
+- Test suite result: `41 passed; 0 failed` (1 filtered known filesystem test).
+- New split-sequence tests verify exact failure mode (`ESC[>0;276;0c`) is dropped even when fragmented across messages.
+- No compile warnings after gating helper-only wrapper with `#[cfg(test)]`.
+
+Result:
+- pass
+
+Next action:
+- Reinstall binary + restart daemon, then confirm on-device that injected `0;276;0c` is gone and repeated reattach no longer goes black.
+
+## Task T-009 - Reattach blank-screen race + scroll-surface hardening
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- Reopened sessions can go blank when initial `pty_bytes/session_history` arrive before mobile registers a `setPtyBytesCallback`; those bytes are dropped. Duplicate render/input bars are worsened by eager fallback history replay even when live redraw bytes are already flowing.
+
+Changes:
+- Updated `mobile/hooks/useSync.ts`:
+  - Added per-session buffering for subscribed sessions when callback is not yet attached.
+  - Flushed buffered PTY chunks immediately when `setPtyBytesCallback` is registered.
+  - Added replay state machine:
+    - alt-screen history replay now uses fallback timer after `pty_resized` ack,
+    - live bytes cancel pending replay,
+    - stale late session-history replies are dropped once live flow resumes.
+  - Added comprehensive cleanup for replay timers/state on unsubscribe/session close/connection reset.
+- Updated `mobile/assets/xterm.html`:
+  - Added capture-phase, full-surface touch pan handling over entire terminal area.
+  - Added movement thresholds and click suppression window to avoid double tap/focus races after touch interactions.
+  - Kept viewport-driven scroll-state reporting (`isAtBottom`) synchronized during touch pan.
+- Updated `cli/src/daemon.rs`:
+  - Increased tmux visible-pane snapshot retry window (`8x` attempts, `120ms` delay) for post-resize reattach stability.
+
+Commands:
+- `npx tsc --noEmit` (mobile)
+- `cargo check --manifest-path cli/Cargo.toml`
+- `cargo test --manifest-path cli/Cargo.toml --bin mobilecli -- --skip test_list_directory_sorts_directories_first`
+- `cargo build --release --manifest-path cli/Cargo.toml`
+- `install -m 755 cli/target/release/mobilecli /home/bigphoot/.local/bin/mobilecli`
+- `/home/bigphoot/.local/bin/mobilecli stop`
+- `nohup env RUST_LOG=mobilecli=debug /home/bigphoot/.local/bin/mobilecli daemon > /home/bigphoot/.mobilecli/daemon.log 2>&1 &`
+
+Evidence:
+- Rust tests: `41 passed; 0 failed` (1 filtered known filesystem test).
+- TypeScript compile: clean (`npx tsc --noEmit` with no errors).
+- Daemon process confirmed running from `/home/bigphoot/.local/bin/mobilecli`.
+- Replay path now explicitly handles:
+  - callback registration races,
+  - fallback replay only on missing live redraw,
+  - stale fallback snapshot suppression after live output resumes.
+
+Result:
+- pass
+
+Next action:
+- Validate on-device reopen loops (Codex + Claude) with the latest daemon/mobile pair and collect fresh screenshots/logs focused on:
+  - no blank reopen,
+  - no duplicate input bars,
+  - full-area scroll responsiveness.
