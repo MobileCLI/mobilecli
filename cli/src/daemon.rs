@@ -118,6 +118,8 @@ const DEFAULT_SCROLLBACK_MAX_BYTES: usize = 64 * 1024;
 const ALT_ENTER_SEQS: &[&[u8]] = &[b"\x1b[?1049h", b"\x1b[?1047h", b"\x1b[?47h"];
 const ALT_LEAVE_SEQS: &[&[u8]] = &[b"\x1b[?1049l", b"\x1b[?1047l", b"\x1b[?47l"];
 const ALT_TRACK_TAIL_BYTES: usize = 7;
+const FRAME_CURSOR_THRESHOLD: u32 = 80;
+const FRAME_ERASE_THRESHOLD: u32 = 40;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ResizeRequest {
@@ -149,6 +151,13 @@ pub struct PtySession {
     /// Tail bytes from prior chunk used to detect alt-screen escape sequences
     /// split across PTY read boundaries.
     pub alt_track_tail: Vec<u8>,
+    /// Cumulative count of absolute cursor-position operations (CSI ... H).
+    pub frame_cursor_pos_count: u32,
+    /// Cumulative count of erase-line operations (CSI ... K).
+    pub frame_erase_line_count: u32,
+    /// True for frame-rendered CLIs (full-screen style) even when they don't
+    /// use alternate screen sequences like ?1049h/?1049l.
+    pub frame_render_mode: bool,
     /// Latest accepted resize epoch from mobile (for stale resize rejection).
     pub last_resize_epoch: u64,
     /// Last dimensions acknowledged by the PTY wrapper.
@@ -586,6 +595,7 @@ async fn handle_pty_session(
     let pty_broadcast = {
         let mut cli_tracker = CliTracker::new();
         cli_tracker.update_from_command(&command);
+        let initial_frame_mode = cli_defaults_to_frame_mode(cli_tracker.current());
 
         let mut st = state.write().await;
         st.sessions.insert(
@@ -605,6 +615,9 @@ async fn handle_pty_session(
                 scrollback_max_bytes: DEFAULT_SCROLLBACK_MAX_BYTES,
                 in_alt_screen: false,
                 alt_track_tail: Vec::new(),
+                frame_cursor_pos_count: 0,
+                frame_erase_line_count: 0,
+                frame_render_mode: initial_frame_mode,
                 last_resize_epoch: 0,
                 last_applied_size: None,
             },
@@ -653,6 +666,21 @@ async fn handle_pty_session(
                                                     &mut session.alt_track_tail,
                                                     &bytes,
                                                 );
+                                                let was_frame = session.frame_render_mode;
+                                                update_frame_render_state(
+                                                    &mut session.frame_render_mode,
+                                                    &mut session.frame_cursor_pos_count,
+                                                    &mut session.frame_erase_line_count,
+                                                    &bytes,
+                                                );
+                                                if !was_frame && session.frame_render_mode {
+                                                    tracing::info!(
+                                                        session_id = %session_id,
+                                                        cursor_ops = session.frame_cursor_pos_count,
+                                                        erase_ops = session.frame_erase_line_count,
+                                                        "Detected frame-rendered session (non-alt); suppressing raw scrollback replay on subscribe"
+                                                    );
+                                                }
                                             }
                                         }
 
@@ -1306,15 +1334,15 @@ async fn process_client_msg(
             }
 
             // Collect session state under one lock, then drop it before sending.
-            let (scrollback_bytes, in_alt_screen) =
+            let (scrollback_bytes, render_as_tui) =
                 if let Some(session) = st.sessions.get(&session_id) {
-                    let alt = session.in_alt_screen;
-                    let sb = if !alt && !session.scrollback.is_empty() {
+                    let render_as_tui = session.in_alt_screen || session.frame_render_mode;
+                    let sb = if !render_as_tui && !session.scrollback.is_empty() {
                         Some(session.scrollback.iter().copied().collect::<Vec<u8>>())
                     } else {
                         None
                     };
-                    (sb, alt)
+                    (sb, render_as_tui)
                 } else {
                     (None, false)
                 };
@@ -1337,7 +1365,7 @@ async fn process_client_msg(
             // stale bytes and enter alt-screen mode before resizing.
             let ack = ServerMessage::SubscribeAck {
                 session_id,
-                in_alt_screen,
+                in_alt_screen: render_as_tui,
             };
             if let Ok(text) = serde_json::to_string(&ack) {
                 let _ = tx.send(Message::Text(text)).await;
@@ -2778,6 +2806,73 @@ fn update_alt_screen_state(in_alt_screen: &mut bool, tail: &mut Vec<u8>, chunk: 
     tail.extend_from_slice(&scan[scan.len() - keep..]);
 }
 
+fn cli_defaults_to_frame_mode(cli: CliType) -> bool {
+    matches!(cli, CliType::Codex | CliType::OpenCode)
+}
+
+fn should_enable_frame_mode(cursor_ops: u32, erase_ops: u32) -> bool {
+    cursor_ops >= FRAME_CURSOR_THRESHOLD && erase_ops >= FRAME_ERASE_THRESHOLD
+}
+
+fn scan_frame_sequences(chunk: &[u8]) -> (u32, u32) {
+    let mut cursor_ops = 0u32;
+    let mut erase_ops = 0u32;
+    let mut i = 0usize;
+
+    while i + 2 < chunk.len() {
+        if chunk[i] != 0x1b || chunk[i + 1] != b'[' {
+            i += 1;
+            continue;
+        }
+
+        let mut j = i + 2;
+        while j < chunk.len()
+            && (chunk[j].is_ascii_digit() || chunk[j] == b';' || chunk[j] == b'?')
+        {
+            j += 1;
+        }
+
+        if j >= chunk.len() {
+            break;
+        }
+
+        let final_byte = chunk[j];
+        let params = &chunk[i + 2..j];
+
+        if final_byte == b'H' && (params.is_empty() || params.contains(&b';')) {
+            cursor_ops += 1;
+        } else if final_byte == b'K' {
+            erase_ops += 1;
+        }
+
+        i = j + 1;
+    }
+
+    (cursor_ops, erase_ops)
+}
+
+fn update_frame_render_state(
+    frame_mode: &mut bool,
+    cursor_ops: &mut u32,
+    erase_ops: &mut u32,
+    chunk: &[u8],
+) {
+    if *frame_mode || chunk.is_empty() {
+        return;
+    }
+
+    let (cursor_inc, erase_inc) = scan_frame_sequences(chunk);
+    if cursor_inc == 0 && erase_inc == 0 {
+        return;
+    }
+
+    *cursor_ops = cursor_ops.saturating_add(cursor_inc);
+    *erase_ops = erase_ops.saturating_add(erase_inc);
+    if should_enable_frame_mode(*cursor_ops, *erase_ops) {
+        *frame_mode = true;
+    }
+}
+
 fn build_notification_text(
     cli_type: CliType,
     session_name: &str,
@@ -2948,10 +3043,12 @@ mod tests {
     use super::{
         build_upload_destination_path, is_noop_resize, is_stale_resize_epoch,
         is_windows_reserved_device_name, resolve_resize_reason, sanitize_upload_file_name,
-        should_force_noop_resize, should_ignore_restore_resize, update_alt_screen_state,
+        scan_frame_sequences, should_enable_frame_mode, should_force_noop_resize,
+        should_ignore_restore_resize, update_alt_screen_state, update_frame_render_state,
         PtyResizeReason,
         MAX_UPLOAD_FILE_NAME_BYTES,
     };
+    use crate::detection::CliType;
     use tempfile::TempDir;
 
     #[test]
@@ -3095,5 +3192,45 @@ mod tests {
         assert!(!should_force_noop_resize(PtyResizeReason::DetachRestore));
         assert!(!should_force_noop_resize(PtyResizeReason::KeyboardOverlay));
         assert!(!should_force_noop_resize(PtyResizeReason::Unknown));
+    }
+
+    #[test]
+    fn frame_sequence_scanner_counts_cursor_and_erase_ops() {
+        let chunk = b"\x1b[10;2HHello\x1b[K\x1b[H\x1b[2K";
+        let (cursor, erase) = scan_frame_sequences(chunk);
+        assert_eq!(cursor, 2);
+        assert_eq!(erase, 2);
+    }
+
+    #[test]
+    fn frame_mode_threshold_requires_heavy_cursor_and_erase_usage() {
+        assert!(!should_enable_frame_mode(79, 40));
+        assert!(!should_enable_frame_mode(80, 39));
+        assert!(should_enable_frame_mode(80, 40));
+        assert!(should_enable_frame_mode(400, 200));
+    }
+
+    #[test]
+    fn frame_mode_update_flips_after_threshold() {
+        let mut frame_mode = false;
+        let mut cursor = 0u32;
+        let mut erase = 0u32;
+        let chunk = b"\x1b[10;2H\x1b[K";
+
+        for _ in 0..79 {
+            update_frame_render_state(&mut frame_mode, &mut cursor, &mut erase, chunk);
+        }
+        assert!(!frame_mode);
+
+        update_frame_render_state(&mut frame_mode, &mut cursor, &mut erase, chunk);
+        assert!(frame_mode);
+    }
+
+    #[test]
+    fn codex_and_opencode_default_to_frame_mode() {
+        assert!(super::cli_defaults_to_frame_mode(CliType::Codex));
+        assert!(super::cli_defaults_to_frame_mode(CliType::OpenCode));
+        assert!(!super::cli_defaults_to_frame_mode(CliType::Claude));
+        assert!(!super::cli_defaults_to_frame_mode(CliType::Terminal));
     }
 }

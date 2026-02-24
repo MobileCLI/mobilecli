@@ -147,11 +147,12 @@ fn should_clear_local_before_resize(
     cols: u16,
 ) -> bool {
     match reason {
+        PtyResizeReason::DetachRestore => true,
+        PtyResizeReason::GeometryChange => previous.is_some_and(|(prev_cols, _)| prev_cols != cols),
         PtyResizeReason::AttachInit
         | PtyResizeReason::ReconnectSync
-        | PtyResizeReason::DetachRestore => true,
-        PtyResizeReason::GeometryChange => previous.is_some_and(|(prev_cols, _)| prev_cols != cols),
-        PtyResizeReason::KeyboardOverlay | PtyResizeReason::Unknown => false,
+        | PtyResizeReason::KeyboardOverlay
+        | PtyResizeReason::Unknown => false,
     }
 }
 
@@ -741,13 +742,13 @@ mod tests {
     }
 
     #[test]
-    fn clear_policy_prefers_attach_detach_and_width_changes() {
-        assert!(should_clear_local_before_resize(
+    fn clear_policy_prefers_detach_and_width_changes_only() {
+        assert!(!should_clear_local_before_resize(
             PtyResizeReason::AttachInit,
             Some((80, 24)),
             80
         ));
-        assert!(should_clear_local_before_resize(
+        assert!(!should_clear_local_before_resize(
             PtyResizeReason::ReconnectSync,
             Some((80, 24)),
             80
