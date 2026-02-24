@@ -207,3 +207,45 @@ Result:
 
 Next action:
 - Install updated release binary locally and run Codex mobile attach/detach verification loop with logs.
+
+## Task T-007 - Mobile terminal report input filtering + lightweight tmux TUI replay
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- Reattach-injected `0;276;0c` text is terminal-report feedback (`ESC[>0;276;0c`) emitted by mobile xterm and forwarded as raw CLI input. Blank/black reattach after repeated cycles is aggravated by oversized tmux history replay for frame TUIs.
+
+Changes:
+- Updated `cli/src/daemon.rs`:
+  - Added raw-input sanitizer:
+    - `strip_terminal_report_sequences`
+    - `is_terminal_report_csi`
+  - `SendInput(raw=true)` now removes terminal report reply sequences before forwarding to PTY.
+  - `capture_tmux_history` now supports replay mode:
+    - full scrollback (`-S -200000`) for text sessions,
+    - visible-pane snapshot only for frame/alt-screen sessions.
+  - `Subscribe` for tmux frame sessions no longer sends eager full replay.
+  - `GetSessionHistory` for tmux now selects replay mode based on `render_as_tui`.
+- Added tests:
+  - `strip_terminal_reports_drops_secondary_da_reply`
+  - `strip_terminal_reports_preserves_user_escape_keys`
+  - `strip_terminal_reports_removes_embedded_report_sequences`
+
+Commands:
+- `cargo fmt --manifest-path cli/Cargo.toml`
+- `cargo check --manifest-path cli/Cargo.toml`
+- `cargo test --manifest-path cli/Cargo.toml --bin mobilecli -- --skip test_list_directory_sorts_directories_first`
+
+Evidence:
+- Test suite result after patch: `39 passed; 0 failed` (1 filtered known filesystem test).
+- Sanitizer test specifically validates dropping `ESC[>0;276;0c` while preserving real key sequences (arrow keys).
+- tmux history capture test remains passing with new API shape.
+
+Result:
+- pass
+
+Next action:
+- Rebuild/install daemon binary and run targeted mobile attach/detach loops validating:
+  - no injected `0;276;0c`,
+  - no black blank on repeated reopen,
+  - stable Codex scroll/render behavior.

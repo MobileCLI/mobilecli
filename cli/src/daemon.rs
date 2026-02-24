@@ -1377,11 +1377,14 @@ async fn process_client_msg(
                 let render_as_tui = session.in_alt_screen || session.frame_render_mode;
                 let has_scrollback = !session.scrollback.is_empty();
                 let runtime = session.runtime.clone();
-                let tmux_snapshot_req = if runtime == "tmux" {
+                let tmux_snapshot_req = if runtime == "tmux" && !render_as_tui {
                     match (&session.tmux_socket, &session.tmux_session) {
-                        (Some(socket), Some(name)) => {
-                            Some((socket.clone(), name.clone(), session.scrollback_max_bytes))
-                        }
+                        (Some(socket), Some(name)) => Some((
+                            socket.clone(),
+                            name.clone(),
+                            session.scrollback_max_bytes,
+                            true,
+                        )),
                         _ => None,
                     }
                 } else {
@@ -1446,8 +1449,9 @@ async fn process_client_msg(
                 }
             }
 
-            if let Some((socket, name, max_bytes)) = tmux_snapshot_req {
-                if let Some(snapshot) = capture_tmux_history(socket, name).await {
+            if let Some((socket, name, max_bytes, include_scrollback)) = tmux_snapshot_req {
+                if let Some(snapshot) = capture_tmux_history(socket, name, include_scrollback).await
+                {
                     let total_bytes = snapshot.len();
                     let skip = total_bytes.saturating_sub(max_bytes);
                     let bytes = &snapshot[skip..];
@@ -1500,11 +1504,32 @@ async fn process_client_msg(
             }
         }
         ClientMessage::SendInput {
-            session_id, text, ..
+            session_id,
+            text,
+            raw,
+            ..
         } => {
             let st = state.read().await;
             if let Some(session) = st.sessions.get(&session_id) {
-                let _ = session.input_tx.send(text.into_bytes());
+                let mut payload = text.into_bytes();
+                if raw {
+                    let (filtered, dropped) = strip_terminal_report_sequences(&payload);
+                    if dropped > 0 {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            runtime = %session.runtime,
+                            dropped_sequences = dropped,
+                            original_len = payload.len(),
+                            filtered_len = filtered.len(),
+                            "Dropped terminal-report reply sequences from mobile raw input"
+                        );
+                    }
+                    payload = filtered;
+                }
+
+                if !payload.is_empty() {
+                    let _ = session.input_tx.send(payload);
+                }
             }
         }
         ClientMessage::PtyResize {
@@ -1822,16 +1847,19 @@ async fn process_client_msg(
             session_id,
             max_bytes,
         } => {
-            let mut tmux_capture_req: Option<(String, String, usize)> = None;
+            let mut tmux_capture_req: Option<(String, String, usize, bool)> = None;
             let (fallback_bytes, fallback_total_bytes) = {
                 let st = state.read().await;
                 if let Some(session) = st.sessions.get(&session_id) {
                     let max = max_bytes.unwrap_or(session.scrollback_max_bytes);
                     if session.runtime == "tmux" {
+                        let render_as_tui = session.in_alt_screen || session.frame_render_mode;
                         if let (Some(socket), Some(name)) =
                             (session.tmux_socket.clone(), session.tmux_session.clone())
                         {
-                            tmux_capture_req = Some((socket, name, max));
+                            // For frame-rendered TUIs use visible pane snapshot only.
+                            // Full scrollback replay here can flood mobile and corrupt redraw.
+                            tmux_capture_req = Some((socket, name, max, !render_as_tui));
                         }
                     }
                     tail_scrollback_bytes(session, max)
@@ -1840,8 +1868,11 @@ async fn process_client_msg(
                 }
             };
 
-            let (data, total_bytes) = if let Some((socket, name, max)) = tmux_capture_req {
-                if let Some(snapshot) = capture_tmux_history(socket, name).await {
+            let (data, total_bytes) = if let Some((socket, name, max, include_scrollback)) =
+                tmux_capture_req
+            {
+                if let Some(snapshot) = capture_tmux_history(socket, name, include_scrollback).await
+                {
                     let total = snapshot.len();
                     let skip = total.saturating_sub(max);
                     (BASE64.encode(&snapshot[skip..]), total)
@@ -2964,27 +2995,31 @@ fn tail_scrollback_bytes(session: &PtySession, max_bytes: usize) -> (Vec<u8>, us
     (bytes, total)
 }
 
-fn capture_tmux_history_blocking(socket: &str, session: &str) -> Option<Vec<u8>> {
+fn capture_tmux_history_blocking(
+    socket: &str,
+    session: &str,
+    include_scrollback: bool,
+) -> Option<Vec<u8>> {
     let targets = [
         format!("{}:0.0", session),
         format!("{}:0", session),
         session.to_string(),
     ];
     for target in targets {
-        let output = std::process::Command::new("tmux")
-            .arg("-L")
+        let mut cmd = std::process::Command::new("tmux");
+        cmd.arg("-L")
             .arg(socket)
             .arg("-f")
             .arg("/dev/null")
             .env_remove("TMUX")
             .arg("capture-pane")
             .arg("-p")
-            .arg("-e")
-            .arg("-S")
-            .arg("-200000")
-            .arg("-t")
-            .arg(&target)
-            .output();
+            .arg("-e");
+        if include_scrollback {
+            cmd.arg("-S").arg("-200000");
+        }
+        cmd.arg("-t").arg(&target);
+        let output = cmd.output();
         if let Ok(out) = output {
             if out.status.success() {
                 return Some(out.stdout);
@@ -2994,11 +3029,76 @@ fn capture_tmux_history_blocking(socket: &str, session: &str) -> Option<Vec<u8>>
     None
 }
 
-async fn capture_tmux_history(socket: String, session: String) -> Option<Vec<u8>> {
-    tokio::task::spawn_blocking(move || capture_tmux_history_blocking(&socket, &session))
-        .await
-        .ok()
-        .flatten()
+async fn capture_tmux_history(
+    socket: String,
+    session: String,
+    include_scrollback: bool,
+) -> Option<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        capture_tmux_history_blocking(&socket, &session, include_scrollback)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+fn is_terminal_report_csi(body: &[u8], final_byte: u8) -> bool {
+    match final_byte {
+        // Device Attributes response (e.g. ESC[>0;276;0c from xterm.js)
+        b'c' => body.starts_with(b">") || body.starts_with(b"?"),
+        // Cursor position report (ESC[row;colR)
+        b'R' => body.contains(&b';') && body.iter().all(|b| b.is_ascii_digit() || *b == b';'),
+        // Status reports (ESC[0n / ESC[3n / ESC[?...)
+        b'n' => body.starts_with(b"?") || body.iter().all(|b| b.is_ascii_digit() || *b == b';'),
+        // Mode reports (ESC[?...$y)
+        b'y' => body.starts_with(b"?") && body.contains(&b'$'),
+        _ => false,
+    }
+}
+
+fn strip_terminal_report_sequences(input: &[u8]) -> (Vec<u8>, usize) {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0usize;
+    let mut dropped = 0usize;
+
+    while i < input.len() {
+        if input[i] == 0x1b && i + 2 < input.len() && input[i + 1] == b'[' {
+            let mut j = i + 2;
+            while j < input.len() {
+                let b = input[j];
+                // End of CSI sequence.
+                if b.is_ascii_alphabetic() || b == b'~' {
+                    let body = &input[i + 2..j];
+                    if is_terminal_report_csi(body, b) {
+                        dropped += 1;
+                        i = j + 1;
+                        break;
+                    }
+                    // Not a report sequence; keep original bytes.
+                    out.extend_from_slice(&input[i..=j]);
+                    i = j + 1;
+                    break;
+                }
+                // Malformed / too long sequence; stop scanning to avoid pathological loops.
+                if b == 0x1b || (j - i) > 64 {
+                    out.push(input[i]);
+                    i += 1;
+                    break;
+                }
+                j += 1;
+            }
+            if j >= input.len() {
+                out.push(input[i]);
+                i += 1;
+            }
+            continue;
+        }
+
+        out.push(input[i]);
+        i += 1;
+    }
+
+    (out, dropped)
 }
 
 fn should_ignore_restore_resize(
@@ -3323,9 +3423,9 @@ mod tests {
         broadcast_pty_resized, build_upload_destination_path, capture_tmux_history, is_noop_resize,
         is_stale_resize_epoch, is_windows_reserved_device_name, resolve_resize_reason,
         sanitize_upload_file_name, scan_frame_sequences, should_enable_frame_mode,
-        should_force_noop_resize, should_ignore_restore_resize, update_alt_screen_state,
-        update_frame_render_state, DaemonState, PtyResizeReason, PtySession,
-        DEFAULT_SCROLLBACK_MAX_BYTES, MAX_UPLOAD_FILE_NAME_BYTES,
+        should_force_noop_resize, should_ignore_restore_resize, strip_terminal_report_sequences,
+        update_alt_screen_state, update_frame_render_state, DaemonState, PtyResizeReason,
+        PtySession, DEFAULT_SCROLLBACK_MAX_BYTES, MAX_UPLOAD_FILE_NAME_BYTES,
     };
     use crate::detection::{CliTracker, CliType};
     use base64::Engine as _;
@@ -3341,6 +3441,30 @@ mod tests {
     fn default_scrollback_is_large_enough_for_frame_clis() {
         assert_eq!(DEFAULT_SCROLLBACK_MAX_BYTES, 2 * 1024 * 1024);
         assert!(DEFAULT_SCROLLBACK_MAX_BYTES > 64 * 1024);
+    }
+
+    #[test]
+    fn strip_terminal_reports_drops_secondary_da_reply() {
+        let input = b"\x1b[>0;276;0c";
+        let (out, dropped) = strip_terminal_report_sequences(input);
+        assert_eq!(dropped, 1);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn strip_terminal_reports_preserves_user_escape_keys() {
+        let input = b"abc\x1b[A\r";
+        let (out, dropped) = strip_terminal_report_sequences(input);
+        assert_eq!(dropped, 0);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn strip_terminal_reports_removes_embedded_report_sequences() {
+        let input = b"hello\x1b[>0;276;0cworld";
+        let (out, dropped) = strip_terminal_report_sequences(input);
+        assert_eq!(dropped, 1);
+        assert_eq!(out, b"helloworld");
     }
 
     #[tokio::test]
@@ -3376,7 +3500,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(150)).await;
 
-        let snapshot = capture_tmux_history(socket.clone(), session.clone())
+        let snapshot = capture_tmux_history(socket.clone(), session.clone(), true)
             .await
             .expect("tmux snapshot");
         let text = String::from_utf8_lossy(&snapshot);
