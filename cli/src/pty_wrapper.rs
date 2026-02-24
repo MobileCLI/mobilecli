@@ -968,7 +968,8 @@ mod tests {
             &ctx.socket_name,
             &ctx.session_name,
             "/bin/sh",
-            &vec!["-lc".to_string(), "sleep 3".to_string()],
+            // Keep the session alive long enough for CI has-session checks.
+            &vec!["-lc".to_string(), "sleep 10 & wait".to_string()],
             ".",
             80,
             24,
