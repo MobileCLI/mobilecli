@@ -348,7 +348,12 @@ fn setup_tmux_session(
     let option_sets: [(&str, &str, &str, &str); 4] = [
         ("set-option", session_name, "status", "off"),
         ("set-option", session_name, "allow-rename", "off"),
-        ("set-window-option", &window_target, "alternate-screen", "off"),
+        (
+            "set-window-option",
+            &window_target,
+            "alternate-screen",
+            "off",
+        ),
         ("set-window-option", &window_target, "window-size", "latest"),
     ];
     for (command, target, key, value) in option_sets {

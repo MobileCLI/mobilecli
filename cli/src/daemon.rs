@@ -1187,12 +1187,16 @@ async fn spawn_session_from_mobile(
     // Without this, the spawned terminal inherits the daemon's CWD,
     // which is wherever the daemon was launched from (often the project dir).
     let home_dir_buf = dirs_next::home_dir();
-    let effective_working_dir: Option<&str> = working_dir.or_else(|| {
-        home_dir_buf.as_ref().and_then(|p| p.to_str())
-    });
+    let effective_working_dir: Option<&str> =
+        working_dir.or_else(|| home_dir_buf.as_ref().and_then(|p| p.to_str()));
 
-    let wrap_cmd =
-        build_wrap_shell_command(&mobilecli_bin, session_name, command, args, effective_working_dir);
+    let wrap_cmd = build_wrap_shell_command(
+        &mobilecli_bin,
+        session_name,
+        command,
+        args,
+        effective_working_dir,
+    );
     let shell_args = shell_args_for_command(&shell, &wrap_cmd);
 
     let mut cmd = if let Some(ref terminal) = terminal {
@@ -1573,13 +1577,8 @@ async fn process_client_msg(
                         0
                     };
                     if let Some(snapshot) =
-                        capture_tmux_history_with_retry(
-                            socket,
-                            name,
-                            include_scrollback,
-                            max_lines,
-                        )
-                        .await
+                        capture_tmux_history_with_retry(socket, name, include_scrollback, max_lines)
+                            .await
                     {
                         let total_bytes = snapshot.len();
                         let skip = total_bytes.saturating_sub(max_bytes);
@@ -2030,38 +2029,39 @@ async fn process_client_msg(
                 }
             };
 
-            let (data, total_bytes) =
-                if let Some((socket, name, max, include_scrollback)) = tmux_capture_req {
-                    // On-demand history requests use the full depth so users can
-                    // retrieve the maximum available scrollback from tmux.
-                    let max_lines = if include_scrollback {
-                        HISTORY_SCROLLBACK_LINES
-                    } else {
-                        0
-                    };
-                    if let Some(snapshot) =
-                        capture_tmux_history_with_retry(socket, name, include_scrollback, max_lines)
-                            .await
-                    {
-                        let total = snapshot.len();
-                        let skip = total.saturating_sub(max);
-                        (BASE64.encode(&snapshot[skip..]), total)
-                    } else {
-                        tracing::debug!(
-                            session_id = %session_id,
-                            fallback_total_bytes = fallback_total_bytes,
-                            "tmux capture-pane unavailable, falling back to daemon scrollback replay"
-                        );
-                        (BASE64.encode(&fallback_bytes), fallback_total_bytes)
-                    }
+            let (data, total_bytes) = if let Some((socket, name, max, include_scrollback)) =
+                tmux_capture_req
+            {
+                // On-demand history requests use the full depth so users can
+                // retrieve the maximum available scrollback from tmux.
+                let max_lines = if include_scrollback {
+                    HISTORY_SCROLLBACK_LINES
+                } else {
+                    0
+                };
+                if let Some(snapshot) =
+                    capture_tmux_history_with_retry(socket, name, include_scrollback, max_lines)
+                        .await
+                {
+                    let total = snapshot.len();
+                    let skip = total.saturating_sub(max);
+                    (BASE64.encode(&snapshot[skip..]), total)
                 } else {
                     tracing::debug!(
                         session_id = %session_id,
                         fallback_total_bytes = fallback_total_bytes,
-                        "Using daemon scrollback replay for session_history"
+                        "tmux capture-pane unavailable, falling back to daemon scrollback replay"
                     );
                     (BASE64.encode(&fallback_bytes), fallback_total_bytes)
-                };
+                }
+            } else {
+                tracing::debug!(
+                    session_id = %session_id,
+                    fallback_total_bytes = fallback_total_bytes,
+                    "Using daemon scrollback replay for session_history"
+                );
+                (BASE64.encode(&fallback_bytes), fallback_total_bytes)
+            };
 
             let msg = ServerMessage::SessionHistory {
                 session_id,
@@ -3553,7 +3553,9 @@ async fn cleanup_client_state(state: &SharedState, addr: SocketAddr) {
         let stale_sender_ids: Vec<String> = st
             .mobile_sender_addrs
             .iter()
-            .filter_map(|(sender_id, mapped_addr)| (*mapped_addr == addr).then_some(sender_id.clone()))
+            .filter_map(|(sender_id, mapped_addr)| {
+                (*mapped_addr == addr).then_some(sender_id.clone())
+            })
             .collect();
         for sender_id in stale_sender_ids {
             st.mobile_sender_addrs.remove(&sender_id);
@@ -3720,10 +3722,10 @@ mod tests {
         is_stale_resize_epoch, is_windows_reserved_device_name, resolve_resize_reason,
         sanitize_upload_file_name, scan_frame_sequences, should_enable_frame_mode,
         should_force_noop_resize, should_ignore_resize_without_viewers,
-        should_ignore_restore_resize, should_treat_as_tui_for_mobile, strip_terminal_report_sequences,
-        strip_terminal_report_sequences_stateful, update_alt_screen_state,
-        update_frame_render_state, DaemonState, PtyResizeReason, PtySession,
-        DEFAULT_SCROLLBACK_MAX_BYTES, MAX_UPLOAD_FILE_NAME_BYTES,
+        should_ignore_restore_resize, should_treat_as_tui_for_mobile,
+        strip_terminal_report_sequences, strip_terminal_report_sequences_stateful,
+        update_alt_screen_state, update_frame_render_state, DaemonState, PtyResizeReason,
+        PtySession, DEFAULT_SCROLLBACK_MAX_BYTES, MAX_UPLOAD_FILE_NAME_BYTES,
     };
     use crate::detection::{CliTracker, CliType};
     use base64::Engine as _;
