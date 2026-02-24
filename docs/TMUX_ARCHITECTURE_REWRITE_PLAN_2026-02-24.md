@@ -1,5 +1,7 @@
 # TMUX Architecture Rewrite Plan
 
+Superseded by `docs/TMUX_RUNTIME_EXECUTION_MASTER_PLAN_2026-02-24.md` (detailed execution version).
+
 Date: 2026-02-24
 Status: Proposed (execute after approval)
 Scope: `cli/` daemon + wrapper + protocol integration, mobile protocol-compatible first
@@ -166,4 +168,3 @@ Pass criteria:
 4. Implement tmux-backed `get_session_history`.
 5. Validate Codex reattach path end-to-end on tmux runtime.
 6. Open focused PR: `feat/tmux-runtime-phase1` with evidence logs.
-
