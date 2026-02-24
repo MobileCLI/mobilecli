@@ -31,19 +31,19 @@ fn install() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "linux")]
     {
         install_systemd_user()?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(target_os = "macos")]
     {
         install_launchd_agent()?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(target_os = "windows")]
     {
         install_windows_task()?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -57,19 +57,19 @@ fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "linux")]
     {
         uninstall_systemd_user()?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(target_os = "macos")]
     {
         uninstall_launchd_agent()?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(target_os = "windows")]
     {
         uninstall_windows_task()?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]

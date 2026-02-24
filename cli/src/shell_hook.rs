@@ -396,7 +396,7 @@ fn powershell_profile_path(home: &std::path::Path) -> Option<PathBuf> {
         if dir.exists() || which::which("pwsh").is_ok() {
             return Some(dir.join("Microsoft.PowerShell_profile.ps1"));
         }
-        return None;
+        None
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -502,7 +502,7 @@ pub fn install_quiet() -> bool {
     let targets = detect_shell_targets();
     let mut any_installed = false;
     for target in &targets {
-        if let Ok(true) = install_into(&target) {
+        if let Ok(true) = install_into(target) {
             any_installed = true;
         }
     }
