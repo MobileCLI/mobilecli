@@ -1422,14 +1422,6 @@ async fn process_client_msg(
         ClientMessage::Subscribe { session_id } => {
             tracing::debug!("Client subscribed to session: {}", session_id);
             let mut st = state.write().await;
-            let entry = st.mobile_views.entry(addr).or_default();
-            if entry.insert(session_id.clone()) {
-                let count = st
-                    .session_view_counts
-                    .entry(session_id.clone())
-                    .or_insert(0);
-                *count += 1;
-            }
 
             // Collect session state under one lock, then drop it before sending.
             let (
@@ -1535,18 +1527,12 @@ async fn process_client_msg(
             // Text main-buffer sessions erase display+scrollback so the next
             // replay starts from a deterministic baseline.
             //
-            // tmux frame sessions intentionally keep existing scrollback and only
-            // clear the visible display to avoid hard history loss on reattach.
             {
                 let clear: &[u8] = if mobile_in_alt_screen {
                     // \x1b[?1049h  enter alternate screen
                     // \x1b[2J      erase display
                     // \x1b[H       cursor home
                     b"\x1b[?1049h\x1b[2J\x1b[H"
-                } else if runtime == "tmux" && render_as_tui {
-                    // \x1b[2J      erase display
-                    // \x1b[H       cursor home
-                    b"\x1b[2J\x1b[H"
                 } else {
                     // \x1b[2J      erase display
                     // \x1b[3J      erase scrollback (xterm extension, supported by xterm.js)
@@ -1621,12 +1607,21 @@ async fn process_client_msg(
             // Always send SubscribeAck so mobile knows whether to suppress
             // stale bytes and enter alt-screen mode before resizing.
             let ack = ServerMessage::SubscribeAck {
-                session_id,
+                session_id: session_id.clone(),
                 in_alt_screen: mobile_in_alt_screen,
                 runtime: Some(runtime),
             };
             if let Ok(text) = serde_json::to_string(&ack) {
                 let _ = tx.send(Message::Text(text)).await;
+            }
+
+            // Register active view after initial clear/replay/ack sequence so
+            // live PTY stream can't interleave with bootstrap replay bytes.
+            let mut st = state.write().await;
+            let entry = st.mobile_views.entry(addr).or_default();
+            if entry.insert(session_id.clone()) {
+                let count = st.session_view_counts.entry(session_id).or_insert(0);
+                *count += 1;
             }
         }
         ClientMessage::Unsubscribe { session_id } => {
