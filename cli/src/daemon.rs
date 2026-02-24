@@ -113,13 +113,13 @@ pub struct PushToken {
     pub platform: String, // "ios" | "android"
 }
 
-/// Default scrollback buffer size (2MB).
+/// Default scrollback buffer size (8MB).
 ///
 /// Codex/OpenCode-style frame UIs emit high-volume ANSI redraw traffic. A
 /// 64KB tail can roll over quickly and make reopened sessions appear to have
 /// "lost" earlier chat. Retaining a larger buffer keeps substantially more
 /// recoverable history while still bounding memory.
-const DEFAULT_SCROLLBACK_MAX_BYTES: usize = 2 * 1024 * 1024;
+const DEFAULT_SCROLLBACK_MAX_BYTES: usize = 8 * 1024 * 1024;
 const ALT_ENTER_SEQS: &[&[u8]] = &[b"\x1b[?1049h", b"\x1b[?1047h", b"\x1b[?47h"];
 const ALT_LEAVE_SEQS: &[&[u8]] = &[b"\x1b[?1049l", b"\x1b[?1047l", b"\x1b[?47l"];
 const ALT_TRACK_TAIL_BYTES: usize = 7;
@@ -1373,12 +1373,18 @@ async fn process_client_msg(
             let (
                 scrollback_bytes,
                 render_as_tui,
+                in_alt_screen,
+                frame_render_mode,
                 queue_deferred_replay,
                 scrollback_len,
                 runtime,
                 tmux_snapshot_req,
             ) = if let Some(session) = st.sessions.get(&session_id) {
-                let render_as_tui = session.in_alt_screen || session.frame_render_mode;
+                let render_as_tui = should_treat_as_tui_for_mobile(
+                    &session.runtime,
+                    session.in_alt_screen,
+                    session.frame_render_mode,
+                );
                 let has_scrollback = !session.scrollback.is_empty();
                 let runtime = session.runtime.clone();
                 let tmux_snapshot_req = if runtime == "tmux" && !render_as_tui {
@@ -1402,6 +1408,8 @@ async fn process_client_msg(
                 (
                     sb,
                     render_as_tui,
+                    session.in_alt_screen,
+                    session.frame_render_mode,
                     // tmux sessions use capture-pane snapshots; raw deferred replay
                     // of daemon scrollback corrupts frame TUIs on reconnect.
                     runtime != "tmux" && render_as_tui && has_scrollback,
@@ -1410,7 +1418,7 @@ async fn process_client_msg(
                     tmux_snapshot_req,
                 )
             } else {
-                (None, false, false, 0, "pty".to_string(), None)
+                (None, false, false, false, false, 0, "pty".to_string(), None)
             };
 
             if queue_deferred_replay {
@@ -1433,6 +1441,8 @@ async fn process_client_msg(
                 addr = %addr,
                 runtime = %runtime,
                 render_as_tui,
+                in_alt_screen,
+                frame_render_mode,
                 queue_deferred_replay,
                 scrollback_len,
                 text_replay_bytes = scrollback_bytes.as_ref().map(|b| b.len()).unwrap_or(0),
@@ -1476,6 +1486,7 @@ async fn process_client_msg(
             let ack = ServerMessage::SubscribeAck {
                 session_id,
                 in_alt_screen: render_as_tui,
+                runtime: Some(runtime),
             };
             if let Ok(text) = serde_json::to_string(&ack) {
                 let _ = tx.send(Message::Text(text)).await;
@@ -1863,14 +1874,19 @@ async fn process_client_msg(
                 let st = state.read().await;
                 if let Some(session) = st.sessions.get(&session_id) {
                     let max = max_bytes.unwrap_or(session.scrollback_max_bytes);
-                    if session.runtime == "tmux" {
-                        let render_as_tui = session.in_alt_screen || session.frame_render_mode;
+                    let render_as_tui = should_treat_as_tui_for_mobile(
+                        &session.runtime,
+                        session.in_alt_screen,
+                        session.frame_render_mode,
+                    );
+                    if session.runtime == "tmux" && !render_as_tui {
                         if let (Some(socket), Some(name)) =
                             (session.tmux_socket.clone(), session.tmux_session.clone())
                         {
-                            // For frame-rendered TUIs use visible pane snapshot only.
-                            // Full scrollback replay here can flood mobile and corrupt redraw.
-                            tmux_capture_req = Some((socket, name, max, !render_as_tui));
+                            // Non-alt tmux sessions use capture-pane with scrollback.
+                            // Alt-screen sessions fall back to daemon PTY scrollback because
+                            // tmux capture-pane history is viewport-limited there.
+                            tmux_capture_req = Some((socket, name, max, true));
                         }
                     }
                     tail_scrollback_bytes(session, max)
@@ -1888,9 +1904,19 @@ async fn process_client_msg(
                         let skip = total.saturating_sub(max);
                         (BASE64.encode(&snapshot[skip..]), total)
                     } else {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            fallback_total_bytes = fallback_total_bytes,
+                            "tmux capture-pane unavailable, falling back to daemon scrollback replay"
+                        );
                         (BASE64.encode(&fallback_bytes), fallback_total_bytes)
                     }
                 } else {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        fallback_total_bytes = fallback_total_bytes,
+                        "Using daemon scrollback replay for session_history"
+                    );
                     (BASE64.encode(&fallback_bytes), fallback_total_bytes)
                 };
 
@@ -3224,6 +3250,20 @@ fn should_ignore_resize_without_viewers(
     )
 }
 
+fn should_treat_as_tui_for_mobile(
+    runtime: &str,
+    in_alt_screen: bool,
+    frame_render_mode: bool,
+) -> bool {
+    // tmux sessions preserve pane state across reattach and can safely stream
+    // frame-rendered (non-alt) CLIs without forcing mobile suppression/reset.
+    // True alternate-screen sessions still need suppression semantics.
+    if runtime == "tmux" {
+        return in_alt_screen;
+    }
+    in_alt_screen || frame_render_mode
+}
+
 fn is_stale_resize_epoch(last_epoch: u64, incoming_epoch: Option<u64>) -> bool {
     incoming_epoch.is_some_and(|epoch| epoch <= last_epoch)
 }
@@ -3507,7 +3547,7 @@ mod tests {
         is_stale_resize_epoch, is_windows_reserved_device_name, resolve_resize_reason,
         sanitize_upload_file_name, scan_frame_sequences, should_enable_frame_mode,
         should_force_noop_resize, should_ignore_resize_without_viewers,
-        should_ignore_restore_resize, strip_terminal_report_sequences,
+        should_ignore_restore_resize, should_treat_as_tui_for_mobile, strip_terminal_report_sequences,
         strip_terminal_report_sequences_stateful, update_alt_screen_state,
         update_frame_render_state, DaemonState, PtyResizeReason, PtySession,
         DEFAULT_SCROLLBACK_MAX_BYTES, MAX_UPLOAD_FILE_NAME_BYTES,
@@ -3524,7 +3564,7 @@ mod tests {
 
     #[test]
     fn default_scrollback_is_large_enough_for_frame_clis() {
-        assert_eq!(DEFAULT_SCROLLBACK_MAX_BYTES, 2 * 1024 * 1024);
+        assert_eq!(DEFAULT_SCROLLBACK_MAX_BYTES, 8 * 1024 * 1024);
         assert!(DEFAULT_SCROLLBACK_MAX_BYTES > 64 * 1024);
     }
 
@@ -3803,6 +3843,18 @@ mod tests {
             1,
             PtyResizeReason::GeometryChange
         ));
+    }
+
+    #[test]
+    fn tmux_mobile_tui_gating_uses_real_alt_screen_only() {
+        // tmux frame-mode sessions that are not in true alt-screen should keep
+        // normal streaming + scrollback replay behavior.
+        assert!(!should_treat_as_tui_for_mobile("tmux", false, true));
+        assert!(!should_treat_as_tui_for_mobile("tmux", false, false));
+        // True alt-screen sessions must still use suppression/reconnect guards.
+        assert!(should_treat_as_tui_for_mobile("tmux", true, false));
+        // Legacy PTY runtime preserves historical frame-mode treatment.
+        assert!(should_treat_as_tui_for_mobile("pty", false, true));
     }
 
     #[test]

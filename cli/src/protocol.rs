@@ -258,6 +258,8 @@ pub enum ServerMessage {
     SubscribeAck {
         session_id: String,
         in_alt_screen: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        runtime: Option<String>,
     },
     /// PTY resized confirmation
     PtyResized {

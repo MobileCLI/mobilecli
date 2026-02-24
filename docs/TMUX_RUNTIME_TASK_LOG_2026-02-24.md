@@ -405,3 +405,223 @@ Result:
 
 Next action:
 - Deploy daemon update (restart required) and mobile update (new build required), then re-test with targeted scenarios: open session, rotate, keyboard show/hide, leave/reopen.
+
+## Task T-012 - Mobile scrollback depth + pan/auto-follow stabilization
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- Two factors are causing "hard to scroll up" behavior even when rendering is otherwise stable:
+  1) local xterm scrollback is capped at 1000 lines, truncating long AI sessions;
+  2) auto-follow can keep snapping back to bottom while users start touch panning upward.
+
+Changes:
+- Updated `mobile/assets/xterm.html`:
+  - Increased local xterm scrollback from `1000` to `20000` lines.
+  - Tightened at-bottom threshold from `50px` to `8px` for faster transition out of follow mode.
+  - Removed 50ms debounced scroll-state update; now evaluates at-bottom state on each viewport scroll event.
+  - Added `autoFollowSuspendedUntil` guard so touch pan interactions temporarily suppress output auto-follow.
+  - On touch pan movement, force `isAtBottom=false` immediately and report state.
+  - Auto-follow now only scrolls on new output when not suspended.
+- Updated `mobile/hooks/useSync.ts`:
+  - `get_session_history` now requests `max_bytes: 8 * 1024 * 1024` to pull a deeper backlog on reattach.
+- Updated `cli/src/daemon.rs`:
+  - Increased default daemon scrollback buffer cap from `2MB` to `8MB`.
+  - Updated unit test expectation for default scrollback size.
+
+Commands:
+- `npx tsc --noEmit` (mobile)
+- `cargo check --manifest-path cli/Cargo.toml`
+- `cargo test --manifest-path cli/Cargo.toml --bin mobilecli -- --skip test_list_directory_sorts_directories_first`
+
+Evidence:
+- TypeScript compile clean.
+- Rust check clean.
+- Rust unit tests: `42 passed; 0 failed` (1 filtered known filesystem test).
+- Diffs show direct changes in scrollback depth and touch/auto-follow arbitration paths.
+
+Result:
+- pass
+
+Next action:
+- Validate on-device with long-output sessions (Codex/Gemini/OpenCode) using:
+  - continuous output while attempting to scroll up,
+  - reopen + deep history scrolling,
+  - repeated attach/detach loops.
+
+## Task T-013 - Scrollback continuity on reattach + tmux TUI gating correction
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- Scrollback loss and chopped reopen history are amplified by two behaviors:
+  1) mobile performs destructive `reset()` on alt-screen reattach paths (clears local buffer);
+  2) daemon classifies tmux frame-mode sessions as "alt-screen-like" and therefore disables tmux scrollback snapshots, even when the session is not truly in alternate screen.
+
+Additional probe evidence:
+- Local tmux probe shows `capture-pane -S` only returns deep history for main-screen output; for alternate-screen output it remains viewport-limited (~24 lines).
+- Therefore, non-alt tmux sessions should not be forced into alt suppression/replay path.
+
+Changes:
+- Updated `cli/src/daemon.rs`:
+  - Added `should_treat_as_tui_for_mobile(runtime, in_alt_screen, frame_render_mode)`.
+  - For `runtime=tmux`, only true `in_alt_screen` now activates TUI suppression semantics.
+  - `GetSessionHistory` for tmux now uses capture-pane scrollback only for non-alt sessions; alt sessions fall back to daemon scrollback path.
+  - Added debug logs clarifying when daemon scrollback fallback is used for session history.
+  - Added unit test: `tmux_mobile_tui_gating_uses_real_alt_screen_only`.
+- Updated `mobile/components/TerminalView.tsx`:
+  - Removed destructive `xterm.reset()` calls from reconnect/late-ack/onReady alt-screen paths.
+  - Kept reconnect resize sync and refit behavior, but now non-destructive to preserve local scrollback continuity.
+  - iOS input path now triggers `maybeScrollToBottom()` after queued input to reduce "typing but prompt not visible" incidents.
+- Updated `mobile/assets/xterm.html`:
+  - `fitTerminal()` now forces `term.refresh(...)` after fit to reduce post-resize cursor/input-line rendering gaps.
+
+Commands:
+- tmux probe:
+  - `tmux ... capture-pane -p -e -S -2000` with main-screen output => deep history (`224` lines)
+  - same probe with explicit alt-screen output => viewport-limited (`24` lines)
+- `npx tsc --noEmit` (mobile)
+- `cargo check --manifest-path cli/Cargo.toml`
+- `cargo test --manifest-path cli/Cargo.toml --bin mobilecli -- --skip test_list_directory_sorts_directories_first`
+
+Evidence:
+- TypeScript compile clean.
+- Rust check clean.
+- Rust tests: `43 passed; 0 failed` (1 filtered known filesystem test).
+- tmux probe confirms main-vs-alt history behavior difference and validates gating change rationale.
+
+Result:
+- pass
+
+Next action:
+- Build/install updated daemon and run on-device reopen/scroll stress with Codex + Gemini + OpenCode.
+- Validate specifically:
+  - deep upward scrolling after reattach,
+  - no duplicate input bars,
+  - prompt/input visibility while typing.
+
+## Task T-014 - Desktop-fit default pivot + runtime-aware suppression
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- Persisting duplicate/frame spill and unreliable scrolling are driven by mobile-dimension PTY resize churn on frame-heavy CLIs. A desktop-canonical PTY with mobile desktop-fit rendering should be more stable.
+
+Changes:
+- Updated `cli/src/protocol.rs`:
+  - `SubscribeAck` now includes optional `runtime` field.
+- Updated `cli/src/daemon.rs`:
+  - `SubscribeAck` now sends session runtime (`pty`/`tmux`).
+  - tmux session classification uses `should_treat_as_tui_for_mobile`; non-alt tmux sessions avoid TUI suppression path.
+  - `GetSessionHistory` requests tmux capture-pane only for non-alt tmux sessions; alt sessions use daemon scrollback fallback.
+- Updated `mobile/hooks/useSync.ts`:
+  - subscribe handling is now runtime-aware:
+    - `in_alt_screen && runtime != tmux` => existing suppression path,
+    - `in_alt_screen && runtime == tmux` => no suppression, immediate history request.
+- Updated `mobile/components/TerminalView.tsx`:
+  - Added desktop-fit default mode (`DESKTOP_FIT_MODE=true`): mobile resize intents now send `keyboard_overlay` sync acks instead of geometry-changing resizes.
+  - `geometry_change` PTY resize emissions disabled in desktop-fit mode.
+  - reconnect/attach sync paths now use non-destructive sync intent.
+- Updated `mobile/assets/xterm.html`:
+  - font size reduced `13 -> 11` to increase effective visible columns in desktop-fit mode.
+
+Commands:
+- `npx tsc --noEmit` (mobile)
+- `cargo check --manifest-path cli/Cargo.toml`
+- `cargo test --manifest-path cli/Cargo.toml --bin mobilecli -- --skip test_list_directory_sorts_directories_first`
+
+Evidence:
+- TypeScript compile clean.
+- Rust tests: `43 passed; 0 failed` (1 filtered known filesystem test).
+- No compile/runtime regressions from protocol extension.
+
+Result:
+- pass
+
+Next action:
+- Rebuild/restart daemon locally and run on-device Gemini/Codex stress loop in desktop-fit mode.
+- If stability is confirmed, keep this as default and expose optional mobile-canonical mode behind a toggle later.
+
+## Task T-015 - Mobile-canonical resize restoration + replay chunking hardening
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- Remaining Gemini/Codex render spill is caused by a size contract violation: xterm was fit to mobile while backend PTY stayed desktop-sized (`DESKTOP_FIT_MODE=true`), so cursor-addressed redraws rendered against mismatched cols/rows.
+- Blank/chopped reopen is caused by oversized `session_history` payloads being dropped/stalled in mobile queues/injection batching.
+
+Changes:
+- Updated `mobile/components/TerminalView.tsx`:
+  - Switched to mobile-canonical PTY sizing (`DESKTOP_FIT_MODE=false`).
+  - Re-enabled geometry resize propagation via `sendResizeIntent(..., 'geometry_change')`.
+  - Keyboard-driven row changes are no longer ignored in canonical mode (prevents input line from drifting under keyboard).
+  - On refocus, perform local `xterm.reset()` before replay/refit to prevent duplicate stale frame overlay.
+- Updated `mobile/hooks/useSync.ts`:
+  - Increased pending PTY queue limits (`chunks: 4000`, `bytes: 20MB`).
+  - Added base64 chunk splitter (`64KB`, 4-byte aligned) before callback/queue delivery.
+  - Queue eviction now preserves at least one newest chunk, preventing self-drop of large replay payloads.
+- Updated `mobile/components/XTermView.tsx`:
+  - Added defensive base64 bridge chunking (`64KB`, 4-byte aligned).
+  - Increased pre-ready pending write cap (`100 -> 2000`) so large replay bursts survive WebView readiness races.
+- Updated `mobile/assets/xterm.html`:
+  - Added full-screen `#gesture-layer` to capture pan/tap across entire terminal area.
+  - Touch action switched to manual pan (`touch-action:none`) for terminal/canvas/gesture layer.
+  - Pan handlers now attach to gesture layer (fallback terminal element).
+  - Font size adjusted to `12` (from desktop-fit `11`) for canonical readability.
+
+Commands:
+- `npx tsc --noEmit` (mobile)
+- `cargo test --manifest-path cli/Cargo.toml --bin mobilecli -- --skip test_list_directory_sorts_directories_first`
+
+Evidence:
+- TypeScript compile clean.
+- Rust tests remain clean: `43 passed; 0 failed` (1 filtered known filesystem test).
+- Code-level root-cause closure:
+  - PTY/xterm dimension mismatch removed by canonical resize.
+  - Large replay payload can no longer be dropped as a single oversize chunk or stuck behind bridge batch-size limits.
+
+Result:
+- pass
+
+Next action:
+- Install this mobile build and run targeted on-device regression loop:
+  - Gemini/Codex/OpenCode startup layout,
+  - leave/reopen same session (no blank, no duplicate prompt bars),
+  - deep upward scrolling through long history,
+  - keyboard show/hide while typing (input line remains visible).
+
+## Task T-016 - Pre-build hygiene audit and dead-path cleanup
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- Remaining reliability risk is now mostly code hygiene (stale fallback/overlay scaffolding) rather than core PTY transport logic. Removing dormant paths reduces future regressions.
+
+Changes:
+- Updated `mobile/components/TerminalView.tsx`:
+  - Removed dormant desktop-fit branching and keyboard-overlay-only branch logic.
+  - Kept canonical path only: mobile resize events always propagate via `onPtyResize(..., geometry_change)`.
+  - Removed no-longer-used keyboard transition refs tied to the old desktop-fit path.
+- Updated `mobile/assets/xterm.html`:
+  - Removed disabled selection-overlay DOM/CSS/functions and associated no-op scheduling hooks.
+  - Removed overlay function calls from `refitTerminal`.
+  - Kept terminal gesture layer + paste interception + xterm core path only.
+- Updated `mobile/hooks/useSync.ts`:
+  - Corrected stale comment wording for tmux alt-screen replay behavior.
+
+Commands:
+- `npx tsc --noEmit` (mobile)
+- `cargo check --manifest-path cli/Cargo.toml`
+- `cargo test --manifest-path cli/Cargo.toml --bin mobilecli -- --skip test_list_directory_sorts_directories_first`
+
+Evidence:
+- TypeScript compile clean.
+- Rust check clean.
+- Rust tests: `43 passed; 0 failed`.
+- `rg` audit confirms overlay code paths removed from `assets/xterm.html`.
+
+Result:
+- pass
+
+Next action:
+- Device validation run before new build submission (Gemini/Codex/OpenCode + reopen + deep scroll + keyboard visibility).
