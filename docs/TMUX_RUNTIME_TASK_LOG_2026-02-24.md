@@ -335,3 +335,33 @@ Next action:
   - no blank reopen,
   - no duplicate input bars,
   - full-area scroll responsiveness.
+
+## Task T-010 - tmux dynamic window sizing fix (root-cause for mobile dimension mismatch)
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- Mobile dimension mismatches and cut-off rendering persist because tmux session bootstrap set `window-size=manual`, which can lock pane geometry and prevent resize propagation from wrapper PTY resizes.
+
+Changes:
+- Updated `cli/src/pty_wrapper.rs`:
+  - Changed tmux bootstrap window option from `window-size manual` to `window-size latest`.
+  - Added code comment documenting why dynamic window-size mode is required for mobile resize propagation.
+- Strengthened wrapper integration test:
+  - `tmux_session_bootstrap_and_cleanup_roundtrip` now asserts tmux reports `window-size=latest` for the created session.
+
+Commands:
+- `cargo fmt --manifest-path cli/Cargo.toml`
+- `cargo check --manifest-path cli/Cargo.toml`
+- `cargo test --manifest-path cli/Cargo.toml --bin mobilecli -- --skip test_list_directory_sorts_directories_first`
+
+Evidence:
+- Wrapper source previously set `window-size=manual` in tmux bootstrap options.
+- Test suite remains green (`41 passed; 0 failed`) with new assertion.
+- This directly targets the resize propagation path responsible for mobile-vs-pane dimension divergence.
+
+Result:
+- pass
+
+Next action:
+- Restart daemon with updated binary (when safe, since active sessions are currently running) and re-test mobile attach/reopen sizing behavior.

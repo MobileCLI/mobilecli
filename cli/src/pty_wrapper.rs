@@ -278,12 +278,14 @@ fn setup_tmux_session(
     run_tmux_checked(&mut new_session, "new-session")?;
 
     // Best-effort options for deterministic rendering behavior.
+    // NOTE: window-size must remain dynamic so wrapper PTY resizes propagate
+    // into tmux panes when mobile dimensions change.
     let window_target = format!("{}:0", session_name);
     let option_sets: [(&str, &str, &str, &str); 4] = [
         ("set-option", session_name, "status", "off"),
         ("set-option", session_name, "allow-rename", "off"),
         ("set-option", session_name, "history-limit", "200000"),
-        ("set-window-option", &window_target, "window-size", "manual"),
+        ("set-window-option", &window_target, "window-size", "latest"),
     ];
     for (command, target, key, value) in option_sets {
         let mut option_cmd = tmux_base_command(socket_name);
@@ -984,6 +986,26 @@ mod tests {
             output.status.success(),
             "expected has-session success: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+
+        let mut show_window_size = tmux_base_command(&ctx.socket_name);
+        let output = show_window_size
+            .arg("show-window-options")
+            .arg("-v")
+            .arg("-t")
+            .arg(format!("{}:0", &ctx.session_name))
+            .arg("window-size")
+            .output()
+            .expect("show-window-options output");
+        assert!(
+            output.status.success(),
+            "expected show-window-options success: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let window_size_mode = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert_eq!(
+            window_size_mode, "latest",
+            "expected tmux window-size to remain dynamic for client-driven resize propagation"
         );
 
         cleanup_tmux_session(&ctx);
