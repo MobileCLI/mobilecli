@@ -9,6 +9,7 @@
 
 use crate::daemon::{get_port, DEFAULT_PORT};
 use crate::protocol::PtyResizeReason;
+use crate::tmux::sanitize_tmux_token;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use colored::Colorize;
 use futures_util::{SinkExt, StreamExt};
@@ -191,23 +192,6 @@ fn jitter_resize_target(cols: u16, rows: u16) -> (u16, u16) {
     let jitter_cols = if cols > 1 { cols - 1 } else { cols + 1 };
     let jitter_rows = if rows > 1 { rows - 1 } else { rows + 1 };
     (jitter_cols, jitter_rows)
-}
-
-fn sanitize_tmux_token(raw: &str) -> String {
-    let mut out: String = raw
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    if out.is_empty() {
-        out.push_str("session");
-    }
-    out
 }
 
 fn resolve_runtime_mode() -> RuntimeMode {

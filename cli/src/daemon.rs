@@ -13,6 +13,7 @@ use crate::protocol::{
     SessionListItem,
 };
 use crate::session::{self, SessionInfo};
+use crate::tmux::sanitize_tmux_token;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
@@ -3149,23 +3150,6 @@ fn truncate_to_max_chars(input: &mut String, max_chars: usize) {
     }
     let trimmed: String = input.chars().skip(len - max_chars).collect();
     *input = trimmed;
-}
-
-fn sanitize_tmux_token(raw: &str) -> String {
-    let mut out: String = raw
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    if out.is_empty() {
-        out.push_str("session");
-    }
-    out
 }
 
 fn tail_scrollback_bytes(session: &PtySession, max_bytes: usize) -> (Vec<u8>, usize) {
