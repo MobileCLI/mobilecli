@@ -39,6 +39,8 @@ impl PtyResizeReason {
 pub enum ClientMessage {
     Hello {
         client_version: String,
+        #[serde(default)]
+        sender_id: Option<String>,
     },
     Subscribe {
         session_id: String,

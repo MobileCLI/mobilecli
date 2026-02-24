@@ -182,6 +182,9 @@ pub struct PtySession {
 pub struct DaemonState {
     pub sessions: HashMap<String, PtySession>,
     pub mobile_clients: HashMap<SocketAddr, mpsc::Sender<Message>>,
+    /// Mapping from logical mobile sender ID to current socket address.
+    /// Used to evict stale/replaced websocket addresses on reconnect.
+    pub mobile_sender_addrs: HashMap<String, SocketAddr>,
     pub pty_broadcast: broadcast::Sender<(String, Vec<u8>)>,
     pub port: u16, // The actual port the daemon is running on
     pub push_tokens: Vec<PushToken>,
@@ -217,6 +220,7 @@ impl DaemonState {
         Self {
             sessions: HashMap::new(),
             mobile_clients: HashMap::new(),
+            mobile_sender_addrs: HashMap::new(),
             pty_broadcast,
             port,
             push_tokens: Vec::new(),
@@ -1353,9 +1357,33 @@ async fn process_client_msg(
     addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match msg {
-        ClientMessage::Hello { client_version, .. } => {
+        ClientMessage::Hello {
+            client_version,
+            sender_id,
+        } => {
             // Already sent Welcome on connect, but log the client version
             tracing::debug!("Client hello, version: {}", client_version);
+            if let Some(sender_id) = sender_id
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                let replaced_addr = {
+                    let mut st = state.write().await;
+                    match st.mobile_sender_addrs.insert(sender_id.clone(), addr) {
+                        Some(previous) if previous != addr => Some(previous),
+                        _ => None,
+                    }
+                };
+                if let Some(previous_addr) = replaced_addr {
+                    tracing::info!(
+                        sender_id = %sender_id,
+                        previous_addr = %previous_addr,
+                        new_addr = %addr,
+                        "Replacing stale mobile socket for sender_id"
+                    );
+                    evict_mobile_addr(state, previous_addr).await;
+                }
+            }
         }
         ClientMessage::Subscribe { session_id } => {
             tracing::debug!("Client subscribed to session: {}", session_id);
@@ -3398,6 +3426,14 @@ fn build_notification_text(
 async fn cleanup_client_state(state: &SharedState, addr: SocketAddr) {
     let (sessions_to_restore, to_unwatch) = {
         let mut st = state.write().await;
+        let stale_sender_ids: Vec<String> = st
+            .mobile_sender_addrs
+            .iter()
+            .filter_map(|(sender_id, mapped_addr)| (*mapped_addr == addr).then_some(sender_id.clone()))
+            .collect();
+        for sender_id in stale_sender_ids {
+            st.mobile_sender_addrs.remove(&sender_id);
+        }
         st.pending_tui_replay.remove(&addr);
 
         let sessions_to_restore = match st.mobile_views.remove(&addr) {
@@ -3449,6 +3485,19 @@ async fn cleanup_client_state(state: &SharedState, addr: SocketAddr) {
     for session_id in sessions_to_restore {
         restore_pty_size(state, &session_id).await;
     }
+}
+
+/// Evict a stale mobile websocket address and clean all associated view/watch state.
+async fn evict_mobile_addr(state: &SharedState, addr: SocketAddr) {
+    let stale_tx = {
+        let mut st = state.write().await;
+        st.file_rate_limiters.remove(&addr);
+        st.mobile_clients.remove(&addr)
+    };
+    if let Some(tx) = stale_tx {
+        let _ = tx.try_send(Message::Close(None));
+    }
+    cleanup_client_state(state, addr).await;
 }
 
 fn is_path_watched(changed_path: &str, watched: &std::collections::HashSet<String>) -> bool {

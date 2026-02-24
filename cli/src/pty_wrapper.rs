@@ -354,7 +354,7 @@ fn resolve_resize_reason(cols: u16, rows: u16, reason: Option<&str>) -> PtyResiz
         Some("geometry_change") => PtyResizeReason::GeometryChange,
         Some("reconnect_sync") => PtyResizeReason::ReconnectSync,
         Some("keyboard_overlay") => PtyResizeReason::KeyboardOverlay,
-        Some("detach_restore") => PtyResizeReason::GeometryChange,
+        Some("detach_restore") => PtyResizeReason::DetachRestore,
         _ => PtyResizeReason::GeometryChange,
     }
 }
@@ -732,10 +732,13 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                                             }
                                         }
 
-                                        let force_noop_refresh = matches!(
-                                            reason,
-                                            PtyResizeReason::AttachInit | PtyResizeReason::ReconnectSync
-                                        ) && last_applied_pty_size == Some((c, r));
+                                        let force_noop_refresh = runtime_mode == RuntimeMode::Pty
+                                            && matches!(
+                                                reason,
+                                                PtyResizeReason::AttachInit
+                                                    | PtyResizeReason::ReconnectSync
+                                            )
+                                            && last_applied_pty_size == Some((c, r));
 
                                         let should_resize =
                                             force_noop_refresh || last_applied_pty_size != Some((c, r));
@@ -949,6 +952,10 @@ mod tests {
         assert_eq!(
             resolve_resize_reason(80, 24, Some("keyboard_overlay")),
             PtyResizeReason::KeyboardOverlay
+        );
+        assert_eq!(
+            resolve_resize_reason(80, 24, Some("detach_restore")),
+            PtyResizeReason::DetachRestore
         );
         assert_eq!(
             resolve_resize_reason(80, 24, Some("future_reason")),
