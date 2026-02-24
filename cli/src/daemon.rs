@@ -701,7 +701,7 @@ async fn handle_pty_session(
                                     if let Ok(bytes) = BASE64.decode(data) {
                                         let _ = pty_broadcast.send((session_id.clone(), bytes.clone()));
 
-                                        // Accumulate scrollback and track alt screen state
+                                        // Accumulate scrollback and track render state.
                                         {
                                             let mut st = state.write().await;
                                             if let Some(session) = st.sessions.get_mut(&session_id) {
@@ -710,14 +710,23 @@ async fn handle_pty_session(
                                                 while session.scrollback.len() > session.scrollback_max_bytes {
                                                     session.scrollback.pop_front();
                                                 }
-                                                // Track alt-screen transitions across chunk
-                                                // boundaries so subscribe_ack reflects the
-                                                // current rendering mode reliably.
-                                                update_alt_screen_state(
-                                                    &mut session.in_alt_screen,
-                                                    &mut session.alt_track_tail,
-                                                    &bytes,
-                                                );
+                                                // tmux runtime runs with alternate-screen disabled
+                                                // during bootstrap, so raw 1049/1047 bytes from
+                                                // frame CLIs are not a reliable signal for
+                                                // mobile-side alt-screen policy.
+                                                if session.runtime == "tmux" {
+                                                    session.in_alt_screen = false;
+                                                    session.alt_track_tail.clear();
+                                                } else {
+                                                    // Track alt-screen transitions across chunk
+                                                    // boundaries so subscribe_ack reflects the
+                                                    // current rendering mode reliably.
+                                                    update_alt_screen_state(
+                                                        &mut session.in_alt_screen,
+                                                        &mut session.alt_track_tail,
+                                                        &bytes,
+                                                    );
+                                                }
                                                 let was_frame = session.frame_render_mode;
                                                 update_frame_render_state(
                                                     &mut session.frame_render_mode,
@@ -1445,33 +1454,19 @@ async fn process_client_msg(
                 );
                 let has_scrollback = !session.scrollback.is_empty();
                 let runtime = session.runtime.clone();
-                // alternate-screen is disabled in tmux so the host terminal (e.g.
-                // Konsole) never enters its own alt-screen and loses scrollback.
-                // This means in_alt_screen is always false for tmux sessions; we
-                // instead use frame_render_mode to distinguish between text CLIs
-                // (which get real scrollback history) and frame-rendering TUIs
-                // (which flood scrollback with cursor-home+clear frames and should
-                // instead get a visible-pane snapshot of their current screen state).
-                // frame_render_mode is detected from observable output patterns —
-                // any app that emits heavy cursor-repositioning qualifies, regardless
-                // of what the app is called.
+                // tmux sessions always replay from capture-pane. For frame-rendering
+                // CLIs we request only the visible pane; for text CLIs we include
+                // deeper scrollback.
                 let frame_render = session.frame_render_mode;
                 let tmux_snapshot_req = if runtime == "tmux" {
-                    if frame_render {
-                        // Frame-rendering TUIs redraw their entire screen on SIGWINCH.
-                        // Skip capture — it would be at desktop dimensions and get
-                        // immediately overwritten by the resize-triggered redraw.
-                        None
-                    } else {
-                        match (&session.tmux_socket, &session.tmux_session) {
-                            (Some(socket), Some(name)) => Some((
-                                socket.clone(),
-                                name.clone(),
-                                session.scrollback_max_bytes,
-                                true,
-                            )),
-                            _ => None,
-                        }
+                    match (&session.tmux_socket, &session.tmux_session) {
+                        (Some(socket), Some(name)) => Some((
+                            socket.clone(),
+                            name.clone(),
+                            session.scrollback_max_bytes,
+                            !frame_render,
+                        )),
+                        _ => None,
                     }
                 } else {
                     None
@@ -1481,9 +1476,9 @@ async fn process_client_msg(
                 } else {
                     None
                 };
-                // Daemon in-memory scrollback fallback for tmux text sessions when
-                // capture-pane is unavailable (socket startup race, etc.).
-                let tmux_fallback = if runtime == "tmux" && !frame_render && has_scrollback {
+                // Daemon in-memory fallback when capture-pane is unavailable
+                // (socket startup race, etc.).
+                let tmux_fallback = if runtime == "tmux" && has_scrollback {
                     Some(session.scrollback.iter().copied().collect::<Vec<u8>>())
                 } else {
                     None
@@ -1537,21 +1532,21 @@ async fn process_client_msg(
             // On every (re-)subscribe we first clear the client terminal so
             // that replay data doesn't append to stale content from a prior
             // subscribe. Sessions in mobile alternate-screen use 1049h clear.
-            // Main-buffer sessions erase display+scrollback so the next render
-            // starts from a deterministic baseline.
+            // Text main-buffer sessions erase display+scrollback so the next
+            // replay starts from a deterministic baseline.
             //
-            // tmux frame sessions intentionally stay in the main buffer to
-            // preserve mobile-side scrollback and manual panning.
-            //
-            // Text sessions
-            // erase the display *and* the scrollback buffer (\x1b[3J) so that
-            // the SessionHistory that follows is the only content.
+            // tmux frame sessions intentionally keep existing scrollback and only
+            // clear the visible display to avoid hard history loss on reattach.
             {
                 let clear: &[u8] = if mobile_in_alt_screen {
                     // \x1b[?1049h  enter alternate screen
                     // \x1b[2J      erase display
                     // \x1b[H       cursor home
                     b"\x1b[?1049h\x1b[2J\x1b[H"
+                } else if runtime == "tmux" && render_as_tui {
+                    // \x1b[2J      erase display
+                    // \x1b[H       cursor home
+                    b"\x1b[2J\x1b[H"
                 } else {
                     // \x1b[2J      erase display
                     // \x1b[3J      erase scrollback (xterm extension, supported by xterm.js)
@@ -1567,10 +1562,9 @@ async fn process_client_msg(
                 }
             }
 
-            // ── Step 2: replay history (text sessions only) ─────────────
+            // ── Step 2: replay history ────────────────────────────────────
             //
-            // TUI sessions skip all replay — the app redraws its full screen
-            // after the SIGWINCH triggered by the mobile resize.
+            // PTY text sessions replay daemon scrollback.
             if !render_as_tui {
                 if let Some(bytes) = scrollback_bytes {
                     let msg = ServerMessage::PtyBytes {
@@ -1581,43 +1575,45 @@ async fn process_client_msg(
                         let _ = tx.send(Message::Text(text)).await;
                     }
                 }
+            }
 
-                if let Some((socket, name, max_bytes, include_scrollback)) = tmux_snapshot_req {
-                    let max_lines = if include_scrollback {
-                        SUBSCRIBE_SCROLLBACK_LINES
-                    } else {
-                        0
+            // tmux sessions always get an authoritative pane snapshot on
+            // subscribe. Frame-rendered CLIs request visible pane only.
+            if let Some((socket, name, max_bytes, include_scrollback)) = tmux_snapshot_req {
+                let max_lines = if include_scrollback {
+                    SUBSCRIBE_SCROLLBACK_LINES
+                } else {
+                    0
+                };
+                if let Some(snapshot) =
+                    capture_tmux_history_with_retry(socket, name, include_scrollback, max_lines)
+                        .await
+                {
+                    let total_bytes = snapshot.len();
+                    let skip = total_bytes.saturating_sub(max_bytes);
+                    let bytes = &snapshot[skip..];
+                    let msg = ServerMessage::SessionHistory {
+                        session_id: session_id.clone(),
+                        data: BASE64.encode(bytes),
+                        total_bytes,
                     };
-                    if let Some(snapshot) =
-                        capture_tmux_history_with_retry(socket, name, include_scrollback, max_lines)
-                            .await
-                    {
-                        let total_bytes = snapshot.len();
-                        let skip = total_bytes.saturating_sub(max_bytes);
-                        let bytes = &snapshot[skip..];
-                        let msg = ServerMessage::SessionHistory {
-                            session_id: session_id.clone(),
-                            data: BASE64.encode(bytes),
-                            total_bytes,
-                        };
-                        if let Ok(text) = serde_json::to_string(&msg) {
-                            let _ = tx.send(Message::Text(text)).await;
-                        }
-                    } else if let Some(fallback) = tmux_fallback_bytes {
-                        tracing::debug!(
-                            session_id = %session_id,
-                            fallback_bytes = fallback.len(),
-                            "capture-pane failed; using daemon scrollback fallback"
-                        );
-                        let total_bytes = fallback.len();
-                        let msg = ServerMessage::SessionHistory {
-                            session_id: session_id.clone(),
-                            data: BASE64.encode(&fallback),
-                            total_bytes,
-                        };
-                        if let Ok(text) = serde_json::to_string(&msg) {
-                            let _ = tx.send(Message::Text(text)).await;
-                        }
+                    if let Ok(text) = serde_json::to_string(&msg) {
+                        let _ = tx.send(Message::Text(text)).await;
+                    }
+                } else if let Some(fallback) = tmux_fallback_bytes {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        fallback_bytes = fallback.len(),
+                        "capture-pane failed; using daemon scrollback fallback"
+                    );
+                    let total_bytes = fallback.len();
+                    let msg = ServerMessage::SessionHistory {
+                        session_id: session_id.clone(),
+                        data: BASE64.encode(&fallback),
+                        total_bytes,
+                    };
+                    if let Ok(text) = serde_json::to_string(&msg) {
+                        let _ = tx.send(Message::Text(text)).await;
                     }
                 }
             }
@@ -2020,19 +2016,18 @@ async fn process_client_msg(
                         session.in_alt_screen,
                         session.frame_render_mode,
                     );
-                    if render_as_tui {
-                        // TUI sessions redraw completely after SIGWINCH.
-                        // The daemon's scrollback for frame-rendering apps is
-                        // raw cursor-positioned output that renders as jumbled
-                        // content at any different terminal size.  Return empty.
-                        (Vec::new(), 0)
-                    } else if session.runtime == "tmux" {
+                    if session.runtime == "tmux" {
                         if let (Some(socket), Some(name)) =
                             (session.tmux_socket.clone(), session.tmux_session.clone())
                         {
-                            tmux_capture_req = Some((socket, name, max, true));
+                            tmux_capture_req = Some((socket, name, max, !render_as_tui));
                         }
                         tail_scrollback_bytes(session, max)
+                    } else if render_as_tui {
+                        // PTY frame-rendering sessions can only safely replay
+                        // their live stream; historical replay is often malformed
+                        // after geometry changes.
+                        (Vec::new(), 0)
                     } else {
                         tail_scrollback_bytes(session, max)
                     }
@@ -3395,15 +3390,15 @@ fn should_ignore_resize_without_viewers(
 }
 
 fn should_treat_as_tui_for_mobile(
-    _runtime: &str,
+    runtime: &str,
     in_alt_screen: bool,
     frame_render_mode: bool,
 ) -> bool {
-    // alternate-screen is disabled in tmux to preserve host terminal
-    // scrollback, so in_alt_screen is always false for tmux sessions.
-    // Use frame_render_mode so mobile's xterm.js enters alternate screen
-    // for TUI apps — without it, every frame draw pollutes main-buffer
-    // scrollback and the user sees jumbled content when scrolling up.
+    if runtime == "tmux" {
+        // tmux runtime keeps alternate-screen disabled at bootstrap, so use
+        // frame-render mode as the TUI gate.
+        return frame_render_mode;
+    }
     in_alt_screen || frame_render_mode
 }
 
@@ -3412,15 +3407,15 @@ fn should_mobile_enter_alt_screen(
     in_alt_screen: bool,
     frame_render_mode: bool,
 ) -> bool {
-    // Preserve real alternate-screen behavior when the app explicitly requests it.
-    if in_alt_screen {
-        return true;
-    }
     // tmux runtime intentionally disables alternate-screen at the host level.
-    // For frame-rendering apps under tmux we keep mobile in the main buffer so
-    // users can retain scrollback and pan through prior output.
+    // Ignore raw 1049/1047 bytes from pane output and keep mobile in main
+    // buffer for deterministic replay + scrollback behavior.
     if runtime == "tmux" {
         return false;
+    }
+    // Preserve real alternate-screen behavior for non-tmux runtimes.
+    if in_alt_screen {
+        return true;
     }
     frame_render_mode
 }
@@ -4039,12 +4034,10 @@ mod tests {
 
     #[test]
     fn tui_gating_uses_frame_render_for_all_runtimes() {
-        // alternate-screen is disabled in tmux so in_alt_screen is always
-        // false there. frame_render_mode must still gate replay behavior for
-        // tmux sessions to avoid dumping raw frame redraw traffic as history.
+        // tmux runtime ignores raw alt-screen bytes and relies on frame mode.
         assert!(should_treat_as_tui_for_mobile("tmux", false, true));
         assert!(!should_treat_as_tui_for_mobile("tmux", false, false));
-        assert!(should_treat_as_tui_for_mobile("tmux", true, false));
+        assert!(!should_treat_as_tui_for_mobile("tmux", true, false));
         assert!(should_treat_as_tui_for_mobile("pty", false, true));
         assert!(!should_treat_as_tui_for_mobile("pty", false, false));
     }
@@ -4053,7 +4046,7 @@ mod tests {
     fn mobile_alt_screen_policy_preserves_tmux_scrollback() {
         assert!(!should_mobile_enter_alt_screen("tmux", false, true));
         assert!(!should_mobile_enter_alt_screen("tmux", false, false));
-        assert!(should_mobile_enter_alt_screen("tmux", true, false));
+        assert!(!should_mobile_enter_alt_screen("tmux", true, false));
         assert!(should_mobile_enter_alt_screen("pty", false, true));
         assert!(!should_mobile_enter_alt_screen("pty", false, false));
     }
