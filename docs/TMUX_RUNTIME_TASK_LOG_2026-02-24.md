@@ -168,3 +168,42 @@ Result:
 
 Next action:
 - Commit changes and run target manual validation loop on Codex session attach/detach cycles using tmux runtime.
+
+## Task T-006 - tmux reconnect replay correctness hardening
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- Blank reattach and "terminal code pasted into chat" regressions come from replaying raw daemon PTY scrollback for tmux sessions instead of replaying an authoritative tmux pane snapshot.
+
+Changes:
+- Updated `cli/src/daemon.rs`:
+  - Added tmux metadata to in-memory session state (`tmux_socket`, `tmux_session`).
+  - Derived tmux identifiers from `session_id` at registration for runtime `tmux`.
+  - Added tmux snapshot helpers:
+    - `capture_tmux_history_blocking`
+    - `capture_tmux_history`
+    - `tail_scrollback_bytes` (fallback path).
+  - `GetSessionHistory` now prefers tmux `capture-pane -p -e -S -200000` for tmux sessions; falls back to daemon buffer only on capture failure.
+  - `Subscribe` now:
+    - disables deferred raw replay for tmux runtime,
+    - sends immediate `session_history` snapshot from tmux when available.
+  - `broadcast_pty_resized` now skips deferred raw replay for tmux sessions (prevents corrupted frame replays).
+- Added daemon test:
+  - `tmux_capture_history_returns_snapshot_text`.
+
+Commands:
+- `cargo fmt --manifest-path cli/Cargo.toml`
+- `cargo check --manifest-path cli/Cargo.toml`
+- `cargo test --manifest-path cli/Cargo.toml --bin mobilecli -- --skip test_list_directory_sorts_directories_first`
+
+Evidence:
+- Test suite result after patch: `36 passed; 0 failed` (1 filtered known filesystem test).
+- New tmux capture test validates snapshot contains expected marker from live tmux session.
+- Deferred raw replay path explicitly bypassed for runtime `tmux`.
+
+Result:
+- pass
+
+Next action:
+- Install updated release binary locally and run Codex mobile attach/detach verification loop with logs.

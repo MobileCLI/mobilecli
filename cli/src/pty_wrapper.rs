@@ -966,7 +966,7 @@ mod tests {
             &ctx.socket_name,
             &ctx.session_name,
             "/bin/sh",
-            &vec!["-lc".to_string(), "printf tmux-test".to_string()],
+            &vec!["-lc".to_string(), "sleep 3".to_string()],
             ".",
             80,
             24,

@@ -139,6 +139,10 @@ pub struct PtySession {
     pub session_id: String,
     /// Execution runtime used by the wrapper (`pty` or `tmux`).
     pub runtime: String,
+    /// tmux socket label (when runtime=tmux)
+    pub tmux_socket: Option<String>,
+    /// tmux session name (when runtime=tmux)
+    pub tmux_session: Option<String>,
     pub name: String,
     pub command: String,
     pub project_path: String,
@@ -597,6 +601,13 @@ async fn handle_pty_session(
     let command = reg_msg["command"].as_str().unwrap_or("shell").to_string();
     let project_path = reg_msg["project_path"].as_str().unwrap_or("").to_string();
     let runtime = reg_msg["runtime"].as_str().unwrap_or("pty").to_lowercase();
+    let (tmux_socket, tmux_session) = if runtime == "tmux" {
+        let token = sanitize_tmux_token(&session_id);
+        let name = format!("mcli-{}", token);
+        (Some(name.clone()), Some(name))
+    } else {
+        (None, None)
+    };
 
     tracing::info!(
         "PTY session registered: {} ({}) runtime={}",
@@ -620,6 +631,8 @@ async fn handle_pty_session(
             PtySession {
                 session_id: session_id.clone(),
                 runtime: runtime.clone(),
+                tmux_socket,
+                tmux_session,
                 name: name.clone(),
                 command,
                 project_path,
@@ -1353,24 +1366,45 @@ async fn process_client_msg(
             }
 
             // Collect session state under one lock, then drop it before sending.
-            let (scrollback_bytes, render_as_tui, queue_deferred_replay, scrollback_len) =
-                if let Some(session) = st.sessions.get(&session_id) {
-                    let render_as_tui = session.in_alt_screen || session.frame_render_mode;
-                    let has_scrollback = !session.scrollback.is_empty();
-                    let sb = if !render_as_tui && has_scrollback {
-                        Some(session.scrollback.iter().copied().collect::<Vec<u8>>())
-                    } else {
-                        None
-                    };
-                    (
-                        sb,
-                        render_as_tui,
-                        render_as_tui && has_scrollback,
-                        session.scrollback.len(),
-                    )
+            let (
+                scrollback_bytes,
+                render_as_tui,
+                queue_deferred_replay,
+                scrollback_len,
+                runtime,
+                tmux_snapshot_req,
+            ) = if let Some(session) = st.sessions.get(&session_id) {
+                let render_as_tui = session.in_alt_screen || session.frame_render_mode;
+                let has_scrollback = !session.scrollback.is_empty();
+                let runtime = session.runtime.clone();
+                let tmux_snapshot_req = if runtime == "tmux" {
+                    match (&session.tmux_socket, &session.tmux_session) {
+                        (Some(socket), Some(name)) => {
+                            Some((socket.clone(), name.clone(), session.scrollback_max_bytes))
+                        }
+                        _ => None,
+                    }
                 } else {
-                    (None, false, false, 0)
+                    None
                 };
+                let sb = if runtime != "tmux" && !render_as_tui && has_scrollback {
+                    Some(session.scrollback.iter().copied().collect::<Vec<u8>>())
+                } else {
+                    None
+                };
+                (
+                    sb,
+                    render_as_tui,
+                    // tmux sessions use capture-pane snapshots; raw deferred replay
+                    // of daemon scrollback corrupts frame TUIs on reconnect.
+                    runtime != "tmux" && render_as_tui && has_scrollback,
+                    session.scrollback.len(),
+                    runtime,
+                    tmux_snapshot_req,
+                )
+            } else {
+                (None, false, false, 0, "pty".to_string(), None)
+            };
 
             if queue_deferred_replay {
                 st.pending_tui_replay
@@ -1390,6 +1424,7 @@ async fn process_client_msg(
             tracing::debug!(
                 session_id = %session_id,
                 addr = %addr,
+                runtime = %runtime,
                 render_as_tui,
                 queue_deferred_replay,
                 scrollback_len,
@@ -1408,6 +1443,22 @@ async fn process_client_msg(
                 };
                 if let Ok(text) = serde_json::to_string(&msg) {
                     let _ = tx.send(Message::Text(text)).await;
+                }
+            }
+
+            if let Some((socket, name, max_bytes)) = tmux_snapshot_req {
+                if let Some(snapshot) = capture_tmux_history(socket, name).await {
+                    let total_bytes = snapshot.len();
+                    let skip = total_bytes.saturating_sub(max_bytes);
+                    let bytes = &snapshot[skip..];
+                    let msg = ServerMessage::SessionHistory {
+                        session_id: session_id.clone(),
+                        data: BASE64.encode(bytes),
+                        total_bytes,
+                    };
+                    if let Ok(text) = serde_json::to_string(&msg) {
+                        let _ = tx.send(Message::Text(text)).await;
+                    }
                 }
             }
 
@@ -1771,18 +1822,34 @@ async fn process_client_msg(
             session_id,
             max_bytes,
         } => {
-            let (data, total_bytes) = {
+            let mut tmux_capture_req: Option<(String, String, usize)> = None;
+            let (fallback_bytes, fallback_total_bytes) = {
                 let st = state.read().await;
                 if let Some(session) = st.sessions.get(&session_id) {
                     let max = max_bytes.unwrap_or(session.scrollback_max_bytes);
-                    let total = session.scrollback.len();
-                    let skip = total.saturating_sub(max);
-                    // VecDeque doesn't support direct slicing, so collect the tail
-                    let bytes: Vec<u8> = session.scrollback.iter().skip(skip).copied().collect();
-                    (BASE64.encode(&bytes), total)
+                    if session.runtime == "tmux" {
+                        if let (Some(socket), Some(name)) =
+                            (session.tmux_socket.clone(), session.tmux_session.clone())
+                        {
+                            tmux_capture_req = Some((socket, name, max));
+                        }
+                    }
+                    tail_scrollback_bytes(session, max)
                 } else {
-                    (String::new(), 0)
+                    (Vec::new(), 0)
                 }
+            };
+
+            let (data, total_bytes) = if let Some((socket, name, max)) = tmux_capture_req {
+                if let Some(snapshot) = capture_tmux_history(socket, name).await {
+                    let total = snapshot.len();
+                    let skip = total.saturating_sub(max);
+                    (BASE64.encode(&snapshot[skip..]), total)
+                } else {
+                    (BASE64.encode(&fallback_bytes), fallback_total_bytes)
+                }
+            } else {
+                (BASE64.encode(&fallback_bytes), fallback_total_bytes)
             };
 
             let msg = ServerMessage::SessionHistory {
@@ -2762,7 +2829,7 @@ async fn broadcast_pty_resized(
 
             if !replay_addrs.is_empty() {
                 if let Some(session) = st.sessions.get(session_id) {
-                    if !session.scrollback.is_empty() {
+                    if session.runtime != "tmux" && !session.scrollback.is_empty() {
                         replay_scrollback_len = session.scrollback.len();
                         let bytes: Vec<u8> = session.scrollback.iter().copied().collect();
                         let replay_msg = ServerMessage::PtyBytes {
@@ -2770,6 +2837,11 @@ async fn broadcast_pty_resized(
                             data: BASE64.encode(&bytes),
                         };
                         replay_payload = serde_json::to_string(&replay_msg).ok();
+                    } else if session.runtime == "tmux" {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            "Skipping deferred raw replay for tmux runtime; mobile will request capture-pane snapshot"
+                        );
                     }
                 }
 
@@ -2866,6 +2938,67 @@ fn truncate_to_max_chars(input: &mut String, max_chars: usize) {
     }
     let trimmed: String = input.chars().skip(len - max_chars).collect();
     *input = trimmed;
+}
+
+fn sanitize_tmux_token(raw: &str) -> String {
+    let mut out: String = raw
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if out.is_empty() {
+        out.push_str("session");
+    }
+    out
+}
+
+fn tail_scrollback_bytes(session: &PtySession, max_bytes: usize) -> (Vec<u8>, usize) {
+    let total = session.scrollback.len();
+    let skip = total.saturating_sub(max_bytes);
+    let bytes: Vec<u8> = session.scrollback.iter().skip(skip).copied().collect();
+    (bytes, total)
+}
+
+fn capture_tmux_history_blocking(socket: &str, session: &str) -> Option<Vec<u8>> {
+    let targets = [
+        format!("{}:0.0", session),
+        format!("{}:0", session),
+        session.to_string(),
+    ];
+    for target in targets {
+        let output = std::process::Command::new("tmux")
+            .arg("-L")
+            .arg(socket)
+            .arg("-f")
+            .arg("/dev/null")
+            .env_remove("TMUX")
+            .arg("capture-pane")
+            .arg("-p")
+            .arg("-e")
+            .arg("-S")
+            .arg("-200000")
+            .arg("-t")
+            .arg(&target)
+            .output();
+        if let Ok(out) = output {
+            if out.status.success() {
+                return Some(out.stdout);
+            }
+        }
+    }
+    None
+}
+
+async fn capture_tmux_history(socket: String, session: String) -> Option<Vec<u8>> {
+    tokio::task::spawn_blocking(move || capture_tmux_history_blocking(&socket, &session))
+        .await
+        .ok()
+        .flatten()
 }
 
 fn should_ignore_restore_resize(
@@ -3187,7 +3320,7 @@ async fn send_push_notifications(tokens: &[PushToken], title: &str, body: &str, 
 #[cfg(test)]
 mod tests {
     use super::{
-        broadcast_pty_resized, build_upload_destination_path, is_noop_resize,
+        broadcast_pty_resized, build_upload_destination_path, capture_tmux_history, is_noop_resize,
         is_stale_resize_epoch, is_windows_reserved_device_name, resolve_resize_reason,
         sanitize_upload_file_name, scan_frame_sequences, should_enable_frame_mode,
         should_force_noop_resize, should_ignore_restore_resize, update_alt_screen_state,
@@ -3208,6 +3341,59 @@ mod tests {
     fn default_scrollback_is_large_enough_for_frame_clis() {
         assert_eq!(DEFAULT_SCROLLBACK_MAX_BYTES, 2 * 1024 * 1024);
         assert!(DEFAULT_SCROLLBACK_MAX_BYTES > 64 * 1024);
+    }
+
+    #[tokio::test]
+    async fn tmux_capture_history_returns_snapshot_text() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+
+        let token = &uuid::Uuid::new_v4().to_string()[..8];
+        let socket = format!("mcli-test-{}-sock", token);
+        let session = format!("mcli-test-{}-session", token);
+
+        let spawn = std::process::Command::new("tmux")
+            .arg("-L")
+            .arg(&socket)
+            .arg("-f")
+            .arg("/dev/null")
+            .env_remove("TMUX")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session,
+                "printf CAPTURE_OK; sleep 2",
+            ])
+            .output()
+            .expect("spawn tmux test session");
+        assert!(
+            spawn.status.success(),
+            "failed to spawn tmux test session: {}",
+            String::from_utf8_lossy(&spawn.stderr)
+        );
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let snapshot = capture_tmux_history(socket.clone(), session.clone())
+            .await
+            .expect("tmux snapshot");
+        let text = String::from_utf8_lossy(&snapshot);
+        assert!(
+            text.contains("CAPTURE_OK"),
+            "snapshot missing expected marker: {}",
+            text
+        );
+
+        let _ = std::process::Command::new("tmux")
+            .arg("-L")
+            .arg(&socket)
+            .arg("-f")
+            .arg("/dev/null")
+            .env_remove("TMUX")
+            .arg("kill-server")
+            .status();
     }
 
     #[test]
@@ -3428,6 +3614,8 @@ mod tests {
                 PtySession {
                     session_id: session_id.clone(),
                     runtime: "pty".to_string(),
+                    tmux_socket: None,
+                    tmux_session: None,
                     name: "Codex".to_string(),
                     command: "codex".to_string(),
                     project_path: "/tmp".to_string(),
