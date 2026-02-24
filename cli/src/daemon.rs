@@ -4021,15 +4021,16 @@ mod tests {
     }
 
     #[test]
-    fn tmux_mobile_tui_gating_uses_real_alt_screen_only() {
-        // tmux frame-mode sessions that are not in true alt-screen should keep
-        // normal streaming + scrollback replay behavior.
-        assert!(!should_treat_as_tui_for_mobile("tmux", false, true));
+    fn tui_gating_uses_frame_render_for_all_runtimes() {
+        // alternate-screen is disabled in tmux so in_alt_screen is always
+        // false there.  frame_render_mode must trigger TUI treatment for
+        // tmux sessions too, otherwise mobile never enters alt-screen and
+        // every TUI frame pollutes main-buffer scrollback.
+        assert!(should_treat_as_tui_for_mobile("tmux", false, true));
         assert!(!should_treat_as_tui_for_mobile("tmux", false, false));
-        // True alt-screen sessions must still use suppression/reconnect guards.
         assert!(should_treat_as_tui_for_mobile("tmux", true, false));
-        // Legacy PTY runtime preserves historical frame-mode treatment.
         assert!(should_treat_as_tui_for_mobile("pty", false, true));
+        assert!(!should_treat_as_tui_for_mobile("pty", false, false));
     }
 
     #[test]
