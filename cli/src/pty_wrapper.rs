@@ -699,8 +699,8 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
 
                                         if reason == PtyResizeReason::DetachRestore {
                                             // Mobile detached. Restore PTY dimensions to the host
-                                            // terminal's current size. In mirror mode, also
-                                            // restore the host window to the original size.
+                                            // terminal's pre-mobile size when available. In mirror
+                                            // mode, also restore the host window.
                                             let (restore_c, restore_r) = match desktop_resize_policy {
                                                 DesktopResizePolicy::Mirror => {
                                                     if let Some((lc, lr)) = saved_local_size.take() {
@@ -711,8 +711,11 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                                                     }
                                                 }
                                                 DesktopResizePolicy::Preserve => {
-                                                    saved_local_size = None;
-                                                    get_terminal_size()
+                                                    if let Some((lc, lr)) = saved_local_size.take() {
+                                                        (lc, lr)
+                                                    } else {
+                                                        get_terminal_size()
+                                                    }
                                                 }
                                             };
                                             c = restore_c;
@@ -721,9 +724,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                                             // Mobile active: always resize child PTY to mobile
                                             // dimensions. Host terminal mirroring is opt-in via
                                             // MOBILECLI_DESKTOP_RESIZE_POLICY=mirror.
-                                            if desktop_resize_policy == DesktopResizePolicy::Mirror
-                                                && saved_local_size.is_none()
-                                            {
+                                            if saved_local_size.is_none() {
                                                 saved_local_size = get_terminal_size_opt();
                                             }
                                             if desktop_resize_policy == DesktopResizePolicy::Mirror {
