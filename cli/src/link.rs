@@ -26,6 +26,7 @@ pub async fn run(session_id: Option<String>) -> Result<(), Box<dyn std::error::E
     let hello = ClientMessage::Hello {
         client_version: env!("CARGO_PKG_VERSION").to_string(),
         sender_id: None,
+        client_capabilities: None,
     };
     ws.send(Message::Text(serde_json::to_string(&hello)?))
         .await?;
@@ -174,6 +175,7 @@ async fn run_linked_mode(
     let hello = ClientMessage::Hello {
         client_version: env!("CARGO_PKG_VERSION").to_string(),
         sender_id: None,
+        client_capabilities: None,
     };
     tx.send(Message::Text(serde_json::to_string(&hello)?))
         .await?;
@@ -181,6 +183,8 @@ async fn run_linked_mode(
     // Subscribe to session
     let subscribe = ClientMessage::Subscribe {
         session_id: session.session_id.clone(),
+        last_seen_seq: None,
+        client_capabilities: None,
     };
     tx.send(Message::Text(serde_json::to_string(&subscribe)?))
         .await?;
