@@ -1605,12 +1605,19 @@ async fn process_client_msg(
             epoch,
             reason,
         } => {
-            // Phase 4: Mobile/Desktop Priority Switching
+            // Phase 4 & 6: Mobile/Desktop Priority + No Keyboard Resize Storms
             // - Mobile has priority: mobile resize always applies
             // - Desktop is passive: desktop resize only applies if no mobile viewers
             // - DetachRestore: restore desktop size when mobile disconnects
+            // - KeyboardOverlay: never forward to PTY (prevents resize storms)
             
             let reason = reason.unwrap_or(PtyResizeReason::GeometryChange);
+            
+            // Phase 6: Ignore keyboard overlay resizes - they don't change PTY geometry
+            if reason == PtyResizeReason::KeyboardOverlay {
+                return Ok(());
+            }
+            
             let is_restore = cols == 0 && rows == 0;
             
             let mut st = state.write().await;
