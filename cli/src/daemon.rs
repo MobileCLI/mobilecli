@@ -2192,7 +2192,7 @@ async fn process_client_msg(
             action,
             count,
         } => {
-            let auth_result: Result<(Option<String>, Option<String>), (&str, String)> = {
+            let auth_result = {
                 let mut st = state.write().await;
                 if !st.tmux_viewport_supported {
                     Err((
