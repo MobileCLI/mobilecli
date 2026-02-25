@@ -1895,8 +1895,18 @@ async fn process_client_msg(
                 *count += 1;
             }
             if st.tmux_viewport_supported && runtime_for_log == "tmux" {
-                st.tmux_viewport_controllers
-                    .insert(session_id.clone(), addr);
+                let controller = st
+                    .tmux_viewport_controllers
+                    .entry(session_id.clone())
+                    .or_insert(addr);
+                if *controller != addr {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        active_controller = %controller,
+                        requester = %addr,
+                        "Keeping existing tmux viewport controller on subscribe"
+                    );
+                }
             }
             if use_attach_v2 {
                 st.mobile_attach_ids
@@ -2162,86 +2172,76 @@ async fn process_client_msg(
             action,
             count,
         } => {
-            let (
-                tmux_viewport_supported,
-                sender_is_viewing,
-                session_exists,
-                runtime,
-                tmux_socket,
-                tmux_session,
-                active_controller,
-            ) = {
-                let st = state.read().await;
-                let sender_is_viewing = st
-                    .mobile_views
-                    .get(&addr)
-                    .map(|views| views.contains(&session_id))
-                    .unwrap_or(false);
-                let session_meta = st.sessions.get(&session_id).map(|session| {
-                    (
-                        session.runtime.clone(),
-                        session.tmux_socket.clone(),
-                        session.tmux_session.clone(),
-                    )
-                });
-                let (runtime, tmux_socket, tmux_session) = session_meta
-                    .clone()
-                    .map(|session| (session.0, session.1, session.2))
-                    .unwrap_or_else(|| ("pty".to_string(), None, None));
-                (
-                    st.tmux_viewport_supported,
-                    sender_is_viewing,
-                    session_meta.is_some(),
-                    runtime,
-                    tmux_socket,
-                    tmux_session,
-                    st.tmux_viewport_controllers.get(&session_id).copied(),
-                )
-            };
-
-            if !session_exists {
-                let msg = ServerMessage::Error {
-                    code: "session_not_found".to_string(),
-                    message: format!("Session {} not found", session_id),
-                };
-                tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
-                return Ok(());
-            }
-
-            if !tmux_viewport_supported {
-                let msg = ServerMessage::Error {
-                    code: "tmux_viewport_disabled".to_string(),
-                    message: "tmux shared viewport control is disabled".to_string(),
-                };
-                tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
-                return Ok(());
-            }
-
-            if runtime != "tmux" {
-                let msg = ServerMessage::Error {
-                    code: "unsupported_runtime".to_string(),
-                    message: "tmux viewport controls require a tmux runtime session".to_string(),
-                };
-                tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
-                return Ok(());
-            }
-
-            let unauthorized = !sender_is_viewing
-                || matches!(active_controller, Some(controller) if controller != addr);
-            if unauthorized {
-                let msg = ServerMessage::Error {
-                    code: "unauthorized_viewport".to_string(),
-                    message: "viewport control requires the active mobile controller".to_string(),
-                };
-                tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
-                return Ok(());
-            }
-
-            {
+            let auth_result: Result<(Option<String>, Option<String>), (&str, String)> = {
                 let mut st = state.write().await;
-                st.tmux_viewport_controllers
-                    .insert(session_id.clone(), addr);
-            }
+                if !st.tmux_viewport_supported {
+                    Err((
+                        "tmux_viewport_disabled",
+                        "tmux shared viewport control is disabled".to_string(),
+                    ))
+                } else {
+                    let sender_is_viewing = st
+                        .mobile_views
+                        .get(&addr)
+                        .map(|views| views.contains(&session_id))
+                        .unwrap_or(false);
+                    match st.sessions.get(&session_id) {
+                        None => {
+                            let message = format!("Session {} not found", session_id);
+                            Err(("session_not_found", message))
+                        }
+                        Some(session) => {
+                            let runtime = session.runtime.clone();
+                            let tmux_socket = session.tmux_socket.clone();
+                            let tmux_session = session.tmux_session.clone();
+
+                            if runtime != "tmux" {
+                                Err((
+                                    "unsupported_runtime",
+                                    "tmux viewport controls require a tmux runtime session"
+                                        .to_string(),
+                                ))
+                            } else if !sender_is_viewing {
+                                Err((
+                                    "unauthorized_viewport",
+                                    "viewport control requires the active mobile controller"
+                                        .to_string(),
+                                ))
+                            } else {
+                                match st.tmux_viewport_controllers.entry(session_id.clone()) {
+                                    std::collections::hash_map::Entry::Occupied(entry)
+                                        if *entry.get() != addr =>
+                                    {
+                                        Err((
+                                            "unauthorized_viewport",
+                                            "viewport control requires the active mobile controller"
+                                                .to_string(),
+                                        ))
+                                    }
+                                    std::collections::hash_map::Entry::Occupied(_) => {
+                                        Ok((tmux_socket, tmux_session))
+                                    }
+                                    std::collections::hash_map::Entry::Vacant(entry) => {
+                                        entry.insert(addr);
+                                        Ok((tmux_socket, tmux_session))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            let (tmux_socket, tmux_session) = match auth_result {
+                Ok(values) => values,
+                Err((code, message)) => {
+                    let msg = ServerMessage::Error {
+                        code: code.to_string(),
+                        message,
+                    };
+                    tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                    return Ok(());
+                }
+            };
 
             let Some(socket) = tmux_socket else {
                 let msg = ServerMessage::Error {
