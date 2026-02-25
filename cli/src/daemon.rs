@@ -136,8 +136,63 @@ const HISTORY_SCROLLBACK_LINES: usize = 200_000;
 const ALT_ENTER_SEQS: &[&[u8]] = &[b"\x1b[?1049h", b"\x1b[?1047h", b"\x1b[?47h"];
 const ALT_LEAVE_SEQS: &[&[u8]] = &[b"\x1b[?1049l", b"\x1b[?1047l", b"\x1b[?47l"];
 const ALT_TRACK_TAIL_BYTES: usize = 7;
-const FRAME_CURSOR_THRESHOLD: u32 = 80;
-const FRAME_ERASE_THRESHOLD: u32 = 40;
+const SNAPSHOT_CHUNK_BYTES: usize = 48 * 1024;
+const CLIENT_CAP_ATTACH_V2: u32 = 1 << 0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttachProtocolMode {
+    V1,
+    V2,
+}
+
+impl AttachProtocolMode {
+    fn from_env() -> Self {
+        match std::env::var("MOBILECLI_ATTACH_PROTOCOL")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("v1") => Self::V1,
+            Some("v2") => Self::V2,
+            _ => Self::V2,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::V1 => "v1",
+            Self::V2 => "v2",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct OverhaulFlags {
+    pub attach_protocol: AttachProtocolMode,
+    pub enable_local_echo: bool,
+    pub resize_simplified: bool,
+}
+
+impl OverhaulFlags {
+    pub fn from_env() -> Self {
+        Self {
+            attach_protocol: AttachProtocolMode::from_env(),
+            enable_local_echo: env_flag("MOBILECLI_ENABLE_LOCAL_ECHO", false),
+            resize_simplified: env_flag("MOBILECLI_RESIZE_SIMPLIFIED", true),
+        }
+    }
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default,
+        },
+        Err(_) => default,
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct ResizeRequest {
@@ -175,17 +230,12 @@ pub struct PtySession {
     /// Tail bytes from prior chunk used to detect alt-screen escape sequences
     /// split across PTY read boundaries.
     pub alt_track_tail: Vec<u8>,
-    /// Cumulative count of absolute cursor-position operations (CSI ... H).
-    pub frame_cursor_pos_count: u32,
-    /// Cumulative count of erase-line operations (CSI ... K).
-    pub frame_erase_line_count: u32,
-    /// True for frame-rendered CLIs (full-screen style) even when they don't
-    /// use alternate screen sequences like ?1049h/?1049l.
-    pub frame_render_mode: bool,
     /// Latest accepted resize epoch from mobile (for stale resize rejection).
     pub last_resize_epoch: u64,
     /// Last dimensions acknowledged by the PTY wrapper.
     pub last_applied_size: Option<(u16, u16)>,
+    /// Sequence number for live PTY chunks (Phase 0 observability scaffold).
+    pub live_seq: u64,
     /// Tail for raw mobile input filtering to handle escape sequences split
     /// across websocket messages.
     pub raw_input_tail: Vec<u8>,
@@ -194,18 +244,19 @@ pub struct PtySession {
 /// Daemon shared state
 pub struct DaemonState {
     pub sessions: HashMap<String, PtySession>,
+    pub overhaul_flags: OverhaulFlags,
+    pub next_attach_id: u64,
     pub mobile_clients: HashMap<SocketAddr, mpsc::Sender<Message>>,
+    pub mobile_client_capabilities: HashMap<SocketAddr, u32>,
+    pub mobile_attach_ids: HashMap<SocketAddr, HashMap<String, u64>>,
     /// Mapping from logical mobile sender ID to current socket address.
     /// Used to evict stale/replaced websocket addresses on reconnect.
     pub mobile_sender_addrs: HashMap<String, SocketAddr>,
-    pub pty_broadcast: broadcast::Sender<(String, Vec<u8>)>,
+    pub pty_broadcast: broadcast::Sender<(String, u64, Vec<u8>)>,
     pub port: u16, // The actual port the daemon is running on
     pub push_tokens: Vec<PushToken>,
     pub mobile_views: HashMap<SocketAddr, std::collections::HashSet<String>>,
     pub session_view_counts: HashMap<String, usize>,
-    /// Sessions that should receive one deferred replay after first
-    /// post-subscribe PTY resize ack (per mobile client).
-    pub pending_tui_replay: HashMap<SocketAddr, std::collections::HashSet<String>>,
     pub file_system: std::sync::Arc<FileSystemService>,
     pub file_watch_subscriptions: HashMap<SocketAddr, std::collections::HashSet<String>>,
     pub file_watch_counts: HashMap<String, usize>,
@@ -232,14 +283,17 @@ impl DaemonState {
 
         Self {
             sessions: HashMap::new(),
+            overhaul_flags: OverhaulFlags::from_env(),
+            next_attach_id: 1,
             mobile_clients: HashMap::new(),
+            mobile_client_capabilities: HashMap::new(),
+            mobile_attach_ids: HashMap::new(),
             mobile_sender_addrs: HashMap::new(),
             pty_broadcast,
             port,
             push_tokens: Vec::new(),
             mobile_views: HashMap::new(),
             session_view_counts: HashMap::new(),
-            pending_tui_replay: HashMap::new(),
             file_system,
             file_watch_subscriptions: HashMap::new(),
             file_watch_counts: HashMap::new(),
@@ -266,6 +320,16 @@ pub async fn run(port: u16) -> std::io::Result<()> {
     std::fs::write(&port_path, port.to_string())?;
 
     let state: SharedState = Arc::new(RwLock::new(DaemonState::new(port)));
+    {
+        let st = state.read().await;
+        tracing::info!(
+            target: "overhaul.phase0",
+            attach_protocol = st.overhaul_flags.attach_protocol.as_str(),
+            enable_local_echo = st.overhaul_flags.enable_local_echo,
+            resize_simplified = st.overhaul_flags.resize_simplified,
+            "Loaded terminal overhaul Phase 0 flags"
+        );
+    }
 
     // Limit concurrent connections to prevent resource exhaustion
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(64));
@@ -551,11 +615,35 @@ async fn handle_mobile_client(
             // PTY output
             result = pty_rx.recv() => {
                 match result {
-                    Ok((session_id, data)) => {
-                        let msg = ServerMessage::PtyBytes {
-                            session_id,
-                            data: BASE64.encode(&data),
+                    Ok((session_id, seq, data)) => {
+                        let (flags, capabilities, attach_id) = {
+                            let st = state.read().await;
+                            let caps = st.mobile_client_capabilities.get(&addr).copied().unwrap_or(0);
+                            let attach_id = st
+                                .mobile_attach_ids
+                                .get(&addr)
+                                .and_then(|sessions| sessions.get(&session_id).copied());
+                            (st.overhaul_flags, caps, attach_id)
                         };
+
+                        let msg = if should_use_attach_v2(flags, capabilities) {
+                            let Some(attach_id) = attach_id else {
+                                continue;
+                            };
+                            ServerMessage::PtyChunk {
+                                session_id,
+                                attach_id,
+                                seq,
+                                data: BASE64.encode(&data),
+                                timestamp_ms: Utc::now().timestamp_millis().max(0) as u64,
+                            }
+                        } else {
+                            ServerMessage::PtyBytes {
+                                session_id,
+                                data: BASE64.encode(&data),
+                            }
+                        };
+
                         if tx.send(Message::Text(serde_json::to_string(&msg)?)).await.is_err() {
                             break;
                         }
@@ -643,7 +731,6 @@ async fn handle_pty_session(
     let pty_broadcast = {
         let mut cli_tracker = CliTracker::new();
         cli_tracker.update_from_command(&command);
-        let initial_frame_mode = cli_defaults_to_frame_mode(cli_tracker.current());
 
         let mut st = state.write().await;
         st.sessions.insert(
@@ -666,11 +753,9 @@ async fn handle_pty_session(
                 scrollback_max_bytes: DEFAULT_SCROLLBACK_MAX_BYTES,
                 in_alt_screen: false,
                 alt_track_tail: Vec::new(),
-                frame_cursor_pos_count: 0,
-                frame_erase_line_count: 0,
-                frame_render_mode: initial_frame_mode,
                 last_resize_epoch: 0,
                 last_applied_size: None,
+                live_seq: 0,
                 raw_input_tail: Vec::new(),
             },
         );
@@ -699,12 +784,13 @@ async fn handle_pty_session(
                             if msg["type"].as_str() == Some("pty_output") {
                                 if let Some(data) = msg["data"].as_str() {
                                     if let Ok(bytes) = BASE64.decode(data) {
-                                        let _ = pty_broadcast.send((session_id.clone(), bytes.clone()));
-
                                         // Accumulate scrollback and track render state.
+                                        let mut live_seq: Option<u64> = None;
                                         {
                                             let mut st = state.write().await;
                                             if let Some(session) = st.sessions.get_mut(&session_id) {
+                                                session.live_seq = session.live_seq.saturating_add(1);
+                                                live_seq = Some(session.live_seq);
                                                 session.scrollback.extend(bytes.iter().copied());
                                                 // Truncate from front if over limit (VecDeque is O(1) per pop)
                                                 while session.scrollback.len() > session.scrollback_max_bytes {
@@ -727,23 +813,20 @@ async fn handle_pty_session(
                                                         &bytes,
                                                     );
                                                 }
-                                                let was_frame = session.frame_render_mode;
-                                                update_frame_render_state(
-                                                    &mut session.frame_render_mode,
-                                                    &mut session.frame_cursor_pos_count,
-                                                    &mut session.frame_erase_line_count,
-                                                    &bytes,
-                                                );
-                                                if !was_frame && session.frame_render_mode {
-                                                    tracing::info!(
-                                                        session_id = %session_id,
-                                                        cursor_ops = session.frame_cursor_pos_count,
-                                                        erase_ops = session.frame_erase_line_count,
-                                                        "Detected frame-rendered session (non-alt); suppressing raw scrollback replay on subscribe"
-                                                    );
-                                                }
                                             }
                                         }
+                                        if let Some(seq) = live_seq {
+                                            tracing::trace!(
+                                                target: "overhaul.sequence",
+                                                session_id = %session_id,
+                                                seq,
+                                                chunk_bytes = bytes.len(),
+                                                "Forwarding live PTY chunk"
+                                            );
+                                        }
+                                        let seq = live_seq.unwrap_or(0);
+                                        let _ =
+                                            pty_broadcast.send((session_id.clone(), seq, bytes.clone()));
 
                                         let text = String::from_utf8_lossy(&bytes);
                                         let normalized_chunk = strip_ansi_and_normalize(&text);
@@ -848,7 +931,16 @@ async fn handle_pty_session(
                         }
                     }
                     Some(Ok(Message::Binary(data))) => {
-                        let _ = pty_broadcast.send((session_id.clone(), data));
+                        let seq = {
+                            let mut st = state.write().await;
+                            if let Some(session) = st.sessions.get_mut(&session_id) {
+                                session.live_seq = session.live_seq.saturating_add(1);
+                                session.live_seq
+                            } else {
+                                0
+                            }
+                        };
+                        let _ = pty_broadcast.send((session_id.clone(), seq, data));
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
@@ -899,6 +991,7 @@ async fn handle_pty_session(
                         }
                         if coalesced > 0 {
                             tracing::debug!(
+                                target: "overhaul.resize",
                                 session_id = %session_id,
                                 coalesced,
                                 cols = req.cols,
@@ -932,7 +1025,7 @@ async fn handle_pty_session(
     let was_present = {
         let mut st = state.write().await;
         if st.sessions.remove(&session_id).is_some() {
-            clear_pending_tui_replay_for_session(&mut st, &session_id);
+            clear_mobile_attach_for_session(&mut st, &session_id);
             // Notify about session end
             let msg = ServerMessage::SessionEnded {
                 session_id: session_id.clone(),
@@ -1394,6 +1487,7 @@ async fn process_client_msg(
         ClientMessage::Hello {
             client_version,
             sender_id,
+            client_capabilities,
         } => {
             // Already sent Welcome on connect, but log the client version
             tracing::debug!("Client hello, version: {}", client_version);
@@ -1418,45 +1512,66 @@ async fn process_client_msg(
                     evict_mobile_addr(state, previous_addr).await;
                 }
             }
+            if let Some(capabilities) = client_capabilities {
+                let mut st = state.write().await;
+                st.mobile_client_capabilities.insert(addr, capabilities);
+                tracing::debug!(
+                    addr = %addr,
+                    capabilities,
+                    supports_attach_v2 = client_supports_attach_v2(capabilities),
+                    "Registered mobile client capabilities"
+                );
+            }
         }
-        ClientMessage::Subscribe { session_id } => {
+        ClientMessage::Subscribe {
+            session_id,
+            last_seen_seq,
+            client_capabilities,
+        } => {
             tracing::debug!("Client subscribed to session: {}", session_id);
+            let attach_started = std::time::Instant::now();
             let mut st = state.write().await;
+            if let Some(capabilities) = client_capabilities {
+                st.mobile_client_capabilities.insert(addr, capabilities);
+            }
+            let attach_id = st.next_attach_id;
+            st.next_attach_id = st.next_attach_id.saturating_add(1);
+            let overhaul_flags = st.overhaul_flags;
+            let capabilities = st
+                .mobile_client_capabilities
+                .get(&addr)
+                .copied()
+                .unwrap_or(0);
+            let use_attach_v2 = should_use_attach_v2(overhaul_flags, capabilities);
 
             // Collect session state under one lock, then drop it before sending.
             let (
                 scrollback_bytes,
                 render_as_tui,
                 mobile_in_alt_screen,
-                queue_deferred_replay,
                 scrollback_len,
                 runtime,
                 tmux_snapshot_req,
-                tmux_fallback_bytes,
+                initial_live_seq,
+                ready_cols,
+                ready_rows,
             ) = if let Some(session) = st.sessions.get(&session_id) {
-                let render_as_tui = should_treat_as_tui_for_mobile(
-                    &session.runtime,
-                    session.in_alt_screen,
-                    session.frame_render_mode,
-                );
-                let mobile_in_alt_screen = should_mobile_enter_alt_screen(
-                    &session.runtime,
-                    session.in_alt_screen,
-                    session.frame_render_mode,
-                );
+                let render_as_tui =
+                    should_treat_as_tui_for_mobile(&session.runtime, session.in_alt_screen);
+                let mobile_in_alt_screen =
+                    should_mobile_enter_alt_screen(&session.runtime, session.in_alt_screen);
                 let has_scrollback = !session.scrollback.is_empty();
                 let runtime = session.runtime.clone();
-                // tmux sessions always replay from capture-pane. For frame-rendering
-                // CLIs we request only the visible pane; for text CLIs we include
-                // deeper scrollback.
-                let frame_render = session.frame_render_mode;
+                // tmux sessions always replay from capture-pane. Alternate-screen
+                // sessions replay only the visible pane; main-screen sessions may
+                // include scrollback.
                 let tmux_snapshot_req = if runtime == "tmux" {
                     match (&session.tmux_socket, &session.tmux_session) {
                         (Some(socket), Some(name)) => Some((
                             socket.clone(),
                             name.clone(),
                             session.scrollback_max_bytes,
-                            !frame_render,
+                            !session.in_alt_screen,
                         )),
                         _ => None,
                     }
@@ -1468,56 +1583,70 @@ async fn process_client_msg(
                 } else {
                     None
                 };
-                // Daemon in-memory fallback when capture-pane is unavailable
-                // (socket startup race, etc.).
-                let tmux_fallback = if runtime == "tmux" && has_scrollback {
-                    Some(session.scrollback.iter().copied().collect::<Vec<u8>>())
-                } else {
-                    None
-                };
+                let (ready_cols, ready_rows) = session.last_applied_size.unwrap_or((0, 0));
                 (
                     sb,
                     render_as_tui,
                     mobile_in_alt_screen,
-                    // tmux sessions use capture-pane snapshots; raw deferred replay
-                    // of daemon scrollback corrupts TUIs on reconnect.
-                    runtime != "tmux" && render_as_tui && has_scrollback,
                     session.scrollback.len(),
                     runtime,
                     tmux_snapshot_req,
-                    tmux_fallback,
+                    session.live_seq,
+                    ready_cols,
+                    ready_rows,
                 )
             } else {
-                (None, false, false, false, 0, "pty".to_string(), None, None)
+                (None, false, false, 0, "pty".to_string(), None, 0, 0, 0)
             };
 
-            if queue_deferred_replay {
-                st.pending_tui_replay
-                    .entry(addr)
-                    .or_default()
-                    .insert(session_id.clone());
-            } else {
-                let mut remove_entry = false;
-                if let Some(pending) = st.pending_tui_replay.get_mut(&addr) {
-                    pending.remove(&session_id);
-                    remove_entry = pending.is_empty();
-                }
-                if remove_entry {
-                    st.pending_tui_replay.remove(&addr);
-                }
-            }
             tracing::debug!(
                 session_id = %session_id,
                 addr = %addr,
+                attach_id,
                 runtime = %runtime,
+                capabilities,
+                use_attach_v2,
+                last_seen_seq = ?last_seen_seq,
                 render_as_tui,
                 mobile_in_alt_screen,
-                queue_deferred_replay,
                 scrollback_len,
                 text_replay_bytes = scrollback_bytes.as_ref().map(|b| b.len()).unwrap_or(0),
                 "Subscribe replay decision"
             );
             drop(st);
+            tracing::info!(
+                target: "overhaul.attach",
+                session_id = %session_id,
+                addr = %addr,
+                attach_id,
+                runtime = %runtime,
+                protocol = overhaul_flags.attach_protocol.as_str(),
+                use_attach_v2,
+                last_seen_seq = ?last_seen_seq,
+                "Attach sequence started"
+            );
+            let clear_mode = if mobile_in_alt_screen {
+                "alternate_screen"
+            } else {
+                "main_screen"
+            };
+            let mut replay_events: Vec<(&'static str, usize)> = Vec::new();
+            if use_attach_v2 {
+                let begin = ServerMessage::AttachBegin {
+                    session_id: session_id.clone(),
+                    attach_id,
+                    runtime: runtime.clone(),
+                    mode: if last_seen_seq.is_some() {
+                        "reconnect".to_string()
+                    } else {
+                        "fresh".to_string()
+                    },
+                    in_alt_screen: mobile_in_alt_screen,
+                };
+                if let Ok(text) = serde_json::to_string(&begin) {
+                    let _ = tx.send(Message::Text(text)).await;
+                }
+            }
 
             // ── Step 1: wipe mobile's xterm.js buffer ──────────────────
             //
@@ -1528,24 +1657,42 @@ async fn process_client_msg(
             // replay starts from a deterministic baseline.
             //
             {
-                let clear: &[u8] = if mobile_in_alt_screen {
-                    // \x1b[?1049h  enter alternate screen
-                    // \x1b[2J      erase display
-                    // \x1b[H       cursor home
-                    b"\x1b[?1049h\x1b[2J\x1b[H"
+                if use_attach_v2 {
+                    let clear = ServerMessage::AttachClear {
+                        session_id: session_id.clone(),
+                        attach_id,
+                    };
+                    if let Ok(text) = serde_json::to_string(&clear) {
+                        let _ = tx.send(Message::Text(text)).await;
+                    }
                 } else {
-                    // \x1b[2J      erase display
-                    // \x1b[3J      erase scrollback (xterm extension, supported by xterm.js)
-                    // \x1b[H       cursor home
-                    b"\x1b[2J\x1b[3J\x1b[H"
-                };
-                let clear_msg = ServerMessage::PtyBytes {
-                    session_id: session_id.clone(),
-                    data: BASE64.encode(clear),
-                };
-                if let Ok(text) = serde_json::to_string(&clear_msg) {
-                    let _ = tx.send(Message::Text(text)).await;
+                    let clear: &[u8] = if mobile_in_alt_screen {
+                        // \x1b[?1049h  enter alternate screen
+                        // \x1b[2J      erase display
+                        // \x1b[H       cursor home
+                        b"\x1b[?1049h\x1b[2J\x1b[H"
+                    } else {
+                        // \x1b[2J      erase display
+                        // \x1b[3J      erase scrollback (xterm extension, supported by xterm.js)
+                        // \x1b[H       cursor home
+                        b"\x1b[2J\x1b[3J\x1b[H"
+                    };
+                    let clear_msg = ServerMessage::PtyBytes {
+                        session_id: session_id.clone(),
+                        data: BASE64.encode(clear),
+                    };
+                    if let Ok(text) = serde_json::to_string(&clear_msg) {
+                        let _ = tx.send(Message::Text(text)).await;
+                    }
                 }
+                tracing::info!(
+                    target: "overhaul.attach",
+                    session_id = %session_id,
+                    attach_id,
+                    clear_mode,
+                    clear_bytes = if use_attach_v2 { 0 } else if mobile_in_alt_screen { b"\x1b[?1049h\x1b[2J\x1b[H".len() } else { b"\x1b[2J\x1b[3J\x1b[H".len() },
+                    "Attach clear frame sent"
+                );
             }
 
             // ── Step 2: replay history ────────────────────────────────────
@@ -1553,18 +1700,59 @@ async fn process_client_msg(
             // PTY text sessions replay daemon scrollback.
             if !render_as_tui {
                 if let Some(bytes) = scrollback_bytes {
-                    let msg = ServerMessage::PtyBytes {
-                        session_id: session_id.clone(),
-                        data: BASE64.encode(&bytes),
-                    };
-                    if let Ok(text) = serde_json::to_string(&msg) {
-                        let _ = tx.send(Message::Text(text)).await;
+                    replay_events.push(("daemon_scrollback", bytes.len()));
+                    if use_attach_v2 {
+                        let chunks = chunk_snapshot_payload(&bytes);
+                        let total_chunks = chunks.len().max(1) as u32;
+                        if chunks.is_empty() {
+                            let msg = ServerMessage::AttachSnapshotChunk {
+                                session_id: session_id.clone(),
+                                attach_id,
+                                chunk_seq: 1,
+                                total_chunks,
+                                is_last: true,
+                                data: String::new(),
+                            };
+                            if let Ok(text) = serde_json::to_string(&msg) {
+                                let _ = tx.send(Message::Text(text)).await;
+                            }
+                        } else {
+                            for (idx, chunk) in chunks.into_iter().enumerate() {
+                                let msg = ServerMessage::AttachSnapshotChunk {
+                                    session_id: session_id.clone(),
+                                    attach_id,
+                                    chunk_seq: (idx + 1) as u32,
+                                    total_chunks,
+                                    is_last: idx + 1 == total_chunks as usize,
+                                    data: chunk,
+                                };
+                                if let Ok(text) = serde_json::to_string(&msg) {
+                                    let _ = tx.send(Message::Text(text)).await;
+                                }
+                            }
+                        }
+                    } else {
+                        let msg = ServerMessage::PtyBytes {
+                            session_id: session_id.clone(),
+                            data: BASE64.encode(&bytes),
+                        };
+                        if let Ok(text) = serde_json::to_string(&msg) {
+                            let _ = tx.send(Message::Text(text)).await;
+                        }
                     }
+                    tracing::info!(
+                        target: "overhaul.attach",
+                        session_id = %session_id,
+                        attach_id,
+                        replay_source = "daemon_scrollback",
+                        replay_bytes = bytes.len(),
+                        "Attach replay sent"
+                    );
                 }
             }
 
             // tmux sessions always get an authoritative pane snapshot on
-            // subscribe. Frame-rendered CLIs request visible pane only.
+            // subscribe.
             if let Some((socket, name, max_bytes, include_scrollback)) = tmux_snapshot_req {
                 let max_lines = if include_scrollback {
                     SUBSCRIBE_SCROLLBACK_LINES
@@ -1578,41 +1766,105 @@ async fn process_client_msg(
                     let total_bytes = snapshot.len();
                     let skip = total_bytes.saturating_sub(max_bytes);
                     let bytes = &snapshot[skip..];
-                    let msg = ServerMessage::SessionHistory {
-                        session_id: session_id.clone(),
-                        data: BASE64.encode(bytes),
-                        total_bytes,
-                    };
-                    if let Ok(text) = serde_json::to_string(&msg) {
-                        let _ = tx.send(Message::Text(text)).await;
+                    replay_events.push(("tmux_capture_pane", bytes.len()));
+                    if use_attach_v2 {
+                        let chunks = chunk_snapshot_payload(bytes);
+                        let total_chunks = chunks.len().max(1) as u32;
+                        if chunks.is_empty() {
+                            let msg = ServerMessage::AttachSnapshotChunk {
+                                session_id: session_id.clone(),
+                                attach_id,
+                                chunk_seq: 1,
+                                total_chunks,
+                                is_last: true,
+                                data: String::new(),
+                            };
+                            if let Ok(text) = serde_json::to_string(&msg) {
+                                let _ = tx.send(Message::Text(text)).await;
+                            }
+                        } else {
+                            for (idx, chunk) in chunks.into_iter().enumerate() {
+                                let msg = ServerMessage::AttachSnapshotChunk {
+                                    session_id: session_id.clone(),
+                                    attach_id,
+                                    chunk_seq: (idx + 1) as u32,
+                                    total_chunks,
+                                    is_last: idx + 1 == total_chunks as usize,
+                                    data: chunk,
+                                };
+                                if let Ok(text) = serde_json::to_string(&msg) {
+                                    let _ = tx.send(Message::Text(text)).await;
+                                }
+                            }
+                        }
+                    } else {
+                        let msg = ServerMessage::SessionHistory {
+                            session_id: session_id.clone(),
+                            data: BASE64.encode(bytes),
+                            total_bytes,
+                        };
+                        if let Ok(text) = serde_json::to_string(&msg) {
+                            let _ = tx.send(Message::Text(text)).await;
+                        }
                     }
-                } else if let Some(fallback) = tmux_fallback_bytes {
-                    tracing::debug!(
+                    tracing::info!(
+                        target: "overhaul.attach",
                         session_id = %session_id,
-                        fallback_bytes = fallback.len(),
-                        "capture-pane failed; using daemon scrollback fallback"
+                        attach_id,
+                        replay_source = "tmux_capture_pane",
+                        replay_bytes = bytes.len(),
+                        total_snapshot_bytes = total_bytes,
+                        "Attach replay sent"
                     );
-                    let total_bytes = fallback.len();
-                    let msg = ServerMessage::SessionHistory {
-                        session_id: session_id.clone(),
-                        data: BASE64.encode(&fallback),
-                        total_bytes,
-                    };
-                    if let Ok(text) = serde_json::to_string(&msg) {
-                        let _ = tx.send(Message::Text(text)).await;
-                    }
+                } else {
+                    tracing::warn!(
+                        target: "overhaul.attach",
+                        session_id = %session_id,
+                        attach_id,
+                        include_scrollback,
+                        "tmux capture-pane unavailable during attach replay"
+                    );
                 }
             }
 
             // Always send SubscribeAck so mobile knows whether to suppress
-            // stale bytes and enter alt-screen mode before resizing.
-            let ack = ServerMessage::SubscribeAck {
-                session_id: session_id.clone(),
-                in_alt_screen: mobile_in_alt_screen,
-                runtime: Some(runtime),
-            };
-            if let Ok(text) = serde_json::to_string(&ack) {
-                let _ = tx.send(Message::Text(text)).await;
+            // stale bytes and enter alt-screen mode before resizing (v1 path).
+            let runtime_for_log = runtime.clone();
+            if use_attach_v2 {
+                let ready_live_seq = {
+                    let st = state.read().await;
+                    st.sessions
+                        .get(&session_id)
+                        .map(|session| session.live_seq)
+                        .unwrap_or(initial_live_seq)
+                };
+                tracing::debug!(
+                    target: "overhaul.sequence",
+                    session_id = %session_id,
+                    attach_id,
+                    initial_live_seq,
+                    ready_live_seq,
+                    "Attach ready sequence barrier"
+                );
+                let ready = ServerMessage::AttachReady {
+                    session_id: session_id.clone(),
+                    attach_id,
+                    last_live_seq: ready_live_seq,
+                    cols: ready_cols,
+                    rows: ready_rows,
+                };
+                if let Ok(text) = serde_json::to_string(&ready) {
+                    let _ = tx.send(Message::Text(text)).await;
+                }
+            } else {
+                let ack = ServerMessage::SubscribeAck {
+                    session_id: session_id.clone(),
+                    in_alt_screen: mobile_in_alt_screen,
+                    runtime: Some(runtime),
+                };
+                if let Ok(text) = serde_json::to_string(&ack) {
+                    let _ = tx.send(Message::Text(text)).await;
+                }
             }
 
             // Register active view after initial clear/replay/ack sequence so
@@ -1620,20 +1872,63 @@ async fn process_client_msg(
             let mut st = state.write().await;
             let entry = st.mobile_views.entry(addr).or_default();
             if entry.insert(session_id.clone()) {
-                let count = st.session_view_counts.entry(session_id).or_insert(0);
+                let count = st
+                    .session_view_counts
+                    .entry(session_id.clone())
+                    .or_insert(0);
                 *count += 1;
             }
+            if use_attach_v2 {
+                st.mobile_attach_ids
+                    .entry(addr)
+                    .or_default()
+                    .insert(session_id.clone(), attach_id);
+            } else {
+                let mut remove_addr = false;
+                if let Some(attach_by_session) = st.mobile_attach_ids.get_mut(&addr) {
+                    attach_by_session.remove(&session_id);
+                    remove_addr = attach_by_session.is_empty();
+                }
+                if remove_addr {
+                    st.mobile_attach_ids.remove(&addr);
+                }
+            }
+            let replay_sources = if replay_events.is_empty() {
+                "none".to_string()
+            } else {
+                replay_events
+                    .iter()
+                    .map(|(source, _)| *source)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            let replay_bytes_total: usize = replay_events.iter().map(|(_, bytes)| *bytes).sum();
+            tracing::info!(
+                target: "overhaul.attach",
+                session_id = %session_id,
+                addr = %addr,
+                attach_id,
+                runtime = %runtime_for_log,
+                protocol = overhaul_flags.attach_protocol.as_str(),
+                use_attach_v2,
+                clear_mode,
+                replay_sources = %replay_sources,
+                replay_events = replay_events.len(),
+                replay_bytes_total,
+                duration_ms = attach_started.elapsed().as_millis() as u64,
+                "Attach sequence completed"
+            );
         }
         ClientMessage::Unsubscribe { session_id } => {
             tracing::debug!("Client unsubscribed from session: {}", session_id);
             let mut st = state.write().await;
-            let mut remove_entry = false;
-            if let Some(pending) = st.pending_tui_replay.get_mut(&addr) {
-                pending.remove(&session_id);
-                remove_entry = pending.is_empty();
+            let mut remove_attach_addr = false;
+            if let Some(attach_by_session) = st.mobile_attach_ids.get_mut(&addr) {
+                attach_by_session.remove(&session_id);
+                remove_attach_addr = attach_by_session.is_empty();
             }
-            if remove_entry {
-                st.pending_tui_replay.remove(&addr);
+            if remove_attach_addr {
+                st.mobile_attach_ids.remove(&addr);
             }
             if let Some(entry) = st.mobile_views.get_mut(&addr) {
                 if entry.remove(&session_id) {
@@ -1692,6 +1987,7 @@ async fn process_client_msg(
         } => {
             let reason = resolve_resize_reason(cols, rows, reason);
             let mut st = state.write().await;
+            let resize_simplified = st.overhaul_flags.resize_simplified;
             let is_restore = reason == PtyResizeReason::DetachRestore;
             let viewer_count = st
                 .session_view_counts
@@ -1709,6 +2005,7 @@ async fn process_client_msg(
                 should_ignore_resize_without_viewers(is_restore, viewer_count, reason);
             if ignore_no_viewer_resize {
                 tracing::debug!(
+                    target: "overhaul.resize",
                     session_id = %session_id,
                     cols,
                     rows,
@@ -1716,6 +2013,7 @@ async fn process_client_msg(
                     reason = reason.as_str(),
                     viewer_count,
                     sender_is_viewing,
+                    resize_simplified,
                     bootstrap_reason = matches!(reason, PtyResizeReason::AttachInit | PtyResizeReason::ReconnectSync),
                     decision = "ignored_no_active_viewers",
                     "Ignoring PTY resize with no active mobile viewers"
@@ -1727,6 +2025,7 @@ async fn process_client_msg(
             // other viewers are still attached to this session.
             if should_ignore_restore_resize(is_restore, viewer_count, sender_is_viewing) {
                 tracing::debug!(
+                    target: "overhaul.resize",
                     session_id = %session_id,
                     cols,
                     rows,
@@ -1734,6 +2033,7 @@ async fn process_client_msg(
                     reason = reason.as_str(),
                     viewer_count,
                     sender_is_viewing,
+                    resize_simplified,
                     decision = "ignored_restore_guard",
                     "Ignoring PTY restore while active viewers remain"
                 );
@@ -1743,6 +2043,7 @@ async fn process_client_msg(
             if let Some(session) = st.sessions.get_mut(&session_id) {
                 if is_stale_resize_epoch(session.last_resize_epoch, epoch) {
                     tracing::debug!(
+                        target: "overhaul.resize",
                         session_id = %session_id,
                         cols,
                         rows,
@@ -1752,6 +2053,7 @@ async fn process_client_msg(
                         sender_is_viewing,
                         alt_screen = session.in_alt_screen,
                         last_epoch = session.last_resize_epoch,
+                        resize_simplified,
                         decision = "ignored_stale_epoch",
                         "Ignoring stale PTY resize"
                     );
@@ -1764,6 +2066,7 @@ async fn process_client_msg(
                 let ack_dims = session.last_applied_size.unwrap_or((cols, rows));
                 if reason == PtyResizeReason::KeyboardOverlay {
                     tracing::debug!(
+                        target: "overhaul.resize",
                         session_id = %session_id,
                         cols,
                         rows,
@@ -1772,47 +2075,14 @@ async fn process_client_msg(
                         viewer_count,
                         sender_is_viewing,
                         alt_screen = session.in_alt_screen,
+                        resize_simplified,
                         decision = "ignored_keyboard_overlay",
                         "Ignoring keyboard-overlay resize (local UX only)"
                     );
                     synthetic_ack = Some((ack_dims.0, ack_dims.1, epoch));
                 } else if is_noop_resize(session.last_applied_size, cols, rows) {
-                    if should_force_noop_resize(reason) {
-                        tracing::debug!(
-                            session_id = %session_id,
-                            cols,
-                            rows,
-                            epoch = ?epoch,
-                            reason = reason.as_str(),
-                            viewer_count,
-                            sender_is_viewing,
-                            alt_screen = session.in_alt_screen,
-                            decision = "forwarded_noop_refresh",
-                            "Forwarding no-op PTY resize to force redraw"
-                        );
-                        let _ = session.resize_tx.send(ResizeRequest {
-                            cols,
-                            rows,
-                            epoch,
-                            reason,
-                        });
-                    } else {
-                        tracing::debug!(
-                            session_id = %session_id,
-                            cols,
-                            rows,
-                            epoch = ?epoch,
-                            reason = reason.as_str(),
-                            viewer_count,
-                            sender_is_viewing,
-                            alt_screen = session.in_alt_screen,
-                            decision = "ignored_noop",
-                            "Ignoring no-op PTY resize"
-                        );
-                        synthetic_ack = Some((ack_dims.0, ack_dims.1, epoch));
-                    }
-                } else {
                     tracing::debug!(
+                        target: "overhaul.resize",
                         session_id = %session_id,
                         cols,
                         rows,
@@ -1821,6 +2091,23 @@ async fn process_client_msg(
                         viewer_count,
                         sender_is_viewing,
                         alt_screen = session.in_alt_screen,
+                        resize_simplified,
+                        decision = "ignored_noop",
+                        "Ignoring no-op PTY resize"
+                    );
+                    synthetic_ack = Some((ack_dims.0, ack_dims.1, epoch));
+                } else {
+                    tracing::debug!(
+                        target: "overhaul.resize",
+                        session_id = %session_id,
+                        cols,
+                        rows,
+                        epoch = ?epoch,
+                        reason = reason.as_str(),
+                        viewer_count,
+                        sender_is_viewing,
+                        alt_screen = session.in_alt_screen,
+                        resize_simplified,
                         decision = "forwarded",
                         "Forwarding PTY resize to wrapper"
                     );
@@ -1891,7 +2178,7 @@ async fn process_client_msg(
                     drop(session);
                     // Clean up view counts for this session
                     st.session_view_counts.remove(&session_id);
-                    clear_pending_tui_replay_for_session(&mut st, &session_id);
+                    clear_mobile_attach_for_session(&mut st, &session_id);
                     for views in st.mobile_views.values_mut() {
                         views.remove(&session_id);
                     }
@@ -2006,22 +2293,17 @@ async fn process_client_msg(
                 let st = state.read().await;
                 if let Some(session) = st.sessions.get(&session_id) {
                     let max = max_bytes.unwrap_or(session.scrollback_max_bytes);
-                    let render_as_tui = should_treat_as_tui_for_mobile(
-                        &session.runtime,
-                        session.in_alt_screen,
-                        session.frame_render_mode,
-                    );
+                    let render_as_tui =
+                        should_treat_as_tui_for_mobile(&session.runtime, session.in_alt_screen);
                     if session.runtime == "tmux" {
                         if let (Some(socket), Some(name)) =
                             (session.tmux_socket.clone(), session.tmux_session.clone())
                         {
                             tmux_capture_req = Some((socket, name, max, !render_as_tui));
                         }
-                        tail_scrollback_bytes(session, max)
+                        (Vec::new(), 0)
                     } else if render_as_tui {
-                        // PTY frame-rendering sessions can only safely replay
-                        // their live stream; historical replay is often malformed
-                        // after geometry changes.
+                        // PTY alternate-screen sessions are live-only.
                         (Vec::new(), 0)
                     } else {
                         tail_scrollback_bytes(session, max)
@@ -2031,39 +2313,37 @@ async fn process_client_msg(
                 }
             };
 
-            let (data, total_bytes) = if let Some((socket, name, max, include_scrollback)) =
-                tmux_capture_req
-            {
-                // On-demand history requests use the full depth so users can
-                // retrieve the maximum available scrollback from tmux.
-                let max_lines = if include_scrollback {
-                    HISTORY_SCROLLBACK_LINES
-                } else {
-                    0
-                };
-                if let Some(snapshot) =
-                    capture_tmux_history_with_retry(socket, name, include_scrollback, max_lines)
-                        .await
-                {
-                    let total = snapshot.len();
-                    let skip = total.saturating_sub(max);
-                    (BASE64.encode(&snapshot[skip..]), total)
+            let (data, total_bytes) =
+                if let Some((socket, name, max, include_scrollback)) = tmux_capture_req {
+                    // On-demand history requests use the full depth so users can
+                    // retrieve the maximum available scrollback from tmux.
+                    let max_lines = if include_scrollback {
+                        HISTORY_SCROLLBACK_LINES
+                    } else {
+                        0
+                    };
+                    if let Some(snapshot) =
+                        capture_tmux_history_with_retry(socket, name, include_scrollback, max_lines)
+                            .await
+                    {
+                        let total = snapshot.len();
+                        let skip = total.saturating_sub(max);
+                        (BASE64.encode(&snapshot[skip..]), total)
+                    } else {
+                        tracing::warn!(
+                            session_id = %session_id,
+                            "tmux capture-pane unavailable for session_history request"
+                        );
+                        (String::new(), 0)
+                    }
                 } else {
                     tracing::debug!(
                         session_id = %session_id,
                         fallback_total_bytes = fallback_total_bytes,
-                        "tmux capture-pane unavailable, falling back to daemon scrollback replay"
+                        "Using daemon scrollback replay for session_history"
                     );
                     (BASE64.encode(&fallback_bytes), fallback_total_bytes)
-                }
-            } else {
-                tracing::debug!(
-                    session_id = %session_id,
-                    fallback_total_bytes = fallback_total_bytes,
-                    "Using daemon scrollback replay for session_history"
-                );
-                (BASE64.encode(&fallback_bytes), fallback_total_bytes)
-            };
+                };
 
             let msg = ServerMessage::SessionHistory {
                 session_id,
@@ -3009,91 +3289,31 @@ async fn broadcast_pty_resized(
         return;
     };
 
-    let mut ack_clients: Vec<mpsc::Sender<Message>> = Vec::new();
-    let mut replay_clients: Vec<mpsc::Sender<Message>> = Vec::new();
-    let mut replay_payload: Option<String> = None;
-    let mut replay_scrollback_len = 0usize;
-
-    {
-        let mut st = state.write().await;
-        let viewing_addrs: Vec<SocketAddr> = st
-            .mobile_views
+    let ack_clients: Vec<mpsc::Sender<Message>> = {
+        let st = state.read().await;
+        st.mobile_views
             .iter()
-            .filter_map(|(addr, views)| views.contains(session_id).then_some(*addr))
-            .collect();
-
-        if !viewing_addrs.is_empty() {
-            for addr in &viewing_addrs {
-                if let Some(client) = st.mobile_clients.get(addr) {
-                    ack_clients.push(client.clone());
+            .filter_map(|(addr, views)| {
+                if !views.contains(session_id) {
+                    return None;
                 }
-            }
-
-            let replay_addrs: Vec<SocketAddr> = viewing_addrs
-                .iter()
-                .copied()
-                .filter(|addr| {
-                    st.pending_tui_replay
-                        .get(addr)
-                        .map(|pending| pending.contains(session_id))
-                        .unwrap_or(false)
-                })
-                .collect();
-
-            if !replay_addrs.is_empty() {
-                if let Some(session) = st.sessions.get(session_id) {
-                    if session.runtime != "tmux" && !session.scrollback.is_empty() {
-                        replay_scrollback_len = session.scrollback.len();
-                        let bytes: Vec<u8> = session.scrollback.iter().copied().collect();
-                        let replay_msg = ServerMessage::PtyBytes {
-                            session_id: session_id.to_string(),
-                            data: BASE64.encode(&bytes),
-                        };
-                        replay_payload = serde_json::to_string(&replay_msg).ok();
-                    } else if session.runtime == "tmux" {
-                        tracing::debug!(
-                            session_id = %session_id,
-                            "Skipping deferred raw replay for tmux runtime; mobile will request capture-pane snapshot"
-                        );
-                    }
-                }
-
-                for addr in replay_addrs {
-                    if let Some(client) = st.mobile_clients.get(&addr) {
-                        replay_clients.push(client.clone());
-                    }
-                    let mut remove_entry = false;
-                    if let Some(pending) = st.pending_tui_replay.get_mut(&addr) {
-                        pending.remove(session_id);
-                        remove_entry = pending.is_empty();
-                    }
-                    if remove_entry {
-                        st.pending_tui_replay.remove(&addr);
-                    }
-                }
-            }
-        }
-    }
+                st.mobile_clients.get(addr).cloned()
+            })
+            .collect()
+    };
 
     tracing::debug!(
+        target: "overhaul.resize",
         session_id = %session_id,
         cols,
         rows,
         epoch = ?epoch,
         ack_clients = ack_clients.len(),
-        replay_clients = replay_clients.len(),
-        replay_scrollback_len,
-        replay_payload_len = replay_payload.as_ref().map(|s| s.len()).unwrap_or(0),
         "Broadcasted pty_resized"
     );
 
     for client in ack_clients {
         let _ = client.try_send(Message::Text(msg_str.clone()));
-    }
-    if let Some(payload) = replay_payload {
-        for client in replay_clients {
-            let _ = client.try_send(Message::Text(payload.clone()));
-        }
     }
 }
 
@@ -3158,6 +3378,36 @@ fn tail_scrollback_bytes(session: &PtySession, max_bytes: usize) -> (Vec<u8>, us
     let skip = total.saturating_sub(max_bytes);
     let bytes: Vec<u8> = session.scrollback.iter().skip(skip).copied().collect();
     (bytes, total)
+}
+
+fn client_supports_attach_v2(capabilities: u32) -> bool {
+    capabilities & CLIENT_CAP_ATTACH_V2 != 0
+}
+
+fn should_use_attach_v2(flags: OverhaulFlags, capabilities: u32) -> bool {
+    flags.attach_protocol == AttachProtocolMode::V2 && client_supports_attach_v2(capabilities)
+}
+
+fn chunk_snapshot_payload(data: &[u8]) -> Vec<String> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+    data.chunks(SNAPSHOT_CHUNK_BYTES)
+        .map(|chunk| BASE64.encode(chunk))
+        .collect()
+}
+
+fn clear_mobile_attach_for_session(st: &mut DaemonState, session_id: &str) {
+    let mut remove_addrs = Vec::new();
+    for (addr, attach_by_session) in st.mobile_attach_ids.iter_mut() {
+        attach_by_session.remove(session_id);
+        if attach_by_session.is_empty() {
+            remove_addrs.push(*addr);
+        }
+    }
+    for addr in remove_addrs {
+        st.mobile_attach_ids.remove(&addr);
+    }
 }
 
 fn capture_tmux_history_blocking(
@@ -3362,13 +3612,6 @@ fn is_noop_resize(last_applied: Option<(u16, u16)>, cols: u16, rows: u16) -> boo
     last_applied == Some((cols, rows))
 }
 
-fn should_force_noop_resize(reason: PtyResizeReason) -> bool {
-    matches!(
-        reason,
-        PtyResizeReason::AttachInit | PtyResizeReason::ReconnectSync
-    )
-}
-
 fn should_ignore_resize_without_viewers(
     is_restore: bool,
     viewer_count: usize,
@@ -3384,35 +3627,23 @@ fn should_ignore_resize_without_viewers(
     )
 }
 
-fn should_treat_as_tui_for_mobile(
-    runtime: &str,
-    in_alt_screen: bool,
-    frame_render_mode: bool,
-) -> bool {
+fn should_treat_as_tui_for_mobile(runtime: &str, in_alt_screen: bool) -> bool {
+    // tmux runtime intentionally keeps alternate-screen disabled so pane
+    // snapshots remain canonical and replay-safe.
     if runtime == "tmux" {
-        // tmux runtime keeps alternate-screen disabled at bootstrap, so use
-        // frame-render mode as the TUI gate.
-        return frame_render_mode;
+        return false;
     }
-    in_alt_screen || frame_render_mode
+    in_alt_screen
 }
 
-fn should_mobile_enter_alt_screen(
-    runtime: &str,
-    in_alt_screen: bool,
-    frame_render_mode: bool,
-) -> bool {
+fn should_mobile_enter_alt_screen(runtime: &str, in_alt_screen: bool) -> bool {
     // tmux runtime intentionally disables alternate-screen at the host level.
     // Ignore raw 1049/1047 bytes from pane output and keep mobile in main
     // buffer for deterministic replay + scrollback behavior.
     if runtime == "tmux" {
         return false;
     }
-    // Preserve real alternate-screen behavior for non-tmux runtimes.
-    if in_alt_screen {
-        return true;
-    }
-    frame_render_mode
+    in_alt_screen
 }
 
 fn is_stale_resize_epoch(last_epoch: u64, incoming_epoch: Option<u64>) -> bool {
@@ -3444,79 +3675,6 @@ fn update_alt_screen_state(in_alt_screen: &mut bool, tail: &mut Vec<u8>, chunk: 
     let keep = ALT_TRACK_TAIL_BYTES.min(scan.len());
     tail.clear();
     tail.extend_from_slice(&scan[scan.len() - keep..]);
-}
-
-fn cli_defaults_to_frame_mode(cli: CliType) -> bool {
-    // Pre-set frame mode for known full-screen TUI apps so the very first
-    // mobile subscribe (before the output heuristic has seen enough frames)
-    // skips the desktop-width capture-pane and enters alt-screen immediately.
-    // The heuristic still runs and will detect any other frame-rendering app.
-    matches!(
-        cli,
-        CliType::Codex | CliType::OpenCode | CliType::Claude | CliType::Gemini
-    )
-}
-
-fn should_enable_frame_mode(cursor_ops: u32, erase_ops: u32) -> bool {
-    cursor_ops >= FRAME_CURSOR_THRESHOLD && erase_ops >= FRAME_ERASE_THRESHOLD
-}
-
-fn scan_frame_sequences(chunk: &[u8]) -> (u32, u32) {
-    let mut cursor_ops = 0u32;
-    let mut erase_ops = 0u32;
-    let mut i = 0usize;
-
-    while i + 2 < chunk.len() {
-        if chunk[i] != 0x1b || chunk[i + 1] != b'[' {
-            i += 1;
-            continue;
-        }
-
-        let mut j = i + 2;
-        while j < chunk.len() && (chunk[j].is_ascii_digit() || chunk[j] == b';' || chunk[j] == b'?')
-        {
-            j += 1;
-        }
-
-        if j >= chunk.len() {
-            break;
-        }
-
-        let final_byte = chunk[j];
-        let params = &chunk[i + 2..j];
-
-        if final_byte == b'H' && (params.is_empty() || params.contains(&b';')) {
-            cursor_ops += 1;
-        } else if final_byte == b'K' {
-            erase_ops += 1;
-        }
-
-        i = j + 1;
-    }
-
-    (cursor_ops, erase_ops)
-}
-
-fn update_frame_render_state(
-    frame_mode: &mut bool,
-    cursor_ops: &mut u32,
-    erase_ops: &mut u32,
-    chunk: &[u8],
-) {
-    if *frame_mode || chunk.is_empty() {
-        return;
-    }
-
-    let (cursor_inc, erase_inc) = scan_frame_sequences(chunk);
-    if cursor_inc == 0 && erase_inc == 0 {
-        return;
-    }
-
-    *cursor_ops = cursor_ops.saturating_add(cursor_inc);
-    *erase_ops = erase_ops.saturating_add(erase_inc);
-    if should_enable_frame_mode(*cursor_ops, *erase_ops) {
-        *frame_mode = true;
-    }
 }
 
 fn build_notification_text(
@@ -3566,7 +3724,8 @@ async fn cleanup_client_state(state: &SharedState, addr: SocketAddr) {
         for sender_id in stale_sender_ids {
             st.mobile_sender_addrs.remove(&sender_id);
         }
-        st.pending_tui_replay.remove(&addr);
+        st.mobile_client_capabilities.remove(&addr);
+        st.mobile_attach_ids.remove(&addr);
 
         let sessions_to_restore = match st.mobile_views.remove(&addr) {
             Some(sessions) => {
@@ -3645,19 +3804,6 @@ fn is_path_watched(changed_path: &str, watched: &std::collections::HashSet<Strin
     false
 }
 
-fn clear_pending_tui_replay_for_session(st: &mut DaemonState, session_id: &str) {
-    let mut empty_addrs = Vec::new();
-    for (addr, pending) in st.pending_tui_replay.iter_mut() {
-        pending.remove(session_id);
-        if pending.is_empty() {
-            empty_addrs.push(*addr);
-        }
-    }
-    for addr in empty_addrs {
-        st.pending_tui_replay.remove(&addr);
-    }
-}
-
 async fn restore_pty_size(state: &SharedState, session_id: &str) {
     let st = state.read().await;
     if let Some(session) = st.sessions.get(session_id) {
@@ -3724,20 +3870,15 @@ async fn send_push_notifications(tokens: &[PushToken], title: &str, body: &str, 
 #[cfg(test)]
 mod tests {
     use super::{
-        broadcast_pty_resized, build_upload_destination_path, capture_tmux_history, is_noop_resize,
-        is_stale_resize_epoch, is_windows_reserved_device_name, resolve_resize_reason,
-        sanitize_upload_file_name, scan_frame_sequences, should_enable_frame_mode,
-        should_force_noop_resize, should_ignore_resize_without_viewers,
-        should_ignore_restore_resize, should_mobile_enter_alt_screen,
-        should_treat_as_tui_for_mobile, strip_terminal_report_sequences,
-        strip_terminal_report_sequences_stateful, update_alt_screen_state,
-        update_frame_render_state, DaemonState, PtyResizeReason, PtySession,
-        DEFAULT_SCROLLBACK_MAX_BYTES, MAX_UPLOAD_FILE_NAME_BYTES,
+        broadcast_pty_resized, build_upload_destination_path, capture_tmux_history,
+        clear_mobile_attach_for_session, is_noop_resize, is_stale_resize_epoch,
+        is_windows_reserved_device_name, resolve_resize_reason, sanitize_upload_file_name,
+        should_ignore_resize_without_viewers, should_ignore_restore_resize,
+        should_mobile_enter_alt_screen, should_treat_as_tui_for_mobile, should_use_attach_v2,
+        strip_terminal_report_sequences, strip_terminal_report_sequences_stateful,
+        update_alt_screen_state, AttachProtocolMode, DaemonState, OverhaulFlags, PtyResizeReason,
+        CLIENT_CAP_ATTACH_V2, DEFAULT_SCROLLBACK_MAX_BYTES, MAX_UPLOAD_FILE_NAME_BYTES,
     };
-    use crate::detection::{CliTracker, CliType};
-    use base64::Engine as _;
-    use chrono::Utc;
-    use std::collections::VecDeque;
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::sync::{mpsc, RwLock};
@@ -3989,16 +4130,6 @@ mod tests {
     }
 
     #[test]
-    fn force_noop_resize_only_for_attach_and_reconnect() {
-        assert!(should_force_noop_resize(PtyResizeReason::AttachInit));
-        assert!(should_force_noop_resize(PtyResizeReason::ReconnectSync));
-        assert!(!should_force_noop_resize(PtyResizeReason::GeometryChange));
-        assert!(!should_force_noop_resize(PtyResizeReason::DetachRestore));
-        assert!(!should_force_noop_resize(PtyResizeReason::KeyboardOverlay));
-        assert!(!should_force_noop_resize(PtyResizeReason::Unknown));
-    }
-
-    #[test]
     fn no_viewer_guard_allows_bootstrap_resizes() {
         assert!(should_ignore_resize_without_viewers(
             false,
@@ -4028,75 +4159,78 @@ mod tests {
     }
 
     #[test]
-    fn tui_gating_uses_frame_render_for_all_runtimes() {
-        // tmux runtime ignores raw alt-screen bytes and relies on frame mode.
-        assert!(should_treat_as_tui_for_mobile("tmux", false, true));
-        assert!(!should_treat_as_tui_for_mobile("tmux", false, false));
-        assert!(!should_treat_as_tui_for_mobile("tmux", true, false));
-        assert!(should_treat_as_tui_for_mobile("pty", false, true));
-        assert!(!should_treat_as_tui_for_mobile("pty", false, false));
+    fn tui_gating_uses_alt_screen_only() {
+        assert!(!should_treat_as_tui_for_mobile("tmux", false));
+        assert!(!should_treat_as_tui_for_mobile("tmux", true));
+        assert!(should_treat_as_tui_for_mobile("pty", true));
+        assert!(!should_treat_as_tui_for_mobile("pty", false));
     }
 
     #[test]
     fn mobile_alt_screen_policy_preserves_tmux_scrollback() {
-        assert!(!should_mobile_enter_alt_screen("tmux", false, true));
-        assert!(!should_mobile_enter_alt_screen("tmux", false, false));
-        assert!(!should_mobile_enter_alt_screen("tmux", true, false));
-        assert!(should_mobile_enter_alt_screen("pty", false, true));
-        assert!(!should_mobile_enter_alt_screen("pty", false, false));
+        assert!(!should_mobile_enter_alt_screen("tmux", false));
+        assert!(!should_mobile_enter_alt_screen("tmux", true));
+        assert!(should_mobile_enter_alt_screen("pty", true));
+        assert!(!should_mobile_enter_alt_screen("pty", false));
     }
 
     #[test]
-    fn frame_sequence_scanner_counts_cursor_and_erase_ops() {
-        let chunk = b"\x1b[10;2HHello\x1b[K\x1b[H\x1b[2K";
-        let (cursor, erase) = scan_frame_sequences(chunk);
-        assert_eq!(cursor, 2);
-        assert_eq!(erase, 2);
+    fn attach_v2_gating_requires_flag_and_capability() {
+        let v1_flags = OverhaulFlags {
+            attach_protocol: AttachProtocolMode::V1,
+            enable_local_echo: false,
+            resize_simplified: false,
+        };
+        let v2_flags = OverhaulFlags {
+            attach_protocol: AttachProtocolMode::V2,
+            enable_local_echo: false,
+            resize_simplified: false,
+        };
+
+        assert!(!should_use_attach_v2(v1_flags, CLIENT_CAP_ATTACH_V2));
+        assert!(!should_use_attach_v2(v2_flags, 0));
+        assert!(should_use_attach_v2(v2_flags, CLIENT_CAP_ATTACH_V2));
     }
 
     #[test]
-    fn frame_mode_threshold_requires_heavy_cursor_and_erase_usage() {
-        assert!(!should_enable_frame_mode(79, 40));
-        assert!(!should_enable_frame_mode(80, 39));
-        assert!(should_enable_frame_mode(80, 40));
-        assert!(should_enable_frame_mode(400, 200));
-    }
+    fn clear_mobile_attach_for_session_prunes_empty_maps() {
+        let mut state = DaemonState::new(9847);
+        let addr_a: std::net::SocketAddr = "127.0.0.1:50001".parse().expect("socket addr a");
+        let addr_b: std::net::SocketAddr = "127.0.0.1:50002".parse().expect("socket addr b");
 
-    #[test]
-    fn frame_mode_update_flips_after_threshold() {
-        let mut frame_mode = false;
-        let mut cursor = 0u32;
-        let mut erase = 0u32;
-        let chunk = b"\x1b[10;2H\x1b[K";
+        state.mobile_attach_ids.insert(
+            addr_a,
+            std::collections::HashMap::from([
+                ("target".to_string(), 1u64),
+                ("keep".to_string(), 2u64),
+            ]),
+        );
+        state.mobile_attach_ids.insert(
+            addr_b,
+            std::collections::HashMap::from([("target".to_string(), 9u64)]),
+        );
 
-        for _ in 0..79 {
-            update_frame_render_state(&mut frame_mode, &mut cursor, &mut erase, chunk);
-        }
-        assert!(!frame_mode);
+        clear_mobile_attach_for_session(&mut state, "target");
 
-        update_frame_render_state(&mut frame_mode, &mut cursor, &mut erase, chunk);
-        assert!(frame_mode);
-    }
-
-    #[test]
-    fn known_tui_apps_preset_frame_mode() {
-        assert!(super::cli_defaults_to_frame_mode(CliType::Codex));
-        assert!(super::cli_defaults_to_frame_mode(CliType::OpenCode));
-        assert!(super::cli_defaults_to_frame_mode(CliType::Claude));
-        assert!(super::cli_defaults_to_frame_mode(CliType::Gemini));
-        assert!(!super::cli_defaults_to_frame_mode(CliType::Terminal));
+        let a_map = state
+            .mobile_attach_ids
+            .get(&addr_a)
+            .expect("addr_a survives");
+        assert!(!a_map.contains_key("target"));
+        assert_eq!(a_map.get("keep"), Some(&2u64));
+        assert!(
+            !state.mobile_attach_ids.contains_key(&addr_b),
+            "addr_b should be pruned when its map becomes empty"
+        );
     }
 
     #[tokio::test]
-    async fn pty_resized_replays_pending_tui_scrollback_only_once() {
+    async fn pty_resized_broadcasts_ack_only() {
         let state = Arc::new(RwLock::new(DaemonState::new(9847)));
         let addr: std::net::SocketAddr = "127.0.0.1:40001".parse().expect("socket addr");
         let session_id = "test-session".to_string();
-        let replay_bytes = b"REPLAY-ME".to_vec();
 
         let (client_tx, mut client_rx) = mpsc::channel::<Message>(32);
-        let (input_tx, _input_rx) = mpsc::unbounded_channel();
-        let (resize_tx, _resize_rx) = mpsc::unbounded_channel();
 
         {
             let mut st = state.write().await;
@@ -4106,51 +4240,12 @@ mod tests {
                 .or_default()
                 .insert(session_id.clone());
             st.session_view_counts.insert(session_id.clone(), 1);
-            st.pending_tui_replay
-                .entry(addr)
-                .or_default()
-                .insert(session_id.clone());
-
-            let mut scrollback = VecDeque::new();
-            scrollback.extend(replay_bytes.iter().copied());
-
-            let mut cli_tracker = CliTracker::new();
-            cli_tracker.update_from_command("codex");
-
-            st.sessions.insert(
-                session_id.clone(),
-                PtySession {
-                    session_id: session_id.clone(),
-                    runtime: "pty".to_string(),
-                    tmux_socket: None,
-                    tmux_session: None,
-                    name: "Codex".to_string(),
-                    command: "codex".to_string(),
-                    project_path: "/tmp".to_string(),
-                    started_at: Utc::now(),
-                    input_tx,
-                    resize_tx,
-                    waiting_state: None,
-                    cli_tracker,
-                    last_wait_hash: None,
-                    scrollback,
-                    scrollback_max_bytes: DEFAULT_SCROLLBACK_MAX_BYTES,
-                    in_alt_screen: false,
-                    alt_track_tail: Vec::new(),
-                    frame_cursor_pos_count: 0,
-                    frame_erase_line_count: 0,
-                    frame_render_mode: true,
-                    last_resize_epoch: 0,
-                    last_applied_size: Some((95, 27)),
-                    raw_input_tail: Vec::new(),
-                },
-            );
         }
 
         broadcast_pty_resized(&state, &session_id, 95, 27, Some(1)).await;
 
         let mut first_ack = 0usize;
-        let mut first_replay = Vec::new();
+        let mut first_replay = 0usize;
         loop {
             match timeout(Duration::from_millis(50), client_rx.recv()).await {
                 Ok(Some(Message::Text(text))) => {
@@ -4158,17 +4253,7 @@ mod tests {
                         serde_json::from_str(text.as_ref()).expect("valid json");
                     match msg.get("type").and_then(|t| t.as_str()) {
                         Some("pty_resized") => first_ack += 1,
-                        Some("pty_bytes") => {
-                            let data = msg
-                                .get("data")
-                                .and_then(|d| d.as_str())
-                                .expect("pty bytes data");
-                            first_replay.push(
-                                base64::engine::general_purpose::STANDARD
-                                    .decode(data)
-                                    .expect("base64 decode"),
-                            );
-                        }
+                        Some("pty_bytes") => first_replay += 1,
                         _ => {}
                     }
                 }
@@ -4178,17 +4263,7 @@ mod tests {
         }
 
         assert_eq!(first_ack, 1);
-        assert_eq!(first_replay.len(), 1);
-        assert_eq!(first_replay[0], replay_bytes);
-
-        {
-            let st = state.read().await;
-            assert!(!st
-                .pending_tui_replay
-                .get(&addr)
-                .map(|pending| pending.contains(&session_id))
-                .unwrap_or(false));
-        }
+        assert_eq!(first_replay, 0);
 
         broadcast_pty_resized(&state, &session_id, 96, 27, Some(2)).await;
 
