@@ -1,0 +1,627 @@
+# TMUX Runtime Task Log
+
+Date: 2026-02-24
+Owner: Codex
+Branch: `feat/tmux-runtime-phase1`
+
+## Task T-001 - Baseline architecture and failure-shape capture
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- Current PTY-centric attach/replay logic is structurally fragile for frame-rendered TUIs and should be replaced with tmux-backed session multiplexing.
+
+Changes:
+- No code changes.
+- Audited current behavior and code paths:
+  - `cli/src/daemon.rs`
+  - `cli/src/pty_wrapper.rs`
+  - `mobile/hooks/useSync.ts`
+  - `mobile/components/TerminalView.tsx`
+  - `mobile/app/session/[id].tsx`
+
+Commands:
+- `rg -n "should_clear_local_before_resize|clear|DetachRestore|subscribe_ack|pty_resized|suppressPtyUntilResize" cli/src mobile`
+- `sed -n ...` on files listed above.
+
+Evidence:
+- Desktop clear logic exists in wrapper resize policy path.
+- Mobile suppresses `pty_bytes` until `pty_resized` ack for alt-screen sessions.
+- Daemon session model is tied to wrapper `register_pty` stream.
+
+Result:
+- pass
+
+Next action:
+- Validate tmux control-mode semantics and output/history behavior with local probes.
+
+## Task T-002 - tmux capability probe and command semantics verification
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- tmux control mode and capture-pane provide sufficient primitives to replace custom PTY replay/resize heuristics.
+
+Changes:
+- No code changes.
+- Ran local tmux probes for:
+  - control mode notification framing,
+  - `%output` data representation,
+  - `capture-pane` ANSI behavior,
+  - `send-keys` input roundtrip.
+
+Commands:
+- `tmux -V`
+- tmux probe scripts using `tmux -L <sock> -f /dev/null ...`
+- `man tmux | col -b | sed -n ...`
+
+Evidence:
+- `tmux 3.4` available locally.
+- Control mode emits `%begin/%end`, `%output`, `%layout-change`, `%exit`.
+- `%output` is escaped text (decoded parser needed).
+- `capture-pane -e` preserves ANSI escapes.
+- `send-keys` roundtrip observed in `%output` stream.
+
+Result:
+- pass
+
+Next action:
+- Finalize comprehensive execution plan with explicit phases, risks, test gates, and rollback.
+
+## Task T-003 - Master execution plan publication
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- A file-level, phase-gated plan with explicit verification checkpoints will prevent further speculative fixes and support reliable execution.
+
+Changes:
+- Added:
+  - `docs/TMUX_RUNTIME_EXECUTION_MASTER_PLAN_2026-02-24.md`
+
+Commands:
+- Document authoring only.
+
+Evidence:
+- Plan includes:
+  - validated baseline facts,
+  - tmux-backed target architecture,
+  - runtime abstraction strategy,
+  - phased PR sequence,
+  - automated/manual matrix gates,
+  - risk and rollback controls,
+  - pre-implementation verification checklist.
+
+Result:
+- pass
+
+Next action:
+- Begin Phase W2 runtime abstraction scaffold on `feat/tmux-runtime-phase1`.
+
+## Task T-004 - Wrapper stabilization and tmux runtime cutover
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- Running wrapped sessions through a tmux-backed runtime and removing local clear sequences will eliminate desktop wipe behavior and provide multiplexer semantics needed for frame-TUI reliability.
+
+Changes:
+- Updated `cli/src/pty_wrapper.rs`:
+  - Added runtime resolver (`MOBILECLI_RUNTIME=auto|tmux|pty`), defaulting `auto` to tmux when available.
+  - Added tmux session bootstrap (`new-session`) and cleanup (`kill-server`) helpers.
+  - Session registration now reports runtime metadata to daemon.
+  - Wrapper now launches tmux attach client in PTY when tmux runtime is active.
+  - Removed destructive local terminal clear path from resize handling.
+- Added wrapper tests:
+  - runtime override behavior,
+  - tmux token sanitization,
+  - tmux bootstrap/cleanup roundtrip.
+
+Commands:
+- `cargo check --manifest-path cli/Cargo.toml`
+- `cargo test --manifest-path cli/Cargo.toml --bin mobilecli -- --skip test_list_directory_sorts_directories_first`
+- `rg -n "2J\\x1b\\[H|clear_local_terminal_view|should_clear_local_before_resize" cli/src/pty_wrapper.rs cli/src/daemon.rs`
+
+Evidence:
+- `rg` returned no matches for local clear/clear-policy functions in wrapper/daemon.
+- tmux lifecycle unit test passes: `pty_wrapper::tests::tmux_session_bootstrap_and_cleanup_roundtrip`.
+- Resize handling still preserves `attach_init/reconnect_sync` no-op redraw path via jittered PTY resize.
+
+Result:
+- pass
+
+Next action:
+- Propagate runtime metadata through daemon session surfaces and increase replay headroom.
+
+## Task T-005 - Daemon runtime metadata and replay headroom
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- Tagging session runtime at daemon level and increasing scrollback headroom reduces replay truncation risk and enables runtime-aware diagnostics during rollout.
+
+Changes:
+- Updated `cli/src/daemon.rs`:
+  - `PtySession` now stores `runtime`.
+  - registration parser accepts `runtime` from wrapper (`register_pty` payload).
+  - sessions list serialization includes runtime.
+  - increased `DEFAULT_SCROLLBACK_MAX_BYTES` from `512KB` to `2MB`.
+  - updated tests/fixtures for new struct field and constant.
+- Updated `cli/src/protocol.rs`:
+  - `SessionListItem` now includes optional `runtime`.
+
+Commands:
+- `cargo fmt --manifest-path cli/Cargo.toml`
+- `cargo check --manifest-path cli/Cargo.toml`
+- `cargo test --manifest-path cli/Cargo.toml --bin mobilecli -- --skip test_list_directory_sorts_directories_first`
+- `rg -n "runtime" cli/src/pty_wrapper.rs cli/src/daemon.rs cli/src/protocol.rs`
+
+Evidence:
+- Test run after formatting: `35 passed; 0 failed` (with one known filtered test).
+- Runtime metadata appears in:
+  - wrapper registration payload,
+  - daemon session state,
+  - protocol session list schema.
+
+Result:
+- pass
+
+Next action:
+- Commit changes and run target manual validation loop on Codex session attach/detach cycles using tmux runtime.
+
+## Task T-006 - tmux reconnect replay correctness hardening
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- Blank reattach and "terminal code pasted into chat" regressions come from replaying raw daemon PTY scrollback for tmux sessions instead of replaying an authoritative tmux pane snapshot.
+
+Changes:
+- Updated `cli/src/daemon.rs`:
+  - Added tmux metadata to in-memory session state (`tmux_socket`, `tmux_session`).
+  - Derived tmux identifiers from `session_id` at registration for runtime `tmux`.
+  - Added tmux snapshot helpers:
+    - `capture_tmux_history_blocking`
+    - `capture_tmux_history`
+    - `tail_scrollback_bytes` (fallback path).
+  - `GetSessionHistory` now prefers tmux `capture-pane -p -e -S -200000` for tmux sessions; falls back to daemon buffer only on capture failure.
+  - `Subscribe` now:
+    - disables deferred raw replay for tmux runtime,
+    - sends immediate `session_history` snapshot from tmux when available.
+  - `broadcast_pty_resized` now skips deferred raw replay for tmux sessions (prevents corrupted frame replays).
+- Added daemon test:
+  - `tmux_capture_history_returns_snapshot_text`.
+
+Commands:
+- `cargo fmt --manifest-path cli/Cargo.toml`
+- `cargo check --manifest-path cli/Cargo.toml`
+- `cargo test --manifest-path cli/Cargo.toml --bin mobilecli -- --skip test_list_directory_sorts_directories_first`
+
+Evidence:
+- Test suite result after patch: `36 passed; 0 failed` (1 filtered known filesystem test).
+- New tmux capture test validates snapshot contains expected marker from live tmux session.
+- Deferred raw replay path explicitly bypassed for runtime `tmux`.
+
+Result:
+- pass
+
+Next action:
+- Install updated release binary locally and run Codex mobile attach/detach verification loop with logs.
+
+## Task T-007 - Mobile terminal report input filtering + lightweight tmux TUI replay
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- Reattach-injected `0;276;0c` text is terminal-report feedback (`ESC[>0;276;0c`) emitted by mobile xterm and forwarded as raw CLI input. Blank/black reattach after repeated cycles is aggravated by oversized tmux history replay for frame TUIs.
+
+Changes:
+- Updated `cli/src/daemon.rs`:
+  - Added raw-input sanitizer:
+    - `strip_terminal_report_sequences`
+    - `is_terminal_report_csi`
+  - `SendInput(raw=true)` now removes terminal report reply sequences before forwarding to PTY.
+  - `capture_tmux_history` now supports replay mode:
+    - full scrollback (`-S -200000`) for text sessions,
+    - visible-pane snapshot only for frame/alt-screen sessions.
+  - `Subscribe` for tmux frame sessions no longer sends eager full replay.
+  - `GetSessionHistory` for tmux now selects replay mode based on `render_as_tui`.
+- Added tests:
+  - `strip_terminal_reports_drops_secondary_da_reply`
+  - `strip_terminal_reports_preserves_user_escape_keys`
+  - `strip_terminal_reports_removes_embedded_report_sequences`
+
+Commands:
+- `cargo fmt --manifest-path cli/Cargo.toml`
+- `cargo check --manifest-path cli/Cargo.toml`
+- `cargo test --manifest-path cli/Cargo.toml --bin mobilecli -- --skip test_list_directory_sorts_directories_first`
+
+Evidence:
+- Test suite result after patch: `39 passed; 0 failed` (1 filtered known filesystem test).
+- Sanitizer test specifically validates dropping `ESC[>0;276;0c` while preserving real key sequences (arrow keys).
+- tmux history capture test remains passing with new API shape.
+
+Result:
+- pass
+
+Next action:
+- Rebuild/install daemon binary and run targeted mobile attach/detach loops validating:
+  - no injected `0;276;0c`,
+  - no black blank on repeated reopen,
+  - stable Codex scroll/render behavior.
+
+## Task T-008 - Stateful split-sequence filtering + tmux TUI capture retry
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- `0;276;0c` injection persists when xterm emits DA reply split across websocket frames (e.g. `ESC[>` then `0;276;0c`). Stateless filtering misses this. Intermittent black reattach also occurs when pane snapshot is captured before TUI redraw settles.
+
+Changes:
+- Updated `cli/src/daemon.rs`:
+  - Added per-session `raw_input_tail` state to `PtySession`.
+  - Replaced stateless raw-input filter path with stateful filter:
+    - `strip_terminal_report_sequences_stateful`
+    - preserves normal split key escapes, drops split terminal report replies.
+  - `SendInput(raw=true)` now mutates per-session tail and filters before forwarding.
+  - Added `capture_tmux_history_with_retry` + `snapshot_has_visible_content`.
+  - TUI pane snapshot path now retries capture up to 3x with short delay to avoid post-resize blank captures.
+- Added tests:
+  - `strip_terminal_reports_stateful_drops_split_da_reply`
+  - `strip_terminal_reports_stateful_preserves_split_arrow_key`
+
+Commands:
+- `cargo fmt --manifest-path cli/Cargo.toml`
+- `cargo check --manifest-path cli/Cargo.toml`
+- `cargo test --manifest-path cli/Cargo.toml --bin mobilecli -- --skip test_list_directory_sorts_directories_first`
+
+Evidence:
+- Test suite result: `41 passed; 0 failed` (1 filtered known filesystem test).
+- New split-sequence tests verify exact failure mode (`ESC[>0;276;0c`) is dropped even when fragmented across messages.
+- No compile warnings after gating helper-only wrapper with `#[cfg(test)]`.
+
+Result:
+- pass
+
+Next action:
+- Reinstall binary + restart daemon, then confirm on-device that injected `0;276;0c` is gone and repeated reattach no longer goes black.
+
+## Task T-009 - Reattach blank-screen race + scroll-surface hardening
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- Reopened sessions can go blank when initial `pty_bytes/session_history` arrive before mobile registers a `setPtyBytesCallback`; those bytes are dropped. Duplicate render/input bars are worsened by eager fallback history replay even when live redraw bytes are already flowing.
+
+Changes:
+- Updated `mobile/hooks/useSync.ts`:
+  - Added per-session buffering for subscribed sessions when callback is not yet attached.
+  - Flushed buffered PTY chunks immediately when `setPtyBytesCallback` is registered.
+  - Added replay state machine:
+    - alt-screen history replay now uses fallback timer after `pty_resized` ack,
+    - live bytes cancel pending replay,
+    - stale late session-history replies are dropped once live flow resumes.
+  - Added comprehensive cleanup for replay timers/state on unsubscribe/session close/connection reset.
+- Updated `mobile/assets/xterm.html`:
+  - Added capture-phase, full-surface touch pan handling over entire terminal area.
+  - Added movement thresholds and click suppression window to avoid double tap/focus races after touch interactions.
+  - Kept viewport-driven scroll-state reporting (`isAtBottom`) synchronized during touch pan.
+- Updated `cli/src/daemon.rs`:
+  - Increased tmux visible-pane snapshot retry window (`8x` attempts, `120ms` delay) for post-resize reattach stability.
+
+Commands:
+- `npx tsc --noEmit` (mobile)
+- `cargo check --manifest-path cli/Cargo.toml`
+- `cargo test --manifest-path cli/Cargo.toml --bin mobilecli -- --skip test_list_directory_sorts_directories_first`
+- `cargo build --release --manifest-path cli/Cargo.toml`
+- `install -m 755 cli/target/release/mobilecli /home/bigphoot/.local/bin/mobilecli`
+- `/home/bigphoot/.local/bin/mobilecli stop`
+- `nohup env RUST_LOG=mobilecli=debug /home/bigphoot/.local/bin/mobilecli daemon > /home/bigphoot/.mobilecli/daemon.log 2>&1 &`
+
+Evidence:
+- Rust tests: `41 passed; 0 failed` (1 filtered known filesystem test).
+- TypeScript compile: clean (`npx tsc --noEmit` with no errors).
+- Daemon process confirmed running from `/home/bigphoot/.local/bin/mobilecli`.
+- Replay path now explicitly handles:
+  - callback registration races,
+  - fallback replay only on missing live redraw,
+  - stale fallback snapshot suppression after live output resumes.
+
+Result:
+- pass
+
+Next action:
+- Validate on-device reopen loops (Codex + Claude) with the latest daemon/mobile pair and collect fresh screenshots/logs focused on:
+  - no blank reopen,
+  - no duplicate input bars,
+  - full-area scroll responsiveness.
+
+## Task T-010 - tmux dynamic window sizing fix (root-cause for mobile dimension mismatch)
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- Mobile dimension mismatches and cut-off rendering persist because tmux session bootstrap set `window-size=manual`, which can lock pane geometry and prevent resize propagation from wrapper PTY resizes.
+
+Changes:
+- Updated `cli/src/pty_wrapper.rs`:
+  - Changed tmux bootstrap window option from `window-size manual` to `window-size latest`.
+  - Added code comment documenting why dynamic window-size mode is required for mobile resize propagation.
+- Strengthened wrapper integration test:
+  - `tmux_session_bootstrap_and_cleanup_roundtrip` now asserts tmux reports `window-size=latest` for the created session.
+
+Commands:
+- `cargo fmt --manifest-path cli/Cargo.toml`
+- `cargo check --manifest-path cli/Cargo.toml`
+- `cargo test --manifest-path cli/Cargo.toml --bin mobilecli -- --skip test_list_directory_sorts_directories_first`
+
+Evidence:
+- Wrapper source previously set `window-size=manual` in tmux bootstrap options.
+- Test suite remains green (`41 passed; 0 failed`) with new assertion.
+- This directly targets the resize propagation path responsible for mobile-vs-pane dimension divergence.
+
+Result:
+- pass
+
+Next action:
+- Restart daemon with updated binary (when safe, since active sessions are currently running) and re-test mobile attach/reopen sizing behavior.
+
+## Task T-011 - Attach resize race fix + mobile TUI surface stabilization
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- Two independent issues still produce clipped/unnatural mobile terminal output:
+  1) daemon may ignore initial `attach_init` resize when it arrives before subscribe view-count registration (race), leaving tmux at desktop geometry;
+  2) mobile forces local `ESC[?1049h` for frame-rendered TUIs, creating visual artifacts/duplication on CLIs that are frame-mode but not true alt-screen.
+
+Changes:
+- Updated `cli/src/daemon.rs`:
+  - Added `should_ignore_resize_without_viewers(...)`.
+  - Viewer-count guard now allows `attach_init` and `reconnect_sync` bootstrap resizes even when current viewer count is still zero.
+  - Added test: `no_viewer_guard_allows_bootstrap_resizes`.
+- Updated `mobile/components/TerminalView.tsx`:
+  - Removed forced local `\x1b[?1049h` injection on subscribe-ack paths.
+  - Keep local terminal reset behavior so stale frame remnants are cleared without faking alternate-screen state.
+- Updated `mobile/components/XTermView.tsx`:
+  - Added forced post-ready refit (immediate + delayed) to recover from early-fit layout races that can produce undersized row/col calculations.
+
+Commands:
+- `npx tsc --noEmit` (mobile)
+- `cargo fmt --manifest-path cli/Cargo.toml`
+- `cargo check --manifest-path cli/Cargo.toml`
+- `cargo test --manifest-path cli/Cargo.toml --bin mobilecli -- --skip test_list_directory_sorts_directories_first`
+
+Evidence:
+- Rust tests now: `42 passed; 0 failed` (1 filtered known filesystem test).
+- TypeScript compile clean.
+- Code paths directly address:
+  - ignored bootstrap resize race,
+  - forced faux-alt-screen injection for frame-mode TUIs,
+  - pre-layout fit timing race in WebView.
+
+Result:
+- pass
+
+Next action:
+- Deploy daemon update (restart required) and mobile update (new build required), then re-test with targeted scenarios: open session, rotate, keyboard show/hide, leave/reopen.
+
+## Task T-012 - Mobile scrollback depth + pan/auto-follow stabilization
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- Two factors are causing "hard to scroll up" behavior even when rendering is otherwise stable:
+  1) local xterm scrollback is capped at 1000 lines, truncating long AI sessions;
+  2) auto-follow can keep snapping back to bottom while users start touch panning upward.
+
+Changes:
+- Updated `mobile/assets/xterm.html`:
+  - Increased local xterm scrollback from `1000` to `20000` lines.
+  - Tightened at-bottom threshold from `50px` to `8px` for faster transition out of follow mode.
+  - Removed 50ms debounced scroll-state update; now evaluates at-bottom state on each viewport scroll event.
+  - Added `autoFollowSuspendedUntil` guard so touch pan interactions temporarily suppress output auto-follow.
+  - On touch pan movement, force `isAtBottom=false` immediately and report state.
+  - Auto-follow now only scrolls on new output when not suspended.
+- Updated `mobile/hooks/useSync.ts`:
+  - `get_session_history` now requests `max_bytes: 8 * 1024 * 1024` to pull a deeper backlog on reattach.
+- Updated `cli/src/daemon.rs`:
+  - Increased default daemon scrollback buffer cap from `2MB` to `8MB`.
+  - Updated unit test expectation for default scrollback size.
+
+Commands:
+- `npx tsc --noEmit` (mobile)
+- `cargo check --manifest-path cli/Cargo.toml`
+- `cargo test --manifest-path cli/Cargo.toml --bin mobilecli -- --skip test_list_directory_sorts_directories_first`
+
+Evidence:
+- TypeScript compile clean.
+- Rust check clean.
+- Rust unit tests: `42 passed; 0 failed` (1 filtered known filesystem test).
+- Diffs show direct changes in scrollback depth and touch/auto-follow arbitration paths.
+
+Result:
+- pass
+
+Next action:
+- Validate on-device with long-output sessions (Codex/Gemini/OpenCode) using:
+  - continuous output while attempting to scroll up,
+  - reopen + deep history scrolling,
+  - repeated attach/detach loops.
+
+## Task T-013 - Scrollback continuity on reattach + tmux TUI gating correction
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- Scrollback loss and chopped reopen history are amplified by two behaviors:
+  1) mobile performs destructive `reset()` on alt-screen reattach paths (clears local buffer);
+  2) daemon classifies tmux frame-mode sessions as "alt-screen-like" and therefore disables tmux scrollback snapshots, even when the session is not truly in alternate screen.
+
+Additional probe evidence:
+- Local tmux probe shows `capture-pane -S` only returns deep history for main-screen output; for alternate-screen output it remains viewport-limited (~24 lines).
+- Therefore, non-alt tmux sessions should not be forced into alt suppression/replay path.
+
+Changes:
+- Updated `cli/src/daemon.rs`:
+  - Added `should_treat_as_tui_for_mobile(runtime, in_alt_screen, frame_render_mode)`.
+  - For `runtime=tmux`, only true `in_alt_screen` now activates TUI suppression semantics.
+  - `GetSessionHistory` for tmux now uses capture-pane scrollback only for non-alt sessions; alt sessions fall back to daemon scrollback path.
+  - Added debug logs clarifying when daemon scrollback fallback is used for session history.
+  - Added unit test: `tmux_mobile_tui_gating_uses_real_alt_screen_only`.
+- Updated `mobile/components/TerminalView.tsx`:
+  - Removed destructive `xterm.reset()` calls from reconnect/late-ack/onReady alt-screen paths.
+  - Kept reconnect resize sync and refit behavior, but now non-destructive to preserve local scrollback continuity.
+  - iOS input path now triggers `maybeScrollToBottom()` after queued input to reduce "typing but prompt not visible" incidents.
+- Updated `mobile/assets/xterm.html`:
+  - `fitTerminal()` now forces `term.refresh(...)` after fit to reduce post-resize cursor/input-line rendering gaps.
+
+Commands:
+- tmux probe:
+  - `tmux ... capture-pane -p -e -S -2000` with main-screen output => deep history (`224` lines)
+  - same probe with explicit alt-screen output => viewport-limited (`24` lines)
+- `npx tsc --noEmit` (mobile)
+- `cargo check --manifest-path cli/Cargo.toml`
+- `cargo test --manifest-path cli/Cargo.toml --bin mobilecli -- --skip test_list_directory_sorts_directories_first`
+
+Evidence:
+- TypeScript compile clean.
+- Rust check clean.
+- Rust tests: `43 passed; 0 failed` (1 filtered known filesystem test).
+- tmux probe confirms main-vs-alt history behavior difference and validates gating change rationale.
+
+Result:
+- pass
+
+Next action:
+- Build/install updated daemon and run on-device reopen/scroll stress with Codex + Gemini + OpenCode.
+- Validate specifically:
+  - deep upward scrolling after reattach,
+  - no duplicate input bars,
+  - prompt/input visibility while typing.
+
+## Task T-014 - Desktop-fit default pivot + runtime-aware suppression
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- Persisting duplicate/frame spill and unreliable scrolling are driven by mobile-dimension PTY resize churn on frame-heavy CLIs. A desktop-canonical PTY with mobile desktop-fit rendering should be more stable.
+
+Changes:
+- Updated `cli/src/protocol.rs`:
+  - `SubscribeAck` now includes optional `runtime` field.
+- Updated `cli/src/daemon.rs`:
+  - `SubscribeAck` now sends session runtime (`pty`/`tmux`).
+  - tmux session classification uses `should_treat_as_tui_for_mobile`; non-alt tmux sessions avoid TUI suppression path.
+  - `GetSessionHistory` requests tmux capture-pane only for non-alt tmux sessions; alt sessions use daemon scrollback fallback.
+- Updated `mobile/hooks/useSync.ts`:
+  - subscribe handling is now runtime-aware:
+    - `in_alt_screen && runtime != tmux` => existing suppression path,
+    - `in_alt_screen && runtime == tmux` => no suppression, immediate history request.
+- Updated `mobile/components/TerminalView.tsx`:
+  - Added desktop-fit default mode (`DESKTOP_FIT_MODE=true`): mobile resize intents now send `keyboard_overlay` sync acks instead of geometry-changing resizes.
+  - `geometry_change` PTY resize emissions disabled in desktop-fit mode.
+  - reconnect/attach sync paths now use non-destructive sync intent.
+- Updated `mobile/assets/xterm.html`:
+  - font size reduced `13 -> 11` to increase effective visible columns in desktop-fit mode.
+
+Commands:
+- `npx tsc --noEmit` (mobile)
+- `cargo check --manifest-path cli/Cargo.toml`
+- `cargo test --manifest-path cli/Cargo.toml --bin mobilecli -- --skip test_list_directory_sorts_directories_first`
+
+Evidence:
+- TypeScript compile clean.
+- Rust tests: `43 passed; 0 failed` (1 filtered known filesystem test).
+- No compile/runtime regressions from protocol extension.
+
+Result:
+- pass
+
+Next action:
+- Rebuild/restart daemon locally and run on-device Gemini/Codex stress loop in desktop-fit mode.
+- If stability is confirmed, keep this as default and expose optional mobile-canonical mode behind a toggle later.
+
+## Task T-015 - Mobile-canonical resize restoration + replay chunking hardening
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- Remaining Gemini/Codex render spill is caused by a size contract violation: xterm was fit to mobile while backend PTY stayed desktop-sized (`DESKTOP_FIT_MODE=true`), so cursor-addressed redraws rendered against mismatched cols/rows.
+- Blank/chopped reopen is caused by oversized `session_history` payloads being dropped/stalled in mobile queues/injection batching.
+
+Changes:
+- Updated `mobile/components/TerminalView.tsx`:
+  - Switched to mobile-canonical PTY sizing (`DESKTOP_FIT_MODE=false`).
+  - Re-enabled geometry resize propagation via `sendResizeIntent(..., 'geometry_change')`.
+  - Keyboard-driven row changes are no longer ignored in canonical mode (prevents input line from drifting under keyboard).
+  - On refocus, perform local `xterm.reset()` before replay/refit to prevent duplicate stale frame overlay.
+- Updated `mobile/hooks/useSync.ts`:
+  - Increased pending PTY queue limits (`chunks: 4000`, `bytes: 20MB`).
+  - Added base64 chunk splitter (`64KB`, 4-byte aligned) before callback/queue delivery.
+  - Queue eviction now preserves at least one newest chunk, preventing self-drop of large replay payloads.
+- Updated `mobile/components/XTermView.tsx`:
+  - Added defensive base64 bridge chunking (`64KB`, 4-byte aligned).
+  - Increased pre-ready pending write cap (`100 -> 2000`) so large replay bursts survive WebView readiness races.
+- Updated `mobile/assets/xterm.html`:
+  - Added full-screen `#gesture-layer` to capture pan/tap across entire terminal area.
+  - Touch action switched to manual pan (`touch-action:none`) for terminal/canvas/gesture layer.
+  - Pan handlers now attach to gesture layer (fallback terminal element).
+  - Font size adjusted to `12` (from desktop-fit `11`) for canonical readability.
+
+Commands:
+- `npx tsc --noEmit` (mobile)
+- `cargo test --manifest-path cli/Cargo.toml --bin mobilecli -- --skip test_list_directory_sorts_directories_first`
+
+Evidence:
+- TypeScript compile clean.
+- Rust tests remain clean: `43 passed; 0 failed` (1 filtered known filesystem test).
+- Code-level root-cause closure:
+  - PTY/xterm dimension mismatch removed by canonical resize.
+  - Large replay payload can no longer be dropped as a single oversize chunk or stuck behind bridge batch-size limits.
+
+Result:
+- pass
+
+Next action:
+- Install this mobile build and run targeted on-device regression loop:
+  - Gemini/Codex/OpenCode startup layout,
+  - leave/reopen same session (no blank, no duplicate prompt bars),
+  - deep upward scrolling through long history,
+  - keyboard show/hide while typing (input line remains visible).
+
+## Task T-016 - Pre-build hygiene audit and dead-path cleanup
+Date: 2026-02-24
+Owner: Codex
+
+Hypothesis:
+- Remaining reliability risk is now mostly code hygiene (stale fallback/overlay scaffolding) rather than core PTY transport logic. Removing dormant paths reduces future regressions.
+
+Changes:
+- Updated `mobile/components/TerminalView.tsx`:
+  - Removed dormant desktop-fit branching and keyboard-overlay-only branch logic.
+  - Kept canonical path only: mobile resize events always propagate via `onPtyResize(..., geometry_change)`.
+  - Removed no-longer-used keyboard transition refs tied to the old desktop-fit path.
+- Updated `mobile/assets/xterm.html`:
+  - Removed disabled selection-overlay DOM/CSS/functions and associated no-op scheduling hooks.
+  - Removed overlay function calls from `refitTerminal`.
+  - Kept terminal gesture layer + paste interception + xterm core path only.
+- Updated `mobile/hooks/useSync.ts`:
+  - Corrected stale comment wording for tmux alt-screen replay behavior.
+
+Commands:
+- `npx tsc --noEmit` (mobile)
+- `cargo check --manifest-path cli/Cargo.toml`
+- `cargo test --manifest-path cli/Cargo.toml --bin mobilecli -- --skip test_list_directory_sorts_directories_first`
+
+Evidence:
+- TypeScript compile clean.
+- Rust check clean.
+- Rust tests: `43 passed; 0 failed`.
+- `rg` audit confirms overlay code paths removed from `assets/xterm.html`.
+
+Result:
+- pass
+
+Next action:
+- Device validation run before new build submission (Gemini/Codex/OpenCode + reopen + deep scroll + keyboard visibility).

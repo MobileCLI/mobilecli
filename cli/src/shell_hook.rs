@@ -34,7 +34,7 @@ fn bash_snippet() -> String {
     format!(
         r#"{BEGIN_MARKER}
 # Automatically launch mobilecli in interactive terminals.
-# To disable: export MOBILECLI_NO_AUTO_LAUNCH=1  (or run: mobilecli shell-hook uninstall)
+# To disable: export MOBILECLI_NO_AUTO_LAUNCH=1  (or run: mobilecli autolaunch uninstall)
 if [ -z "$MOBILECLI_NO_AUTO_LAUNCH" ] && [ -z "$MOBILECLI_SESSION" ] && [ -t 0 ] && command -v mobilecli >/dev/null 2>&1; then
   exec mobilecli
 fi
@@ -48,7 +48,7 @@ fn fish_snippet() -> String {
     format!(
         r#"{BEGIN_MARKER}
 # Automatically launch mobilecli in interactive terminals.
-# To disable: set -gx MOBILECLI_NO_AUTO_LAUNCH 1  (or run: mobilecli shell-hook uninstall)
+# To disable: set -gx MOBILECLI_NO_AUTO_LAUNCH 1  (or run: mobilecli autolaunch uninstall)
 if not set -q MOBILECLI_NO_AUTO_LAUNCH; and not set -q MOBILECLI_SESSION; and isatty stdin; and command -v mobilecli >/dev/null 2>&1
     exec mobilecli
 end
@@ -62,7 +62,7 @@ fn powershell_snippet() -> String {
     format!(
         r#"{BEGIN_MARKER}
 # Automatically launch mobilecli in interactive terminals.
-# To disable: $env:MOBILECLI_NO_AUTO_LAUNCH = "1"  (or run: mobilecli shell-hook uninstall)
+# To disable: $env:MOBILECLI_NO_AUTO_LAUNCH = "1"  (or run: mobilecli autolaunch uninstall)
 if (-not $env:MOBILECLI_NO_AUTO_LAUNCH -and -not $env:MOBILECLI_SESSION -and [Environment]::UserInteractive -and (Get-Command mobilecli -ErrorAction SilentlyContinue)) {{
     & mobilecli
     exit $LASTEXITCODE
@@ -147,7 +147,7 @@ fn install() -> Result<(), Box<dyn std::error::Error>> {
         );
         println!(
             "  To remove permanently:  {}",
-            "mobilecli shell-hook uninstall".dimmed()
+            "mobilecli autolaunch uninstall".dimmed()
         );
     }
 
@@ -220,10 +220,7 @@ fn status() -> Result<(), Box<dyn std::error::Error>> {
 
     if !any_found {
         println!("{} Auto-launch: not installed", "○".dimmed());
-        println!(
-            "  Run {} to enable",
-            "mobilecli shell-hook install".cyan()
-        );
+        println!("  Run {} to enable", "mobilecli autolaunch install".cyan());
     }
 
     Ok(())
@@ -399,7 +396,7 @@ fn powershell_profile_path(home: &std::path::Path) -> Option<PathBuf> {
         if dir.exists() || which::which("pwsh").is_ok() {
             return Some(dir.join("Microsoft.PowerShell_profile.ps1"));
         }
-        return None;
+        None
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -505,23 +502,9 @@ pub fn install_quiet() -> bool {
     let targets = detect_shell_targets();
     let mut any_installed = false;
     for target in &targets {
-        if let Ok(true) = install_into(&target) {
+        if let Ok(true) = install_into(target) {
             any_installed = true;
         }
     }
     any_installed
-}
-
-/// Convenience: uninstall shell hook non-interactively.
-pub fn uninstall_quiet() -> bool {
-    let targets = all_possible_targets();
-    let mut any_removed = false;
-    for target in &targets {
-        if target.path.exists() {
-            if let Ok(true) = remove_from(&target) {
-                any_removed = true;
-            }
-        }
-    }
-    any_removed
 }

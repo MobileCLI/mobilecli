@@ -4,15 +4,52 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Semantic reason for a PTY resize request.
+///
+/// `Unknown` allows forward compatibility when newer clients introduce
+/// additional reasons.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PtyResizeReason {
+    AttachInit,
+    GeometryChange,
+    ReconnectSync,
+    DetachRestore,
+    KeyboardOverlay,
+    #[serde(other)]
+    Unknown,
+}
+
+impl PtyResizeReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AttachInit => "attach_init",
+            Self::GeometryChange => "geometry_change",
+            Self::ReconnectSync => "reconnect_sync",
+            Self::DetachRestore => "detach_restore",
+            Self::KeyboardOverlay => "keyboard_overlay",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Messages sent from mobile client to server
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     Hello {
         client_version: String,
+        #[serde(default)]
+        sender_id: Option<String>,
+        #[serde(default)]
+        client_capabilities: Option<u32>,
     },
     Subscribe {
         session_id: String,
+        #[serde(default)]
+        last_seen_seq: Option<u64>,
+        #[serde(default)]
+        client_capabilities: Option<u32>,
     },
     Unsubscribe {
         session_id: String,
@@ -32,6 +69,8 @@ pub enum ClientMessage {
         rows: u16,
         #[serde(default)]
         epoch: Option<u64>,
+        #[serde(default)]
+        reason: Option<PtyResizeReason>,
     },
     /// Heartbeat ping
     Ping,
@@ -227,6 +266,46 @@ pub enum ServerMessage {
     SubscribeAck {
         session_id: String,
         in_alt_screen: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        runtime: Option<String>,
+    },
+    /// Attach v2 start marker for deterministic replay/live handoff.
+    AttachBegin {
+        session_id: String,
+        attach_id: u64,
+        runtime: String,
+        mode: String, // "fresh" | "reconnect"
+        in_alt_screen: bool,
+    },
+    /// Attach v2 clear marker (client clears local terminal canvas/buffer).
+    AttachClear {
+        session_id: String,
+        attach_id: u64,
+    },
+    /// Attach v2 replay payload chunk.
+    AttachSnapshotChunk {
+        session_id: String,
+        attach_id: u64,
+        chunk_seq: u32,
+        total_chunks: u32,
+        is_last: bool,
+        data: String, // base64 encoded bytes
+    },
+    /// Attach v2 replay complete; live stream begins after this point.
+    AttachReady {
+        session_id: String,
+        attach_id: u64,
+        last_live_seq: u64,
+        cols: u16,
+        rows: u16,
+    },
+    /// Live PTY data tagged with attach + sequence for dedupe ordering.
+    PtyChunk {
+        session_id: String,
+        attach_id: u64,
+        seq: u64,
+        data: String, // base64 encoded bytes
+        timestamp_ms: u64,
     },
     /// PTY resized confirmation
     PtyResized {
@@ -346,6 +425,9 @@ pub struct SessionListItem {
     pub started_at: String,
     /// Explicit CLI type identifier for mobile app disambiguation
     pub cli_type: String,
+    /// Runtime backend for this session (`pty` or `tmux`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

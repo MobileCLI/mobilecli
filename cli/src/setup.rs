@@ -513,7 +513,7 @@ pub fn run_setup_wizard() -> io::Result<Config> {
     );
     println!(
         "{}",
-        "You can remove it anytime with: mobilecli shell-hook uninstall".dimmed()
+        "You can remove it anytime with: mobilecli autolaunch uninstall".dimmed()
     );
     println!();
 
@@ -536,7 +536,7 @@ pub fn run_setup_wizard() -> io::Result<Config> {
     } else {
         println!(
             "{}",
-            "Skipped. You can enable later with: mobilecli shell-hook install".dimmed()
+            "Skipped. You can enable later with: mobilecli autolaunch install".dimmed()
         );
     }
 
