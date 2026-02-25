@@ -1605,143 +1605,101 @@ async fn process_client_msg(
             epoch,
             reason,
         } => {
-            let reason = resolve_resize_reason(cols, rows, reason);
+            // Phase 4: Mobile/Desktop Priority Switching
+            // - Mobile has priority: mobile resize always applies
+            // - Desktop is passive: desktop resize only applies if no mobile viewers
+            // - DetachRestore: restore desktop size when mobile disconnects
+            
+            let reason = reason.unwrap_or(PtyResizeReason::GeometryChange);
+            let is_restore = cols == 0 && rows == 0;
+            
             let mut st = state.write().await;
-            let resize_simplified = st.overhaul_flags.resize_simplified;
-            let is_restore = reason == PtyResizeReason::DetachRestore;
             let viewer_count = st
                 .session_view_counts
                 .get(&session_id)
                 .copied()
                 .unwrap_or(0);
-            let sender_is_viewing = st
+            let sender_is_mobile = st
                 .mobile_views
                 .get(&addr)
                 .map(|views| views.contains(&session_id))
                 .unwrap_or(false);
-            let mut synthetic_ack: Option<(u16, u16, Option<u64>)> = None;
-
-            let ignore_no_viewer_resize =
-                should_ignore_resize_without_viewers(is_restore, viewer_count, reason);
-            if ignore_no_viewer_resize {
+            
+            // Determine if we should apply this resize
+            let should_apply = if is_restore {
+                // Restore desktop size when mobile disconnects
+                true
+            } else if sender_is_mobile {
+                // Mobile has priority - always apply mobile resize
+                true
+            } else {
+                // Desktop resize - only apply if no mobile viewers
+                viewer_count == 0
+            };
+            
+            if !should_apply {
                 tracing::debug!(
-                    target: "overhaul.resize",
                     session_id = %session_id,
                     cols,
                     rows,
-                    epoch = ?epoch,
                     reason = reason.as_str(),
                     viewer_count,
-                    sender_is_viewing,
-                    resize_simplified,
-                    bootstrap_reason = matches!(reason, PtyResizeReason::AttachInit | PtyResizeReason::ReconnectSync),
-                    decision = "ignored_no_active_viewers",
-                    "Ignoring PTY resize with no active mobile viewers"
+                    sender_is_mobile,
+                    decision = "ignored_desktop_while_mobile_active",
+                    "Ignoring desktop resize while mobile viewers active"
                 );
                 return Ok(());
             }
-
-            // A restore request (0x0) must not override active dimensions while
-            // other viewers are still attached to this session.
-            if should_ignore_restore_resize(is_restore, viewer_count, sender_is_viewing) {
-                tracing::debug!(
-                    target: "overhaul.resize",
-                    session_id = %session_id,
-                    cols,
-                    rows,
-                    epoch = ?epoch,
-                    reason = reason.as_str(),
-                    viewer_count,
-                    sender_is_viewing,
-                    resize_simplified,
-                    decision = "ignored_restore_guard",
-                    "Ignoring PTY restore while active viewers remain"
-                );
-                return Ok(());
-            }
-
+            
             if let Some(session) = st.sessions.get_mut(&session_id) {
-                if is_stale_resize_epoch(session.last_resize_epoch, epoch) {
-                    tracing::debug!(
-                        target: "overhaul.resize",
-                        session_id = %session_id,
-                        cols,
-                        rows,
-                        epoch = ?epoch,
-                        reason = reason.as_str(),
-                        viewer_count,
-                        sender_is_viewing,
-                        alt_screen = session.in_alt_screen,
-                        last_epoch = session.last_resize_epoch,
-                        resize_simplified,
-                        decision = "ignored_stale_epoch",
-                        "Ignoring stale PTY resize"
-                    );
-                    return Ok(());
+                // Check for stale epoch
+                if let Some(epoch_val) = epoch {
+                    if epoch_val <= session.last_resize_epoch {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            cols,
+                            rows,
+                            epoch = epoch_val,
+                            last_epoch = session.last_resize_epoch,
+                            decision = "ignored_stale_epoch",
+                            "Ignoring stale PTY resize"
+                        );
+                        return Ok(());
+                    }
+                    session.last_resize_epoch = epoch_val;
                 }
-                if let Some(epoch) = epoch {
-                    session.last_resize_epoch = epoch;
-                }
-
-                let ack_dims = session.last_applied_size.unwrap_or((cols, rows));
-                if reason == PtyResizeReason::KeyboardOverlay {
+                
+                // Skip if no-op
+                if session.last_applied_size == Some((cols, rows)) {
                     tracing::debug!(
-                        target: "overhaul.resize",
                         session_id = %session_id,
                         cols,
                         rows,
-                        epoch = ?epoch,
-                        reason = reason.as_str(),
-                        viewer_count,
-                        sender_is_viewing,
-                        alt_screen = session.in_alt_screen,
-                        resize_simplified,
-                        decision = "ignored_keyboard_overlay",
-                        "Ignoring keyboard-overlay resize (local UX only)"
-                    );
-                    synthetic_ack = Some((ack_dims.0, ack_dims.1, epoch));
-                } else if is_noop_resize(session.last_applied_size, cols, rows) {
-                    tracing::debug!(
-                        target: "overhaul.resize",
-                        session_id = %session_id,
-                        cols,
-                        rows,
-                        epoch = ?epoch,
-                        reason = reason.as_str(),
-                        viewer_count,
-                        sender_is_viewing,
-                        alt_screen = session.in_alt_screen,
-                        resize_simplified,
                         decision = "ignored_noop",
                         "Ignoring no-op PTY resize"
                     );
-                    synthetic_ack = Some((ack_dims.0, ack_dims.1, epoch));
-                } else {
-                    tracing::debug!(
-                        target: "overhaul.resize",
-                        session_id = %session_id,
-                        cols,
-                        rows,
-                        epoch = ?epoch,
-                        reason = reason.as_str(),
-                        viewer_count,
-                        sender_is_viewing,
-                        alt_screen = session.in_alt_screen,
-                        resize_simplified,
-                        decision = "forwarded",
-                        "Forwarding PTY resize to wrapper"
-                    );
-                    let _ = session.resize_tx.send(ResizeRequest {
-                        cols,
-                        rows,
-                        epoch,
-                        reason,
-                    });
+                    return Ok(());
                 }
-            }
-            drop(st);
-            if let Some((ack_cols, ack_rows, ack_epoch)) = synthetic_ack {
-                broadcast_pty_resized(state, &session_id, ack_cols, ack_rows, ack_epoch).await;
+                
+                tracing::debug!(
+                    session_id = %session_id,
+                    cols,
+                    rows,
+                    epoch = ?epoch,
+                    reason = reason.as_str(),
+                    viewer_count,
+                    sender_is_mobile,
+                    is_restore,
+                    decision = "forwarded",
+                    "Forwarding PTY resize to wrapper"
+                );
+                
+                let _ = session.resize_tx.send(ResizeRequest {
+                    cols,
+                    rows,
+                    epoch,
+                    reason,
+                });
             }
         }
         ClientMessage::Ping => {
@@ -2970,56 +2928,8 @@ fn strip_terminal_report_sequences_stateful(tail: &mut Vec<u8>, input: &[u8]) ->
     (out, dropped)
 }
 
-fn should_ignore_restore_resize(
-    is_restore: bool,
-    viewer_count: usize,
-    sender_is_viewing: bool,
-) -> bool {
-    is_restore && (viewer_count > 1 || (viewer_count == 1 && !sender_is_viewing))
-}
-
-fn resolve_resize_reason(
-    cols: u16,
-    rows: u16,
-    incoming: Option<PtyResizeReason>,
-) -> PtyResizeReason {
-    if cols == 0 || rows == 0 {
-        return PtyResizeReason::DetachRestore;
-    }
-
-    match incoming {
-        Some(reason @ PtyResizeReason::AttachInit)
-        | Some(reason @ PtyResizeReason::GeometryChange)
-        | Some(reason @ PtyResizeReason::ReconnectSync)
-        | Some(reason @ PtyResizeReason::KeyboardOverlay) => reason,
-        Some(PtyResizeReason::DetachRestore | PtyResizeReason::Unknown) => {
-            PtyResizeReason::GeometryChange
-        }
-        None => PtyResizeReason::GeometryChange,
-    }
-}
-
 fn is_noop_resize(last_applied: Option<(u16, u16)>, cols: u16, rows: u16) -> bool {
     last_applied == Some((cols, rows))
-}
-
-fn should_ignore_resize_without_viewers(
-    is_restore: bool,
-    viewer_count: usize,
-    reason: PtyResizeReason,
-) -> bool {
-    if is_restore || viewer_count > 0 {
-        return false;
-    }
-
-    !matches!(
-        reason,
-        PtyResizeReason::AttachInit | PtyResizeReason::ReconnectSync
-    )
-}
-
-fn is_stale_resize_epoch(last_epoch: u64, incoming_epoch: Option<u64>) -> bool {
-    incoming_epoch.is_some_and(|epoch| epoch <= last_epoch)
 }
 
 /// Update alternate-screen state from a PTY chunk, including sequences split
@@ -3209,9 +3119,8 @@ async fn send_push_notifications(tokens: &[PushToken], title: &str, body: &str, 
 mod tests {
     use super::{
         broadcast_pty_resized, build_upload_destination_path,
-        clear_mobile_attach_for_session, is_noop_resize, is_stale_resize_epoch,
-        is_windows_reserved_device_name, resolve_resize_reason, sanitize_upload_file_name,
-        should_ignore_resize_without_viewers, should_ignore_restore_resize,
+        clear_mobile_attach_for_session, is_noop_resize,
+        is_windows_reserved_device_name, sanitize_upload_file_name,
         should_use_attach_v2,
         strip_terminal_report_sequences, strip_terminal_report_sequences_stateful,
         update_alt_screen_state,
@@ -3365,83 +3274,10 @@ mod tests {
     }
 
     #[test]
-    fn restore_resize_rules_protect_active_viewers() {
-        assert!(should_ignore_restore_resize(true, 2, true));
-        assert!(should_ignore_restore_resize(true, 1, false));
-        assert!(!should_ignore_restore_resize(true, 1, true));
-        assert!(!should_ignore_restore_resize(false, 2, true));
-    }
-
-    #[test]
-    fn stale_epoch_detection_rejects_older_or_equal_epochs() {
-        assert!(!is_stale_resize_epoch(0, None));
-        assert!(!is_stale_resize_epoch(5, Some(6)));
-        assert!(is_stale_resize_epoch(5, Some(5)));
-        assert!(is_stale_resize_epoch(5, Some(4)));
-    }
-
-    #[test]
-    fn resolve_resize_reason_prefers_restore_for_zero_dimensions() {
-        assert_eq!(
-            resolve_resize_reason(0, 24, Some(PtyResizeReason::GeometryChange)),
-            PtyResizeReason::DetachRestore
-        );
-        assert_eq!(
-            resolve_resize_reason(80, 0, Some(PtyResizeReason::AttachInit)),
-            PtyResizeReason::DetachRestore
-        );
-    }
-
-    #[test]
-    fn resolve_resize_reason_defaults_unknown_to_geometry_change() {
-        assert_eq!(
-            resolve_resize_reason(80, 24, None),
-            PtyResizeReason::GeometryChange
-        );
-        assert_eq!(
-            resolve_resize_reason(80, 24, Some(PtyResizeReason::Unknown)),
-            PtyResizeReason::GeometryChange
-        );
-        assert_eq!(
-            resolve_resize_reason(80, 24, Some(PtyResizeReason::DetachRestore)),
-            PtyResizeReason::GeometryChange
-        );
-    }
-
-    #[test]
     fn noop_resize_detection_matches_last_applied_dimensions() {
         assert!(is_noop_resize(Some((80, 24)), 80, 24));
         assert!(!is_noop_resize(Some((80, 24)), 81, 24));
         assert!(!is_noop_resize(None, 80, 24));
-    }
-
-    #[test]
-    fn no_viewer_guard_allows_bootstrap_resizes() {
-        assert!(should_ignore_resize_without_viewers(
-            false,
-            0,
-            PtyResizeReason::GeometryChange
-        ));
-        assert!(!should_ignore_resize_without_viewers(
-            false,
-            0,
-            PtyResizeReason::AttachInit
-        ));
-        assert!(!should_ignore_resize_without_viewers(
-            false,
-            0,
-            PtyResizeReason::ReconnectSync
-        ));
-        assert!(!should_ignore_resize_without_viewers(
-            true,
-            0,
-            PtyResizeReason::DetachRestore
-        ));
-        assert!(!should_ignore_resize_without_viewers(
-            false,
-            1,
-            PtyResizeReason::GeometryChange
-        ));
     }
 
     #[test]
