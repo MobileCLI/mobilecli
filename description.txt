@@ -1,0 +1,46 @@
+Your desktop terminal, in your pocket.
+
+MobileCLI connects to your development machine and gives you full access to your terminal sessions from your phone. Pair with a QR code, and you're in — no accounts, no cloud relay, no configuration files.
+
+Built for developers who use AI coding assistants. Watch Claude Code, Codex, or Gemini work in real time. Approve tool calls from the couch. Fix a stuck prompt from the grocery store. Your sessions keep running whether you're watching or not.
+
+REAL TERMINAL, NOT A TOY
+
+Full xterm.js terminal with keyboard toolbar — arrow keys for history navigation, escape, paste from clipboard, and file attachments. Everything you type goes straight to your PTY. Everything your PTY outputs streams back instantly over WebSocket.
+
+CONNECT YOUR WAY
+
+Scan a QR code on your local network, or connect over Tailscale from anywhere in the world. Link multiple machines and switch between them. All connections are direct — your data never touches a third-party server.
+
+FILE BROWSER & EDITOR (Pro)
+
+Browse your project files, edit code with syntax highlighting, view images and PDFs, search by filename or content. Create, rename, move, and delete files and folders. Upload photos and documents straight from your phone into your terminal session.
+
+SPAWN SESSIONS FROM YOUR PHONE
+
+Start new terminal sessions remotely — Claude Code, Codex, Gemini CLI, OpenCode, or a plain shell. Pick a working directory, name your session, and go.
+
+NOTIFICATIONS WHEN IT MATTERS
+
+Get a push notification when your AI assistant needs input — tool approvals, plan confirmations, or clarifying questions. Tap to jump straight into the session.
+
+MULTIPLE THEMES
+
+Classic black terminal, Tokyo Night, or Light mode. Pick what feels right.
+
+FREE TO START
+
+Connect one device, open terminal sessions, type commands, and get notifications — all free. Upgrade to Pro to unlock the file browser, file editor, and attachment uploads.
+
+PRO SUBSCRIPTION
+
+MobileCLI Pro unlocks file browsing, editing, and attachment uploads.
+• $19.99/year with a 3-day free trial
+• $29.99 lifetime purchase (one-time)
+• Payment is charged to your Apple ID account at confirmation of purchase
+• Subscription automatically renews unless canceled at least 24 hours before the end of the current period
+• Your account is charged for renewal within 24 hours prior to the end of the current period
+• Manage or cancel anytime in Settings → Apple ID → Subscriptions
+
+Privacy Policy: https://www.mobilecli.app/privacy
+Terms of Use: https://www.mobilecli.app/terms

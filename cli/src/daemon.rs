@@ -13,7 +13,7 @@ use crate::protocol::{
     SessionListItem,
 };
 use crate::session::{self, SessionInfo};
-use crate::tmux::sanitize_tmux_token;
+
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
@@ -122,15 +122,7 @@ pub struct PushToken {
 /// recoverable history while still bounding memory.
 const DEFAULT_SCROLLBACK_MAX_BYTES: usize = 8 * 1024 * 1024;
 
-/// Maximum tmux scrollback lines fetched via capture-pane on the subscribe path.
-///
-/// Mobile xterm.js holds 20 000 lines. Desktop sessions are typically 160–240 cols
-/// while mobile is 80–100 cols, giving a worst-case wrap ratio of ~3×. So 10 000
-/// tmux lines → up to ~30 000 visual lines, which keeps the buffer well-fed without
-/// sending megabytes of scrollback that will immediately be discarded by xterm.js.
-///
-/// For on-demand `GetSessionHistory` requests the full 200 000-line depth is used.
-const SUBSCRIBE_SCROLLBACK_LINES: usize = 10_000;
+/// For on-demand `GetSessionHistory` requests.
 const HISTORY_SCROLLBACK_LINES: usize = 200_000;
 
 const ALT_ENTER_SEQS: &[&[u8]] = &[b"\x1b[?1049h", b"\x1b[?1047h", b"\x1b[?47h"];
@@ -205,27 +197,18 @@ pub struct ResizeRequest {
 /// Active PTY session
 pub struct PtySession {
     pub session_id: String,
-    /// Execution runtime used by the wrapper (`pty` or `tmux`).
-    pub runtime: String,
-    /// tmux socket label (when runtime=tmux)
-    pub tmux_socket: Option<String>,
-    /// tmux session name (when runtime=tmux)
-    pub tmux_session: Option<String>,
     pub name: String,
     pub command: String,
     pub project_path: String,
     pub started_at: chrono::DateTime<Utc>,
     pub input_tx: mpsc::UnboundedSender<Vec<u8>>,
     pub resize_tx: mpsc::UnboundedSender<ResizeRequest>,
-    pub waiting_state: Option<WaitingState>,
-    pub cli_tracker: CliTracker,
-    pub last_wait_hash: Option<u64>,
-    /// Scrollback buffer for session history (for linked terminals)
+    /// Scrollback buffer for session history (plain text only)
     /// Uses VecDeque for efficient front truncation when buffer is full
     pub scrollback: VecDeque<u8>,
     /// Maximum scrollback buffer size
     pub scrollback_max_bytes: usize,
-    /// Whether the CLI is currently in alternate screen buffer mode
+    /// Whether the session is currently in alternate screen buffer mode
     pub in_alt_screen: bool,
     /// Tail bytes from prior chunk used to detect alt-screen escape sequences
     /// split across PTY read boundaries.
@@ -234,7 +217,9 @@ pub struct PtySession {
     pub last_resize_epoch: u64,
     /// Last dimensions acknowledged by the PTY wrapper.
     pub last_applied_size: Option<(u16, u16)>,
-    /// Sequence number for live PTY chunks (Phase 0 observability scaffold).
+    /// Last non-zero resize dimensions forwarded to the PTY wrapper.
+    pub last_requested_size: Option<(u16, u16)>,
+    /// Sequence number for live PTY chunks.
     pub live_seq: u64,
     /// Tail for raw mobile input filtering to handle escape sequences split
     /// across websocket messages.
@@ -708,53 +693,32 @@ async fn handle_pty_session(
     let name = reg_msg["name"].as_str().unwrap_or("Terminal").to_string();
     let command = reg_msg["command"].as_str().unwrap_or("shell").to_string();
     let project_path = reg_msg["project_path"].as_str().unwrap_or("").to_string();
-    let runtime = reg_msg["runtime"].as_str().unwrap_or("pty").to_lowercase();
-    let (tmux_socket, tmux_session) = if runtime == "tmux" {
-        let token = sanitize_tmux_token(&session_id);
-        let name = format!("mcli-{}", token);
-        (Some(name.clone()), Some(name))
-    } else {
-        (None, None)
-    };
 
-    tracing::info!(
-        "PTY session registered: {} ({}) runtime={}",
-        name,
-        session_id,
-        runtime
-    );
+    tracing::info!("PTY session registered: {} ({})", name, session_id);
 
     let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (resize_tx, mut resize_rx) = mpsc::unbounded_channel::<ResizeRequest>();
 
     // Register session
     let pty_broadcast = {
-        let mut cli_tracker = CliTracker::new();
-        cli_tracker.update_from_command(&command);
-
         let mut st = state.write().await;
         st.sessions.insert(
             session_id.clone(),
             PtySession {
                 session_id: session_id.clone(),
-                runtime: runtime.clone(),
-                tmux_socket,
-                tmux_session,
                 name: name.clone(),
                 command,
                 project_path,
                 started_at: Utc::now(),
                 input_tx,
                 resize_tx,
-                waiting_state: None,
-                cli_tracker,
-                last_wait_hash: None,
                 scrollback: VecDeque::new(),
                 scrollback_max_bytes: DEFAULT_SCROLLBACK_MAX_BYTES,
                 in_alt_screen: false,
                 alt_track_tail: Vec::new(),
                 last_resize_epoch: 0,
                 last_applied_size: None,
+                last_requested_size: None,
                 live_seq: 0,
                 raw_input_tail: Vec::new(),
             },
@@ -796,23 +760,14 @@ async fn handle_pty_session(
                                                 while session.scrollback.len() > session.scrollback_max_bytes {
                                                     session.scrollback.pop_front();
                                                 }
-                                                // tmux runtime runs with alternate-screen disabled
-                                                // during bootstrap, so raw 1049/1047 bytes from
-                                                // frame CLIs are not a reliable signal for
-                                                // mobile-side alt-screen policy.
-                                                if session.runtime == "tmux" {
-                                                    session.in_alt_screen = false;
-                                                    session.alt_track_tail.clear();
-                                                } else {
-                                                    // Track alt-screen transitions across chunk
-                                                    // boundaries so subscribe_ack reflects the
-                                                    // current rendering mode reliably.
-                                                    update_alt_screen_state(
-                                                        &mut session.in_alt_screen,
-                                                        &mut session.alt_track_tail,
-                                                        &bytes,
-                                                    );
-                                                }
+                                                // Track alt-screen transitions across chunk
+                                                // boundaries so subscribe_ack reflects the
+                                                // current rendering mode reliably.
+                                                update_alt_screen_state(
+                                                    &mut session.in_alt_screen,
+                                                    &mut session.alt_track_tail,
+                                                    &bytes,
+                                                );
                                             }
                                         }
                                         if let Some(seq) = live_seq {
@@ -828,88 +783,8 @@ async fn handle_pty_session(
                                         let _ =
                                             pty_broadcast.send((session_id.clone(), seq, bytes.clone()));
 
-                                        let text = String::from_utf8_lossy(&bytes);
-                                        let normalized_chunk = strip_ansi_and_normalize(&text);
-
-                                        if !normalized_chunk.is_empty() {
-                                            output_buffer.push_str(&normalized_chunk);
-                                            truncate_to_max_chars(&mut output_buffer, BUFFER_MAX_CHARS);
-
-                                            // Update CLI tracker based on output
-                                            let cli_type = {
-                                                let mut st = state.write().await;
-                                                if let Some(session) = st.sessions.get_mut(&session_id) {
-                                                    session.cli_tracker.update_from_output(&normalized_chunk);
-                                                    session.cli_tracker.current()
-                                                } else {
-                                                    CliType::Terminal
-                                                }
-                                            };
-
-                                            // Check for waiting state patterns
-                                            tracing::debug!("Checking for wait event, cli_type: {:?}, buffer_len: {}", cli_type, output_buffer.len());
-                                            if let Some(wait_event) = detect_wait_event(&output_buffer, cli_type) {
-                                                tracing::info!("Detected wait event: {:?} for session {}", wait_event.wait_type, session_id);
-                                                let should_notify = {
-                                                    let mut st = state.write().await;
-                                                    if let Some(session) = st.sessions.get_mut(&session_id) {
-                                                        let is_new = session.waiting_state.as_ref().map(|w| {
-                                                            w.prompt_hash != wait_event.prompt_hash || w.wait_type != wait_event.wait_type
-                                                        }).unwrap_or(true);
-                                                        if is_new {
-                                                            session.waiting_state = Some(WaitingState {
-                                                                wait_type: wait_event.wait_type,
-                                                                prompt_content: wait_event.prompt.clone(),
-                                                                timestamp: Utc::now(),
-                                                                approval_model: wait_event.approval_model,
-                                                                prompt_hash: wait_event.prompt_hash,
-                                                            });
-                                                            session.last_wait_hash = Some(wait_event.prompt_hash);
-                                                        }
-                                                        is_new
-                                                    } else {
-                                                        false
-                                                    }
-                                                };
-
-                                                if should_notify {
-                                                    // Broadcast to mobile clients
-                                                    broadcast_waiting_for_input(&state, &session_id).await;
-
-                                                    // Send push notifications (async to avoid blocking PTY)
-                                                    let tokens = {
-                                                        let st = state.read().await;
-                                                        st.push_tokens.clone()
-                                                    };
-                                                    let session_id_clone = session_id.clone();
-                                                    let name_clone = name.clone();
-                                                    tokio::spawn(async move {
-                                                        let (title, body) = build_notification_text(cli_type, &name_clone, &wait_event);
-                                                        send_push_notifications(&tokens, &title, &body, &session_id_clone).await;
-                                                    });
-                                                }
-                                            } else {
-                                                // If previously waiting, clear on meaningful output that is not a waiting prompt
-                                                let should_clear = {
-                                                    let mut st = state.write().await;
-                                                    if let Some(session) = st.sessions.get_mut(&session_id) {
-                                                        if session.waiting_state.is_some() && normalized_chunk.trim().chars().count() >= 10 {
-                                                            session.waiting_state = None;
-                                                            session.last_wait_hash = None;
-                                                            true
-                                                        } else {
-                                                            false
-                                                        }
-                                                    } else {
-                                                        false
-                                                    }
-                                                };
-
-                                                if should_clear {
-                                                    broadcast_waiting_cleared(&state, &session_id).await;
-                                                }
-                                            }
-                                        }
+                                        // Note: Notification detection removed for simplicity.
+                                        // Can be re-added later in a separate notification module.
                                     }
                                 }
                             } else if msg["type"].as_str() == Some("pty_resized") {
@@ -957,19 +832,6 @@ async fn handle_pty_session(
                         });
                         if tx.send(Message::Text(msg.to_string())).await.is_err() {
                             break;
-                        }
-
-                        // Clear waiting state when user sends input
-                        {
-                            let mut st = state.write().await;
-                            if let Some(session) = st.sessions.get_mut(&session_id) {
-                                if session.waiting_state.is_some() {
-                                    session.waiting_state = None;
-                                    session.last_wait_hash = None;
-                                    drop(st);
-                                    broadcast_waiting_cleared(&state, &session_id).await;
-                                }
-                            }
                         }
 
                         // Clear output buffer on input
@@ -1545,69 +1407,51 @@ async fn process_client_msg(
             let use_attach_v2 = should_use_attach_v2(overhaul_flags, capabilities);
 
             // Collect session state under one lock, then drop it before sending.
+            // Get session info for subscribe
             let (
                 scrollback_bytes,
-                render_as_tui,
                 mobile_in_alt_screen,
                 scrollback_len,
-                runtime,
-                tmux_snapshot_req,
                 initial_live_seq,
                 ready_cols,
                 ready_rows,
             ) = if let Some(session) = st.sessions.get(&session_id) {
-                let render_as_tui =
-                    should_treat_as_tui_for_mobile(&session.runtime, session.in_alt_screen);
-                let mobile_in_alt_screen =
-                    should_mobile_enter_alt_screen(&session.runtime, session.in_alt_screen);
                 let has_scrollback = !session.scrollback.is_empty();
-                let runtime = session.runtime.clone();
-                // tmux sessions always replay from capture-pane. Alternate-screen
-                // sessions replay only the visible pane; main-screen sessions may
-                // include scrollback.
-                let tmux_snapshot_req = if runtime == "tmux" {
-                    match (&session.tmux_socket, &session.tmux_session) {
-                        (Some(socket), Some(name)) => Some((
-                            socket.clone(),
-                            name.clone(),
-                            session.scrollback_max_bytes,
-                            !session.in_alt_screen,
-                        )),
-                        _ => None,
+                let mobile_in_alt_screen = session.in_alt_screen;
+                
+                // Only replay scrollback if it's plain text (no cursor positioning)
+                let sb = if !mobile_in_alt_screen && has_scrollback {
+                    let bytes: Vec<u8> = session.scrollback.iter().copied().collect();
+                    // Check for cursor positioning sequences
+                    if !contains_cursor_positioning(&bytes) {
+                        Some(bytes)
+                    } else {
+                        None
                     }
                 } else {
                     None
                 };
-                let sb = if runtime != "tmux" && !render_as_tui && has_scrollback {
-                    Some(session.scrollback.iter().copied().collect::<Vec<u8>>())
-                } else {
-                    None
-                };
+                
                 let (ready_cols, ready_rows) = session.last_applied_size.unwrap_or((0, 0));
                 (
                     sb,
-                    render_as_tui,
                     mobile_in_alt_screen,
                     session.scrollback.len(),
-                    runtime,
-                    tmux_snapshot_req,
                     session.live_seq,
                     ready_cols,
                     ready_rows,
                 )
             } else {
-                (None, false, false, 0, "pty".to_string(), None, 0, 0, 0)
+                (None, false, 0, 0, 0, 0)
             };
 
             tracing::debug!(
                 session_id = %session_id,
                 addr = %addr,
                 attach_id,
-                runtime = %runtime,
                 capabilities,
                 use_attach_v2,
                 last_seen_seq = ?last_seen_seq,
-                render_as_tui,
                 mobile_in_alt_screen,
                 scrollback_len,
                 text_replay_bytes = scrollback_bytes.as_ref().map(|b| b.len()).unwrap_or(0),
@@ -1619,7 +1463,6 @@ async fn process_client_msg(
                 session_id = %session_id,
                 addr = %addr,
                 attach_id,
-                runtime = %runtime,
                 protocol = overhaul_flags.attach_protocol.as_str(),
                 use_attach_v2,
                 last_seen_seq = ?last_seen_seq,
@@ -1751,85 +1594,8 @@ async fn process_client_msg(
                 }
             }
 
-            // tmux sessions always get an authoritative pane snapshot on
-            // subscribe.
-            if let Some((socket, name, max_bytes, include_scrollback)) = tmux_snapshot_req {
-                let max_lines = if include_scrollback {
-                    SUBSCRIBE_SCROLLBACK_LINES
-                } else {
-                    0
-                };
-                if let Some(snapshot) =
-                    capture_tmux_history_with_retry(socket, name, include_scrollback, max_lines)
-                        .await
-                {
-                    let total_bytes = snapshot.len();
-                    let skip = total_bytes.saturating_sub(max_bytes);
-                    let bytes = &snapshot[skip..];
-                    replay_events.push(("tmux_capture_pane", bytes.len()));
-                    if use_attach_v2 {
-                        let chunks = chunk_snapshot_payload(bytes);
-                        let total_chunks = chunks.len().max(1) as u32;
-                        if chunks.is_empty() {
-                            let msg = ServerMessage::AttachSnapshotChunk {
-                                session_id: session_id.clone(),
-                                attach_id,
-                                chunk_seq: 1,
-                                total_chunks,
-                                is_last: true,
-                                data: String::new(),
-                            };
-                            if let Ok(text) = serde_json::to_string(&msg) {
-                                let _ = tx.send(Message::Text(text)).await;
-                            }
-                        } else {
-                            for (idx, chunk) in chunks.into_iter().enumerate() {
-                                let msg = ServerMessage::AttachSnapshotChunk {
-                                    session_id: session_id.clone(),
-                                    attach_id,
-                                    chunk_seq: (idx + 1) as u32,
-                                    total_chunks,
-                                    is_last: idx + 1 == total_chunks as usize,
-                                    data: chunk,
-                                };
-                                if let Ok(text) = serde_json::to_string(&msg) {
-                                    let _ = tx.send(Message::Text(text)).await;
-                                }
-                            }
-                        }
-                    } else {
-                        let msg = ServerMessage::SessionHistory {
-                            session_id: session_id.clone(),
-                            data: BASE64.encode(bytes),
-                            total_bytes,
-                        };
-                        if let Ok(text) = serde_json::to_string(&msg) {
-                            let _ = tx.send(Message::Text(text)).await;
-                        }
-                    }
-                    tracing::info!(
-                        target: "overhaul.attach",
-                        session_id = %session_id,
-                        attach_id,
-                        replay_source = "tmux_capture_pane",
-                        replay_bytes = bytes.len(),
-                        total_snapshot_bytes = total_bytes,
-                        "Attach replay sent"
-                    );
-                } else {
-                    tracing::warn!(
-                        target: "overhaul.attach",
-                        session_id = %session_id,
-                        attach_id,
-                        include_scrollback,
-                        "tmux capture-pane unavailable during attach replay"
-                    );
-                }
-            }
-
             // Always send SubscribeAck so mobile knows whether to suppress
             // stale bytes and enter alt-screen mode before resizing (v1 path).
-            let runtime_for_log = runtime.clone();
             if use_attach_v2 {
                 let ready_live_seq = {
                     let st = state.read().await;
@@ -3410,87 +3176,6 @@ fn clear_mobile_attach_for_session(st: &mut DaemonState, session_id: &str) {
     }
 }
 
-fn capture_tmux_history_blocking(
-    socket: &str,
-    session: &str,
-    include_scrollback: bool,
-    // Lines to request via `-S -N`. Ignored when include_scrollback is false.
-    max_scrollback_lines: usize,
-) -> Option<Vec<u8>> {
-    let targets = [
-        format!("{}:0.0", session),
-        format!("{}:0", session),
-        session.to_string(),
-    ];
-    for target in targets {
-        let mut cmd = std::process::Command::new("tmux");
-        cmd.arg("-L")
-            .arg(socket)
-            .arg("-f")
-            .arg("/dev/null")
-            .env_remove("TMUX")
-            .arg("capture-pane")
-            .arg("-p")
-            .arg("-e");
-        if include_scrollback {
-            cmd.arg("-S").arg(format!("-{}", max_scrollback_lines));
-        }
-        cmd.arg("-t").arg(&target);
-        let output = cmd.output();
-        if let Ok(out) = output {
-            if out.status.success() {
-                return Some(out.stdout);
-            }
-        }
-    }
-    None
-}
-
-async fn capture_tmux_history(
-    socket: String,
-    session: String,
-    include_scrollback: bool,
-    max_scrollback_lines: usize,
-) -> Option<Vec<u8>> {
-    tokio::task::spawn_blocking(move || {
-        capture_tmux_history_blocking(&socket, &session, include_scrollback, max_scrollback_lines)
-    })
-    .await
-    .ok()
-    .flatten()
-}
-
-fn snapshot_has_visible_content(bytes: &[u8]) -> bool {
-    bytes
-        .iter()
-        .any(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
-}
-
-async fn capture_tmux_history_with_retry(
-    socket: String,
-    session: String,
-    include_scrollback: bool,
-    max_scrollback_lines: usize,
-) -> Option<Vec<u8>> {
-    if include_scrollback {
-        return capture_tmux_history(socket, session, true, max_scrollback_lines).await;
-    }
-
-    const MAX_ATTEMPTS: usize = 8;
-    const RETRY_DELAY_MS: u64 = 120;
-    for attempt in 0..MAX_ATTEMPTS {
-        if let Some(snapshot) =
-            capture_tmux_history(socket.clone(), session.clone(), false, 0).await
-        {
-            if snapshot_has_visible_content(&snapshot) || attempt + 1 == MAX_ATTEMPTS {
-                return Some(snapshot);
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
-    }
-    None
-}
-
 fn is_terminal_report_csi(body: &[u8], final_byte: u8) -> bool {
     match final_byte {
         // Device Attributes response (e.g. ESC[>0;276;0c from xterm.js)
@@ -3625,25 +3310,6 @@ fn should_ignore_resize_without_viewers(
         reason,
         PtyResizeReason::AttachInit | PtyResizeReason::ReconnectSync
     )
-}
-
-fn should_treat_as_tui_for_mobile(runtime: &str, in_alt_screen: bool) -> bool {
-    // tmux runtime intentionally keeps alternate-screen disabled so pane
-    // snapshots remain canonical and replay-safe.
-    if runtime == "tmux" {
-        return false;
-    }
-    in_alt_screen
-}
-
-fn should_mobile_enter_alt_screen(runtime: &str, in_alt_screen: bool) -> bool {
-    // tmux runtime intentionally disables alternate-screen at the host level.
-    // Ignore raw 1049/1047 bytes from pane output and keep mobile in main
-    // buffer for deterministic replay + scrollback behavior.
-    if runtime == "tmux" {
-        return false;
-    }
-    in_alt_screen
 }
 
 fn is_stale_resize_epoch(last_epoch: u64, incoming_epoch: Option<u64>) -> bool {

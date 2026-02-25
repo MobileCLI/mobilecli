@@ -1,0 +1,451 @@
+{
+  "generated_at": "2026-02-25T01:29:51.801Z",
+  "url": "ws://127.0.0.1:9855",
+  "scenario": "all",
+  "loops": 10,
+  "capture_ms": 500,
+  "session": {
+    "session_id": "806300f7-1c9",
+    "spawned": true,
+    "session_name": "phase0-harness-1771982991828"
+  },
+  "results": {
+    "attach_latency": {
+      "loops": 10,
+      "capture_ms": 500,
+      "handshake_latency": {
+        "count": 10,
+        "min_ms": 40.6,
+        "avg_ms": 41.7,
+        "p50_ms": 41.7,
+        "p95_ms": 42.8,
+        "max_ms": 42.8
+      },
+      "attach_ready_latency": {
+        "count": 10,
+        "min_ms": 40.6,
+        "avg_ms": 41.7,
+        "p50_ms": 41.7,
+        "p95_ms": 42.8,
+        "max_ms": 42.8
+      },
+      "subscribe_ack_latency": null,
+      "first_stable_frame_latency": {
+        "count": 10,
+        "min_ms": 40.6,
+        "avg_ms": 41.7,
+        "p50_ms": 41.7,
+        "p95_ms": 42.8,
+        "max_ms": 42.8
+      },
+      "blank_attach_count": 0,
+      "per_loop": [
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 42.3,
+          "subscribe_ack_ms": 42.3,
+          "first_stable_frame_ms": 42.2,
+          "frame_messages": 21,
+          "payload_bytes": 586,
+          "duplicate_tokens": 0,
+          "unique_tokens": 31,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 42.8,
+          "subscribe_ack_ms": 42.8,
+          "first_stable_frame_ms": 42.8,
+          "frame_messages": 20,
+          "payload_bytes": 1020,
+          "duplicate_tokens": 0,
+          "unique_tokens": 54,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 41.7,
+          "subscribe_ack_ms": 41.7,
+          "first_stable_frame_ms": 41.7,
+          "frame_messages": 20,
+          "payload_bytes": 1388,
+          "duplicate_tokens": 0,
+          "unique_tokens": 77,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 42.2,
+          "subscribe_ack_ms": 42.2,
+          "first_stable_frame_ms": 42.2,
+          "frame_messages": 20,
+          "payload_bytes": 1756,
+          "duplicate_tokens": 1,
+          "unique_tokens": 99,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 40.6,
+          "subscribe_ack_ms": 40.6,
+          "first_stable_frame_ms": 40.6,
+          "frame_messages": 20,
+          "payload_bytes": 2108,
+          "duplicate_tokens": 0,
+          "unique_tokens": 122,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 40.8,
+          "subscribe_ack_ms": 40.8,
+          "first_stable_frame_ms": 40.8,
+          "frame_messages": 20,
+          "payload_bytes": 2476,
+          "duplicate_tokens": 0,
+          "unique_tokens": 145,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 41.2,
+          "subscribe_ack_ms": 41.2,
+          "first_stable_frame_ms": 41.2,
+          "frame_messages": 20,
+          "payload_bytes": 2844,
+          "duplicate_tokens": 1,
+          "unique_tokens": 167,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 41.2,
+          "subscribe_ack_ms": 41.2,
+          "first_stable_frame_ms": 41.2,
+          "frame_messages": 20,
+          "payload_bytes": 3196,
+          "duplicate_tokens": 0,
+          "unique_tokens": 190,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 42.2,
+          "subscribe_ack_ms": 42.2,
+          "first_stable_frame_ms": 42.2,
+          "frame_messages": 20,
+          "payload_bytes": 3564,
+          "duplicate_tokens": 0,
+          "unique_tokens": 213,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 41.7,
+          "subscribe_ack_ms": 41.7,
+          "first_stable_frame_ms": 41.7,
+          "frame_messages": 20,
+          "payload_bytes": 3932,
+          "duplicate_tokens": 0,
+          "unique_tokens": 236,
+          "blank_attach": false
+        }
+      ]
+    },
+    "reconnect_stress": {
+      "loops": 10,
+      "capture_ms": 500,
+      "duplicate_loop_count": 3,
+      "duplicate_loop_rate": 0.3,
+      "total_duplicate_tokens": 3,
+      "blank_attach_count": 0,
+      "blank_attach_rate": 0,
+      "handshake_latency": {
+        "count": 10,
+        "min_ms": 14,
+        "avg_ms": 39.3,
+        "p50_ms": 41.8,
+        "p95_ms": 43.3,
+        "max_ms": 43.3
+      },
+      "attach_ready_latency": {
+        "count": 10,
+        "min_ms": 14,
+        "avg_ms": 39.3,
+        "p50_ms": 41.8,
+        "p95_ms": 43.3,
+        "max_ms": 43.3
+      },
+      "subscribe_ack_latency": null,
+      "first_stable_frame_latency": {
+        "count": 10,
+        "min_ms": 13.7,
+        "avg_ms": 39.2,
+        "p50_ms": 41.8,
+        "p95_ms": 43.3,
+        "max_ms": 43.3
+      },
+      "per_loop": [
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 43.3,
+          "subscribe_ack_ms": 43.3,
+          "first_stable_frame_ms": 43.3,
+          "frame_messages": 20,
+          "payload_bytes": 4300,
+          "duplicate_tokens": 1,
+          "unique_tokens": 258,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 42.4,
+          "subscribe_ack_ms": 42.4,
+          "first_stable_frame_ms": 42.4,
+          "frame_messages": 20,
+          "payload_bytes": 4668,
+          "duplicate_tokens": 1,
+          "unique_tokens": 281,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 42.7,
+          "subscribe_ack_ms": 42.7,
+          "first_stable_frame_ms": 42.6,
+          "frame_messages": 20,
+          "payload_bytes": 5036,
+          "duplicate_tokens": 1,
+          "unique_tokens": 304,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 14,
+          "subscribe_ack_ms": 14,
+          "first_stable_frame_ms": 13.7,
+          "frame_messages": 19,
+          "payload_bytes": 5380,
+          "duplicate_tokens": 0,
+          "unique_tokens": 327,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 41.4,
+          "subscribe_ack_ms": 41.4,
+          "first_stable_frame_ms": 41.4,
+          "frame_messages": 20,
+          "payload_bytes": 5756,
+          "duplicate_tokens": 0,
+          "unique_tokens": 350,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 41.8,
+          "subscribe_ack_ms": 41.8,
+          "first_stable_frame_ms": 41.8,
+          "frame_messages": 20,
+          "payload_bytes": 6124,
+          "duplicate_tokens": 0,
+          "unique_tokens": 373,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 41.7,
+          "subscribe_ack_ms": 41.7,
+          "first_stable_frame_ms": 41.7,
+          "frame_messages": 20,
+          "payload_bytes": 6492,
+          "duplicate_tokens": 0,
+          "unique_tokens": 396,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 41,
+          "subscribe_ack_ms": 41,
+          "first_stable_frame_ms": 40.9,
+          "frame_messages": 20,
+          "payload_bytes": 6860,
+          "duplicate_tokens": 0,
+          "unique_tokens": 419,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 41.9,
+          "subscribe_ack_ms": 41.9,
+          "first_stable_frame_ms": 41.9,
+          "frame_messages": 20,
+          "payload_bytes": 7228,
+          "duplicate_tokens": 0,
+          "unique_tokens": 442,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 42.5,
+          "subscribe_ack_ms": 42.5,
+          "first_stable_frame_ms": 42.5,
+          "frame_messages": 20,
+          "payload_bytes": 7596,
+          "duplicate_tokens": 0,
+          "unique_tokens": 465,
+          "blank_attach": false
+        }
+      ]
+    },
+    "duplicate_detector": {
+      "loops": 10,
+      "duplicate_loop_count": 2,
+      "duplicate_loop_rate": 0.2,
+      "total_duplicate_tokens": 2,
+      "blank_attach_count": 0,
+      "per_loop": [
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 41.1,
+          "subscribe_ack_ms": 41.1,
+          "first_stable_frame_ms": 41.1,
+          "frame_messages": 20,
+          "payload_bytes": 7964,
+          "duplicate_tokens": 0,
+          "unique_tokens": 488,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 41.1,
+          "subscribe_ack_ms": 41.1,
+          "first_stable_frame_ms": 41.1,
+          "frame_messages": 20,
+          "payload_bytes": 8332,
+          "duplicate_tokens": 0,
+          "unique_tokens": 511,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 43.6,
+          "subscribe_ack_ms": 43.6,
+          "first_stable_frame_ms": 43.5,
+          "frame_messages": 20,
+          "payload_bytes": 8700,
+          "duplicate_tokens": 0,
+          "unique_tokens": 534,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 41,
+          "subscribe_ack_ms": 41,
+          "first_stable_frame_ms": 41,
+          "frame_messages": 20,
+          "payload_bytes": 9068,
+          "duplicate_tokens": 0,
+          "unique_tokens": 557,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 42.8,
+          "subscribe_ack_ms": 42.8,
+          "first_stable_frame_ms": 42.7,
+          "frame_messages": 20,
+          "payload_bytes": 9436,
+          "duplicate_tokens": 0,
+          "unique_tokens": 580,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 41.8,
+          "subscribe_ack_ms": 41.8,
+          "first_stable_frame_ms": 41.8,
+          "frame_messages": 20,
+          "payload_bytes": 9804,
+          "duplicate_tokens": 0,
+          "unique_tokens": 603,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 43.4,
+          "subscribe_ack_ms": 43.4,
+          "first_stable_frame_ms": 43.4,
+          "frame_messages": 20,
+          "payload_bytes": 10172,
+          "duplicate_tokens": 0,
+          "unique_tokens": 626,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 42.4,
+          "subscribe_ack_ms": 42.4,
+          "first_stable_frame_ms": 42.4,
+          "frame_messages": 20,
+          "payload_bytes": 10540,
+          "duplicate_tokens": 0,
+          "unique_tokens": 649,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 41.8,
+          "subscribe_ack_ms": 41.8,
+          "first_stable_frame_ms": 41.8,
+          "frame_messages": 20,
+          "payload_bytes": 10924,
+          "duplicate_tokens": 1,
+          "unique_tokens": 672,
+          "blank_attach": false
+        },
+        {
+          "protocol": "v2",
+          "handshake_event": "attach_ready",
+          "handshake_ms": 42.9,
+          "subscribe_ack_ms": 42.9,
+          "first_stable_frame_ms": 42.9,
+          "frame_messages": 20,
+          "payload_bytes": 11292,
+          "duplicate_tokens": 1,
+          "unique_tokens": 695,
+          "blank_attach": false
+        }
+      ]
+    }
+  }
+}

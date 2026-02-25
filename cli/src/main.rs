@@ -21,7 +21,7 @@ mod qr;
 mod session;
 mod setup;
 mod shell_hook;
-mod tmux;
+
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;

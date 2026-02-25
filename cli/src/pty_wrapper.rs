@@ -9,14 +9,12 @@
 
 use crate::daemon::{get_port, DEFAULT_PORT};
 use crate::protocol::PtyResizeReason;
-use crate::tmux::sanitize_tmux_token;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use colored::Colorize;
 use futures_util::{SinkExt, StreamExt};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::borrow::Cow;
 use std::io::{IsTerminal, Read, Write};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
@@ -42,27 +40,6 @@ pub struct WrapConfig {
     pub session_name: String,
     pub quiet: bool,
     pub working_dir: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RuntimeMode {
-    Pty,
-    Tmux,
-}
-
-impl RuntimeMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Pty => "pty",
-            Self::Tmux => "tmux",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct TmuxContext {
-    socket_name: String,
-    session_name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,218 +133,6 @@ fn request_terminal_resize(cols: u16, rows: u16) {
     set_stdout_winsize(cols, rows);
 }
 
-fn tmux_base_command(socket_name: &str) -> Command {
-    let mut cmd = Command::new("tmux");
-    cmd.arg("-L")
-        .arg(socket_name)
-        .arg("-f")
-        .arg("/dev/null")
-        .env_remove("TMUX");
-    cmd
-}
-
-fn run_tmux_checked(cmd: &mut Command, context: &str) -> Result<(), WrapError> {
-    let output = cmd
-        .output()
-        .map_err(|e| WrapError::Pty(format!("Failed to run tmux ({context}): {e}")))?;
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let detail = if !stderr.is_empty() {
-        stderr
-    } else if !stdout.is_empty() {
-        stdout
-    } else {
-        format!("exit status {}", output.status)
-    };
-    Err(WrapError::Pty(format!(
-        "tmux command failed ({context}): {detail}"
-    )))
-}
-
-fn resolve_runtime_mode() -> RuntimeMode {
-    let requested = std::env::var("MOBILECLI_RUNTIME")
-        .unwrap_or_else(|_| "auto".to_string())
-        .to_lowercase();
-
-    match requested.as_str() {
-        "pty" | "legacy" => RuntimeMode::Pty,
-        "tmux" => {
-            if which::which("tmux").is_ok() {
-                RuntimeMode::Tmux
-            } else {
-                tracing::warn!(
-                    "MOBILECLI_RUNTIME=tmux requested, but tmux is not installed; falling back to pty runtime"
-                );
-                RuntimeMode::Pty
-            }
-        }
-        // Default auto policy prefers tmux when available because frame-rendered
-        // TUIs (Codex/OpenCode/etc.) need multiplexer semantics for reliable reattach.
-        "auto" | "" => {
-            if which::which("tmux").is_ok() {
-                RuntimeMode::Tmux
-            } else {
-                RuntimeMode::Pty
-            }
-        }
-        other => {
-            tracing::warn!(
-                "Unknown MOBILECLI_RUNTIME='{}'. Falling back to auto policy.",
-                other
-            );
-            if which::which("tmux").is_ok() {
-                RuntimeMode::Tmux
-            } else {
-                RuntimeMode::Pty
-            }
-        }
-    }
-}
-
-fn setup_tmux_session(
-    socket_name: &str,
-    session_name: &str,
-    command_path: &str,
-    args: &[String],
-    cwd: &str,
-    cols: u16,
-    rows: u16,
-) -> Result<(), WrapError> {
-    // Bootstrap a dedicated tmux server first so global options apply before
-    // the wrapped CLI starts. We also disable alternate-screen globally here
-    // because the pty_wrapper runs tmux attach-session inside the host
-    // terminal (e.g. Konsole). If alternate-screen is enabled, tmux forwards
-    // \x1b[?1049h to the host terminal when TUI apps run, causing the host to
-    // enter its own alt-screen and lose its scrollback. Disabling it keeps
-    // all output in the main buffer where capture-pane can reach it.
-    let mut start_server = tmux_base_command(socket_name);
-    start_server.arg("start-server");
-    let _ = run_tmux_checked(&mut start_server, "start-server");
-
-    let mut pre_alt_screen = tmux_base_command(socket_name);
-    pre_alt_screen
-        .arg("set-window-option")
-        .arg("-g")
-        .arg("alternate-screen")
-        .arg("off");
-    if let Err(err) = run_tmux_checked(&mut pre_alt_screen, "alternate-screen") {
-        tracing::debug!(
-            socket = socket_name,
-            session = session_name,
-            error = %err,
-            "Ignoring non-fatal pre-session alternate-screen option failure"
-        );
-    }
-
-    // Set history-limit globally BEFORE creating the session. tmux allocates
-    // each pane's history buffer at window-creation time using the current
-    // history-limit value; setting it after new-session has no effect on the
-    // window that was already created with the default 2000 lines.
-    let mut pre_history = tmux_base_command(socket_name);
-    pre_history
-        .arg("set-option")
-        .arg("-g")
-        .arg("history-limit")
-        .arg("200000");
-    if let Err(err) = run_tmux_checked(&mut pre_history, "history-limit") {
-        tracing::debug!(
-            socket = socket_name,
-            session = session_name,
-            error = %err,
-            "Ignoring non-fatal pre-session history-limit option failure"
-        );
-    }
-
-    let mut new_session = tmux_base_command(socket_name);
-    new_session
-        .arg("new-session")
-        .arg("-d")
-        .arg("-s")
-        .arg(session_name)
-        .arg("-x")
-        .arg(cols.to_string())
-        .arg("-y")
-        .arg(rows.to_string())
-        .arg("--")
-        .arg(command_path)
-        .args(args)
-        .current_dir(cwd)
-        .env("TERM", "xterm-256color")
-        .env("MOBILECLI_SESSION", "1");
-    run_tmux_checked(&mut new_session, "new-session")?;
-
-    // Best-effort options for deterministic rendering behavior.
-    // NOTE: window-size must remain dynamic so wrapper PTY resizes propagate
-    // into tmux panes when mobile dimensions change.
-    let window_target = format!("{}:0", session_name);
-    // Disable smcup/rmcup so tmux itself does NOT enter Konsole's alternate
-    // screen on attach. Without this, Konsole has zero scrollback while tmux
-    // is attached (alt-screen has no history buffer). With it disabled, tmux
-    // renders in Konsole's main buffer and the scrollbar works.
-    let mut disable_altscreen_client = tmux_base_command(socket_name);
-    disable_altscreen_client
-        .arg("set-option")
-        .arg("-g")
-        .arg("terminal-overrides")
-        .arg("xterm*:smcup@:rmcup@");
-    let _ = run_tmux_checked(&mut disable_altscreen_client, "terminal-overrides");
-
-    // Enable mouse so scroll wheel works with tmux's history buffer.
-    let mut mouse_on = tmux_base_command(socket_name);
-    mouse_on.arg("set-option").arg("-g").arg("mouse").arg("on");
-    let _ = run_tmux_checked(&mut mouse_on, "mouse");
-
-    // history-limit is set globally before new-session so the window is
-    // allocated with the full 200K-line buffer from the start.
-    let option_sets: [(&str, &str, &str, &str); 4] = [
-        ("set-option", session_name, "status", "off"),
-        ("set-option", session_name, "allow-rename", "off"),
-        (
-            "set-window-option",
-            &window_target,
-            "alternate-screen",
-            "off",
-        ),
-        ("set-window-option", &window_target, "window-size", "latest"),
-    ];
-    for (command, target, key, value) in option_sets {
-        let mut option_cmd = tmux_base_command(socket_name);
-        option_cmd
-            .arg(command)
-            .arg("-t")
-            .arg(target)
-            .arg(key)
-            .arg(value);
-        if let Err(err) = run_tmux_checked(&mut option_cmd, key) {
-            tracing::debug!(
-                socket = socket_name,
-                session = session_name,
-                option = key,
-                error = %err,
-                "Ignoring non-fatal tmux option failure"
-            );
-        }
-    }
-    Ok(())
-}
-
-fn cleanup_tmux_session(ctx: &TmuxContext) {
-    let mut cmd = tmux_base_command(&ctx.socket_name);
-    cmd.arg("kill-server");
-    if let Err(err) = run_tmux_checked(&mut cmd, "kill-server") {
-        tracing::debug!(
-            socket = %ctx.socket_name,
-            session = %ctx.session_name,
-            error = %err,
-            "Best-effort tmux cleanup failed"
-        );
-    }
-}
-
 fn resolve_resize_reason(cols: u16, rows: u16, reason: Option<&str>) -> PtyResizeReason {
     if cols == 0 || rows == 0 {
         return PtyResizeReason::DetachRestore;
@@ -425,7 +190,6 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
     // Resolve the command path
     let cmd_path = resolve_command(&config.command)
         .ok_or_else(|| WrapError::CommandNotFound(config.command.clone()))?;
-    let runtime_mode = resolve_runtime_mode();
 
     // Generate session ID (12 chars for better collision resistance)
     let session_id = uuid::Uuid::new_v4().to_string()[..12].to_string();
@@ -453,7 +217,6 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
         "name": config.session_name,
         "command": config.command,
         "project_path": cwd,
-        "runtime": runtime_mode.as_str(),
     });
     ws_tx
         .send(Message::Text(register_msg.to_string()))
@@ -473,7 +236,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
 
     if !config.quiet {
         println!(
-            "{} {} {} {}",
+            "{} {} {}",
             "📱".green(),
             "Connected!".green().bold(),
             format!(
@@ -481,7 +244,6 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                 config.session_name
             )
             .dimmed(),
-            format!("[runtime:{}]", runtime_mode.as_str()).dimmed()
         );
     }
 
@@ -498,43 +260,9 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
         })
         .map_err(|e| WrapError::Pty(e.to_string()))?;
 
-    let mut tmux_context: Option<TmuxContext> = None;
-    if runtime_mode == RuntimeMode::Tmux {
-        let token = sanitize_tmux_token(&session_id);
-        let ctx = TmuxContext {
-            socket_name: format!("mcli-{}", token),
-            session_name: format!("mcli-{}", token),
-        };
-        setup_tmux_session(
-            &ctx.socket_name,
-            &ctx.session_name,
-            &cmd_path,
-            &config.args,
-            &cwd,
-            cols,
-            rows,
-        )?;
-        tmux_context = Some(ctx);
-    }
-
-    // Build command
-    let mut cmd = if let Some(ctx) = &tmux_context {
-        let mut c = CommandBuilder::new("tmux");
-        c.args([
-            "-L",
-            ctx.socket_name.as_str(),
-            "-f",
-            "/dev/null",
-            "attach-session",
-            "-t",
-            ctx.session_name.as_str(),
-        ]);
-        c
-    } else {
-        let mut c = CommandBuilder::new(&cmd_path);
-        c.args(&config.args);
-        c
-    };
+    // Build command - run directly (no tmux wrapping)
+    let mut cmd = CommandBuilder::new(&cmd_path);
+    cmd.args(&config.args);
     cmd.cwd(&cwd);
 
     // Set up environment for interactive shell
@@ -547,12 +275,10 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
     cmd.env("MOBILECLI_SESSION", "1");
 
     // Spawn the command
-    let mut child = pair.slave.spawn_command(cmd).map_err(|e| {
-        if let Some(ctx) = &tmux_context {
-            cleanup_tmux_session(ctx);
-        }
-        WrapError::Pty(e.to_string())
-    })?;
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| WrapError::Pty(e.to_string()))?;
 
     // Drop the slave - we communicate through the master
     drop(pair.slave);
@@ -697,34 +423,9 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                                             "Wrapper resize request"
                                         );
 
-                                        if reason == PtyResizeReason::KeyboardOverlay {
-                                            let (ack_c, ack_r) = last_applied_pty_size.unwrap_or((c, r));
-                                            tracing::debug!(
-                                                session_id = %session_id,
-                                                cols = c,
-                                                rows = r,
-                                                epoch = ?epoch,
-                                                reason = reason.as_str(),
-                                                decision = "ignored_keyboard_overlay",
-                                                "Ignoring keyboard-only resize in wrapper"
-                                            );
-
-                                            let mut resized_msg = serde_json::json!({
-                                                "type": "pty_resized",
-                                                "cols": ack_c,
-                                                "rows": ack_r,
-                                            });
-                                            if let Some(epoch) = epoch {
-                                                resized_msg["epoch"] = serde_json::json!(epoch);
-                                            }
-                                            let _ = ws_tx.send(Message::Text(resized_msg.to_string())).await;
-                                            continue;
-                                        }
-
                                         if reason == PtyResizeReason::DetachRestore {
                                             // Mobile detached. Restore PTY dimensions to the host
-                                            // terminal's pre-mobile size when available. In mirror
-                                            // mode, also restore the host window.
+                                            // terminal's pre-mobile size when available.
                                             let (restore_c, restore_r) = match desktop_resize_policy {
                                                 DesktopResizePolicy::Mirror => {
                                                     if let Some((lc, lr)) = saved_local_size.take() {
@@ -858,10 +559,6 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
     // Wait for reader thread
     let _ = reader_handle.join();
 
-    if let Some(ctx) = &tmux_context {
-        cleanup_tmux_session(ctx);
-    }
-
     // Print exit message
     println!();
     if exit_code == 0 {
@@ -919,10 +616,7 @@ fn restore_terminal_mode(_original: Option<()>) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        cleanup_tmux_session, resolve_resize_reason, resolve_runtime_mode, sanitize_tmux_token,
-        setup_tmux_session, tmux_base_command, RuntimeMode, TmuxContext,
-    };
+    use super::resolve_resize_reason;
     use crate::protocol::PtyResizeReason;
 
     #[test]
@@ -944,122 +638,12 @@ mod tests {
             PtyResizeReason::AttachInit
         );
         assert_eq!(
-            resolve_resize_reason(80, 24, Some("keyboard_overlay")),
-            PtyResizeReason::KeyboardOverlay
-        );
-        assert_eq!(
             resolve_resize_reason(80, 24, Some("detach_restore")),
             PtyResizeReason::DetachRestore
         );
         assert_eq!(
             resolve_resize_reason(80, 24, Some("future_reason")),
             PtyResizeReason::GeometryChange
-        );
-    }
-
-    #[test]
-    fn tmux_token_sanitizes_non_identifier_chars() {
-        assert_eq!(sanitize_tmux_token("abc123"), "abc123");
-        assert_eq!(sanitize_tmux_token("abc/def"), "abc-def");
-        assert_eq!(sanitize_tmux_token(""), "session");
-    }
-
-    #[test]
-    fn runtime_mode_honors_explicit_pty_override() {
-        std::env::set_var("MOBILECLI_RUNTIME", "pty");
-        assert_eq!(resolve_runtime_mode(), RuntimeMode::Pty);
-        std::env::remove_var("MOBILECLI_RUNTIME");
-    }
-
-    #[test]
-    fn tmux_session_bootstrap_and_cleanup_roundtrip() {
-        if which::which("tmux").is_err() {
-            return;
-        }
-
-        let token = sanitize_tmux_token(&uuid::Uuid::new_v4().to_string()[..12]);
-        let ctx = TmuxContext {
-            socket_name: format!("mcli-test-{}", token),
-            session_name: format!("mcli-test-{}", token),
-        };
-
-        setup_tmux_session(
-            &ctx.socket_name,
-            &ctx.session_name,
-            "/bin/sh",
-            // Keep the session alive long enough for CI has-session checks.
-            &vec!["-lc".to_string(), "sleep 10 & wait".to_string()],
-            ".",
-            80,
-            24,
-        )
-        .expect("setup tmux session");
-
-        let mut has_session = tmux_base_command(&ctx.socket_name);
-        let output = has_session
-            .arg("has-session")
-            .arg("-t")
-            .arg(&ctx.session_name)
-            .output()
-            .expect("has-session output");
-        assert!(
-            output.status.success(),
-            "expected has-session success: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-
-        let mut show_window_size = tmux_base_command(&ctx.socket_name);
-        let output = show_window_size
-            .arg("show-window-options")
-            .arg("-v")
-            .arg("-t")
-            .arg(format!("{}:0", &ctx.session_name))
-            .arg("window-size")
-            .output()
-            .expect("show-window-options output");
-        assert!(
-            output.status.success(),
-            "expected show-window-options success: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let window_size_mode = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        assert_eq!(
-            window_size_mode, "latest",
-            "expected tmux window-size to remain dynamic for client-driven resize propagation"
-        );
-
-        let mut show_alt_screen = tmux_base_command(&ctx.socket_name);
-        let output = show_alt_screen
-            .arg("show-window-options")
-            .arg("-v")
-            .arg("-t")
-            .arg(format!("{}:0", &ctx.session_name))
-            .arg("alternate-screen")
-            .output()
-            .expect("show-window-options alternate-screen output");
-        assert!(
-            output.status.success(),
-            "expected alternate-screen query success: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let alt_screen_mode = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        assert_eq!(
-            alt_screen_mode, "off",
-            "expected tmux alternate-screen to be disabled to protect host terminal scrollback"
-        );
-
-        cleanup_tmux_session(&ctx);
-
-        let mut has_after_cleanup = tmux_base_command(&ctx.socket_name);
-        let output = has_after_cleanup
-            .arg("has-session")
-            .arg("-t")
-            .arg(&ctx.session_name)
-            .output()
-            .expect("has-session output");
-        assert!(
-            !output.status.success(),
-            "expected tmux session cleanup to remove server/session"
         );
     }
 }

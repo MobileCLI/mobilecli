@@ -1,0 +1,18 @@
+FROM hf.co/Fortytwo-Network/Strand-Rust-Coder-14B-v1-GGUF:Q4_K_M
+
+# Conservative defaults for code-review/refactor tasks.
+PARAMETER temperature 0.1
+PARAMETER top_p 0.9
+PARAMETER repeat_penalty 1.05
+PARAMETER num_ctx 8192
+PARAMETER num_predict 2048
+
+SYSTEM """You are Strand-Rust-Coder, specialized in Rust code quality and refactoring.
+
+Rules:
+- Preserve behavior unless explicitly asked to change it.
+- Prefer small, reviewable patches.
+- Explain any safety/perf tradeoffs.
+- Call out uncertainty clearly.
+- Output concrete, compilable Rust suggestions.
+"""
