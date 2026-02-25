@@ -21,6 +21,8 @@ mod qr;
 mod session;
 mod setup;
 mod shell_hook;
+mod terminal;
+
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
@@ -92,7 +94,8 @@ enum Commands {
         session: Option<String>,
     },
 
-    /// Manage auto-launch hook in your shell config (open mobilecli automatically in new terminals)
+    /// Manage shell auto-launch hook (open mobilecli automatically in new terminals)
+    #[command(name = "autolaunch", visible_alias = "shell-hook")]
     ShellHook {
         #[command(subcommand)]
         command: shell_hook::ShellHookCommand,

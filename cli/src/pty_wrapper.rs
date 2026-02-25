@@ -8,6 +8,7 @@
 //! 5. Handles terminal resize events
 
 use crate::daemon::{get_port, DEFAULT_PORT};
+use crate::protocol::PtyResizeReason;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use colored::Colorize;
 use futures_util::{SinkExt, StreamExt};
@@ -132,6 +133,21 @@ fn request_terminal_resize(cols: u16, rows: u16) {
     set_stdout_winsize(cols, rows);
 }
 
+fn resolve_resize_reason(cols: u16, rows: u16, reason: Option<&str>) -> PtyResizeReason {
+    if cols == 0 || rows == 0 {
+        return PtyResizeReason::DetachRestore;
+    }
+
+    match reason {
+        Some("attach_init") => PtyResizeReason::AttachInit,
+        Some("geometry_change") => PtyResizeReason::GeometryChange,
+        Some("reconnect_sync") => PtyResizeReason::ReconnectSync,
+        Some("keyboard_overlay") => PtyResizeReason::KeyboardOverlay,
+        Some("detach_restore") => PtyResizeReason::DetachRestore,
+        _ => PtyResizeReason::GeometryChange,
+    }
+}
+
 /// Normalize newline input sequences before writing into the PTY.
 ///
 /// Different environments (raw/canonical mode, ICRNL, etc.) may send Enter as
@@ -227,7 +243,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                 "Session '{}' is now visible on your phone",
                 config.session_name
             )
-            .dimmed()
+            .dimmed(),
         );
     }
 
@@ -244,7 +260,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
         })
         .map_err(|e| WrapError::Pty(e.to_string()))?;
 
-    // Build command
+    // Build command - run directly (no tmux wrapping)
     let mut cmd = CommandBuilder::new(&cmd_path);
     cmd.args(&config.args);
     cmd.cwd(&cwd);
@@ -340,6 +356,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
     let mut stdout = std::io::stdout();
     let desktop_resize_policy = DesktopResizePolicy::from_env();
     let mut saved_local_size: Option<(u16, u16)> = None;
+    let mut last_applied_pty_size: Option<(u16, u16)> = Some((cols, rows));
     let mut exit_code: i32 = 0;
 
     loop {
@@ -391,12 +408,25 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                                         msg["cols"].as_u64(),
                                         msg["rows"].as_u64(),
                                     ) {
+                                        let mut c = cols.min(u16::MAX as u64) as u16;
+                                        let mut r = rows.min(u16::MAX as u64) as u16;
                                         let epoch = msg["epoch"].as_u64();
-                                        if cols == 0 || rows == 0 {
-                                            // Mobile detached. Restore PTY dimensions to the
-                                            // host terminal's current size. In mirror mode,
-                                            // also restore the host window to the original size.
-                                            let (c, r) = match desktop_resize_policy {
+                                        let reason =
+                                            resolve_resize_reason(c, r, msg["reason"].as_str());
+                                        tracing::debug!(
+                                            session_id = %session_id,
+                                            cols = c,
+                                            rows = r,
+                                            epoch = ?epoch,
+                                            reason = reason.as_str(),
+                                            policy = ?desktop_resize_policy,
+                                            "Wrapper resize request"
+                                        );
+
+                                        if reason == PtyResizeReason::DetachRestore {
+                                            // Mobile detached. Restore PTY dimensions to the host
+                                            // terminal's pre-mobile size when available.
+                                            let (restore_c, restore_r) = match desktop_resize_policy {
                                                 DesktopResizePolicy::Mirror => {
                                                     if let Some((lc, lr)) = saved_local_size.take() {
                                                         request_terminal_resize(lc, lr);
@@ -406,57 +436,79 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                                                     }
                                                 }
                                                 DesktopResizePolicy::Preserve => {
-                                                    saved_local_size = None;
-                                                    get_terminal_size()
+                                                    if let Some((lc, lr)) = saved_local_size.take() {
+                                                        (lc, lr)
+                                                    } else {
+                                                        get_terminal_size()
+                                                    }
                                                 }
                                             };
-
-                                            let resized = master.resize(PtySize {
-                                                rows: r, cols: c,
-                                                pixel_width: 0, pixel_height: 0,
-                                            });
-                                            if resized.is_ok() {
-                                                let mut resized_msg = serde_json::json!({
-                                                    "type": "pty_resized",
-                                                    "cols": c,
-                                                    "rows": r,
-                                                });
-                                                if let Some(epoch) = epoch {
-                                                    resized_msg["epoch"] = serde_json::json!(epoch);
-                                                }
-                                                let _ = ws_tx.send(Message::Text(resized_msg.to_string())).await;
-                                            }
+                                            c = restore_c;
+                                            r = restore_r;
                                         } else {
                                             // Mobile active: always resize child PTY to mobile
                                             // dimensions. Host terminal mirroring is opt-in via
                                             // MOBILECLI_DESKTOP_RESIZE_POLICY=mirror.
-                                            if desktop_resize_policy == DesktopResizePolicy::Mirror
-                                                && saved_local_size.is_none()
-                                            {
+                                            if saved_local_size.is_none() {
                                                 saved_local_size = get_terminal_size_opt();
                                             }
-                                            let c = cols.min(u16::MAX as u64) as u16;
-                                            let r = rows.min(u16::MAX as u64) as u16;
                                             if desktop_resize_policy == DesktopResizePolicy::Mirror {
                                                 request_terminal_resize(c, r);
                                             }
+                                        }
 
+                                        let should_resize = last_applied_pty_size != Some((c, r));
+                                        if should_resize {
                                             let resized = master.resize(PtySize {
-                                                rows: r, cols: c,
-                                                pixel_width: 0, pixel_height: 0,
+                                                rows: r,
+                                                cols: c,
+                                                pixel_width: 0,
+                                                pixel_height: 0,
                                             });
                                             if resized.is_ok() {
-                                                let mut resized_msg = serde_json::json!({
-                                                    "type": "pty_resized",
-                                                    "cols": c,
-                                                    "rows": r,
-                                                });
-                                                if let Some(epoch) = epoch {
-                                                    resized_msg["epoch"] = serde_json::json!(epoch);
-                                                }
-                                                let _ = ws_tx.send(Message::Text(resized_msg.to_string())).await;
+                                                last_applied_pty_size = Some((c, r));
+                                                tracing::debug!(
+                                                    session_id = %session_id,
+                                                    cols = c,
+                                                    rows = r,
+                                                    epoch = ?epoch,
+                                                    reason = reason.as_str(),
+                                                    decision = "applied",
+                                                    "Applied PTY resize"
+                                                );
+                                            } else {
+                                                tracing::warn!(
+                                                    session_id = %session_id,
+                                                    cols = c,
+                                                    rows = r,
+                                                    epoch = ?epoch,
+                                                    reason = reason.as_str(),
+                                                    decision = "apply_failed",
+                                                    "Failed to apply PTY resize"
+                                                );
+                                                continue;
                                             }
+                                        } else {
+                                            tracing::debug!(
+                                                session_id = %session_id,
+                                                cols = c,
+                                                rows = r,
+                                                epoch = ?epoch,
+                                                reason = reason.as_str(),
+                                                decision = "noop",
+                                                "Skipping no-op PTY resize"
+                                            );
                                         }
+
+                                        let mut resized_msg = serde_json::json!({
+                                            "type": "pty_resized",
+                                            "cols": c,
+                                            "rows": r,
+                                        });
+                                        if let Some(epoch) = epoch {
+                                            resized_msg["epoch"] = serde_json::json!(epoch);
+                                        }
+                                        let _ = ws_tx.send(Message::Text(resized_msg.to_string())).await;
                                     }
                                 }
                                 _ => {}
@@ -561,3 +613,37 @@ fn restore_terminal_mode(original: Option<nix::sys::termios::Termios>) {
 
 #[cfg(not(unix))]
 fn restore_terminal_mode(_original: Option<()>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_resize_reason;
+    use crate::protocol::PtyResizeReason;
+
+    #[test]
+    fn wrapper_reason_resolves_restore_from_zero_dimensions() {
+        assert_eq!(
+            resolve_resize_reason(0, 24, Some("geometry_change")),
+            PtyResizeReason::DetachRestore
+        );
+        assert_eq!(
+            resolve_resize_reason(80, 0, Some("attach_init")),
+            PtyResizeReason::DetachRestore
+        );
+    }
+
+    #[test]
+    fn wrapper_reason_maps_known_and_defaults_unknown() {
+        assert_eq!(
+            resolve_resize_reason(80, 24, Some("attach_init")),
+            PtyResizeReason::AttachInit
+        );
+        assert_eq!(
+            resolve_resize_reason(80, 24, Some("detach_restore")),
+            PtyResizeReason::DetachRestore
+        );
+        assert_eq!(
+            resolve_resize_reason(80, 24, Some("future_reason")),
+            PtyResizeReason::GeometryChange
+        );
+    }
+}
