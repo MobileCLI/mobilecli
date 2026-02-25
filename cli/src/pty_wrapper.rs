@@ -188,12 +188,6 @@ fn run_tmux_checked(cmd: &mut Command, context: &str) -> Result<(), WrapError> {
     )))
 }
 
-fn jitter_resize_target(cols: u16, rows: u16) -> (u16, u16) {
-    let jitter_cols = if cols > 1 { cols - 1 } else { cols + 1 };
-    let jitter_rows = if rows > 1 { rows - 1 } else { rows + 1 };
-    (jitter_cols, jitter_rows)
-}
-
 fn resolve_runtime_mode() -> RuntimeMode {
     let requested = std::env::var("MOBILECLI_RUNTIME")
         .unwrap_or_else(|_| "auto".to_string())
@@ -762,38 +756,8 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                                             }
                                         }
 
-                                        let force_noop_refresh = runtime_mode == RuntimeMode::Pty
-                                            && matches!(
-                                                reason,
-                                                PtyResizeReason::AttachInit
-                                                    | PtyResizeReason::ReconnectSync
-                                            )
-                                            && last_applied_pty_size == Some((c, r));
-
-                                        let should_resize =
-                                            force_noop_refresh || last_applied_pty_size != Some((c, r));
+                                        let should_resize = last_applied_pty_size != Some((c, r));
                                         if should_resize {
-                                            if force_noop_refresh {
-                                                let (jitter_c, jitter_r) = jitter_resize_target(c, r);
-                                                tracing::debug!(
-                                                    session_id = %session_id,
-                                                    cols = c,
-                                                    rows = r,
-                                                    jitter_cols = jitter_c,
-                                                    jitter_rows = jitter_r,
-                                                    epoch = ?epoch,
-                                                    reason = reason.as_str(),
-                                                    decision = "force_noop_redraw",
-                                                    "Applying jitter resize before final target to force redraw"
-                                                );
-                                                let _ = master.resize(PtySize {
-                                                    rows: jitter_r,
-                                                    cols: jitter_c,
-                                                    pixel_width: 0,
-                                                    pixel_height: 0,
-                                                });
-                                            }
-
                                             let resized = master.resize(PtySize {
                                                 rows: r,
                                                 cols: c,
@@ -956,8 +920,8 @@ fn restore_terminal_mode(_original: Option<()>) {}
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_tmux_session, jitter_resize_target, resolve_resize_reason, resolve_runtime_mode,
-        sanitize_tmux_token, setup_tmux_session, tmux_base_command, RuntimeMode, TmuxContext,
+        cleanup_tmux_session, resolve_resize_reason, resolve_runtime_mode, sanitize_tmux_token,
+        setup_tmux_session, tmux_base_command, RuntimeMode, TmuxContext,
     };
     use crate::protocol::PtyResizeReason;
 
@@ -998,12 +962,6 @@ mod tests {
         assert_eq!(sanitize_tmux_token("abc123"), "abc123");
         assert_eq!(sanitize_tmux_token("abc/def"), "abc-def");
         assert_eq!(sanitize_tmux_token(""), "session");
-    }
-
-    #[test]
-    fn jitter_target_always_changes_dimensions() {
-        assert_eq!(jitter_resize_target(80, 24), (79, 23));
-        assert_eq!(jitter_resize_target(1, 1), (2, 2));
     }
 
     #[test]
