@@ -2255,9 +2255,7 @@ async fn process_client_msg(
                                             Ok((tmux_socket, tmux_session))
                                         }
                                     }
-                                    Some(_) => {
-                                        Ok((tmux_socket, tmux_session))
-                                    }
+                                    Some(_) => Ok((tmux_socket, tmux_session)),
                                     None => {
                                         st.tmux_viewport_controllers
                                             .insert(session_id.clone(), addr);
