@@ -264,6 +264,8 @@ pub struct DaemonState {
     pub mobile_views: HashMap<SocketAddr, std::collections::HashSet<String>>,
     /// Current mobile controller socket for tmux shared viewport per session.
     pub tmux_viewport_controllers: HashMap<String, SocketAddr>,
+    /// Monotonic action sequence per tmux session for viewport frame/state ordering.
+    pub tmux_viewport_action_seq: HashMap<String, u64>,
     pub session_view_counts: HashMap<String, usize>,
     pub file_system: std::sync::Arc<FileSystemService>,
     pub file_watch_subscriptions: HashMap<SocketAddr, std::collections::HashSet<String>>,
@@ -306,6 +308,7 @@ impl DaemonState {
             push_tokens: Vec::new(),
             mobile_views: HashMap::new(),
             tmux_viewport_controllers: HashMap::new(),
+            tmux_viewport_action_seq: HashMap::new(),
             session_view_counts: HashMap::new(),
             file_system,
             file_watch_subscriptions: HashMap::new(),
@@ -1041,6 +1044,7 @@ async fn handle_pty_session(
         let mut st = state.write().await;
         if st.sessions.remove(&session_id).is_some() {
             st.tmux_viewport_controllers.remove(&session_id);
+            st.tmux_viewport_action_seq.remove(&session_id);
             clear_mobile_attach_for_session(&mut st, &session_id);
             // Notify about session end
             let msg = ServerMessage::SessionEnded {
@@ -2281,6 +2285,15 @@ async fn process_client_msg(
             let clamped_count = count
                 .unwrap_or(TMUX_VIEWPORT_DEFAULT_COUNT)
                 .clamp(1, TMUX_VIEWPORT_MAX_COUNT);
+            let action_seq = {
+                let mut st = state.write().await;
+                let seq = st
+                    .tmux_viewport_action_seq
+                    .entry(session_id.clone())
+                    .or_insert(0);
+                *seq = seq.saturating_add(1);
+                *seq
+            };
             let action_result = apply_tmux_viewport_action_with_retry(
                 socket.clone(),
                 name.clone(),
@@ -2288,11 +2301,38 @@ async fn process_client_msg(
                 clamped_count,
             )
             .await;
-            let viewport_state = query_tmux_viewport_state(socket, name)
+            let viewport_state = query_tmux_viewport_state(socket.clone(), name.clone())
                 .await
                 .unwrap_or_default();
+            let viewport_frame = capture_tmux_viewport_frame(
+                socket.clone(),
+                name.clone(),
+                viewport_state.in_copy_mode,
+            )
+            .await;
+            if let Some(frame) = viewport_frame {
+                let frame_msg = ServerMessage::TmuxViewportFrame {
+                    session_id: session_id.clone(),
+                    action_seq,
+                    data: BASE64.encode(frame),
+                    in_copy_mode: viewport_state.in_copy_mode,
+                    scroll_position: viewport_state.scroll_position,
+                    history_size: viewport_state.history_size,
+                    following_live: viewport_state.following_live,
+                };
+                tx.send(Message::Text(serde_json::to_string(&frame_msg)?))
+                    .await?;
+            } else {
+                tracing::debug!(
+                    session_id = %session_id,
+                    action = ?action,
+                    action_seq,
+                    "tmux viewport frame capture returned no bytes"
+                );
+            }
             let state_msg = ServerMessage::TmuxViewportState {
                 session_id: session_id.clone(),
+                action_seq: Some(action_seq),
                 in_copy_mode: viewport_state.in_copy_mode,
                 scroll_position: viewport_state.scroll_position,
                 history_size: viewport_state.history_size,
@@ -2364,6 +2404,7 @@ async fn process_client_msg(
                     // Clean up view counts for this session
                     st.session_view_counts.remove(&session_id);
                     st.tmux_viewport_controllers.remove(&session_id);
+                    st.tmux_viewport_action_seq.remove(&session_id);
                     clear_mobile_attach_for_session(&mut st, &session_id);
                     for views in st.mobile_views.values_mut() {
                         views.remove(&session_id);
@@ -3801,6 +3842,55 @@ async fn query_tmux_viewport_state(
         .await
         .ok()
         .flatten()
+}
+
+fn capture_tmux_viewport_frame_blocking(
+    socket: &str,
+    session: &str,
+    in_copy_mode: bool,
+) -> Option<Vec<u8>> {
+    let mode_attempts: &[bool] = if in_copy_mode {
+        &[true, false]
+    } else {
+        &[false]
+    };
+    for use_mode_capture in mode_attempts {
+        for target in tmux_targets(session) {
+            let mut cmd = std::process::Command::new("tmux");
+            cmd.arg("-L")
+                .arg(socket)
+                .arg("-f")
+                .arg("/dev/null")
+                .env_remove("TMUX")
+                .arg("capture-pane")
+                .arg("-p")
+                .arg("-e");
+            if *use_mode_capture {
+                cmd.arg("-M");
+            }
+            cmd.arg("-t").arg(&target);
+            let output = cmd.output();
+            if let Ok(out) = output {
+                if out.status.success() {
+                    return Some(out.stdout);
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn capture_tmux_viewport_frame(
+    socket: String,
+    session: String,
+    in_copy_mode: bool,
+) -> Option<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        capture_tmux_viewport_frame_blocking(&socket, &session, in_copy_mode)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 fn capture_tmux_history_blocking(
