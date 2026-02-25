@@ -2224,44 +2224,26 @@ async fn process_client_msg(
                             } else if !sender_is_viewing {
                                 Err((
                                     "unauthorized_viewport",
-                                    "viewport control requires the active mobile controller"
-                                        .to_string(),
+                                    "viewport control requires an active mobile viewer".to_string(),
                                 ))
                             } else {
-                                let active_controller =
-                                    st.tmux_viewport_controllers.get(&session_id).copied();
-                                match active_controller {
-                                    Some(controller) if controller != addr => {
-                                        let controller_is_viewing = st
-                                            .mobile_views
-                                            .get(&controller)
-                                            .map(|views| views.contains(&session_id))
-                                            .unwrap_or(false);
-                                        if controller_is_viewing {
-                                            Err((
-                                                "unauthorized_viewport",
-                                                "viewport control requires the active mobile controller"
-                                                    .to_string(),
-                                            ))
-                                        } else {
-                                            st.tmux_viewport_controllers
-                                                .insert(session_id.clone(), addr);
-                                            tracing::debug!(
-                                                session_id = %session_id,
-                                                stale_controller = %controller,
-                                                new_controller = %addr,
-                                                "Reclaimed stale tmux viewport controller on action"
-                                            );
-                                            Ok((tmux_socket, tmux_session))
-                                        }
+                                // Action wins controller ownership. This prevents stale or
+                                // ghost sockets from locking viewport control after reconnects.
+                                match st
+                                    .tmux_viewport_controllers
+                                    .insert(session_id.clone(), addr)
+                                {
+                                    Some(previous) if previous != addr => {
+                                        tracing::debug!(
+                                            session_id = %session_id,
+                                            previous_controller = %previous,
+                                            new_controller = %addr,
+                                            "Reassigned tmux viewport controller on action"
+                                        );
                                     }
-                                    Some(_) => Ok((tmux_socket, tmux_session)),
-                                    None => {
-                                        st.tmux_viewport_controllers
-                                            .insert(session_id.clone(), addr);
-                                        Ok((tmux_socket, tmux_session))
-                                    }
+                                    _ => {}
                                 }
+                                Ok((tmux_socket, tmux_session))
                             }
                         }
                     }
