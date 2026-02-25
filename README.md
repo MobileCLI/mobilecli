@@ -87,7 +87,6 @@ This starts the daemon, generates a cryptographic auth token, and displays a QR 
 ```bash
 mobilecli claude                    # Claude Code
 mobilecli codex                     # OpenAI Codex
-mobilecli gemini                    # Gemini CLI
 mobilecli -n "DB Migration" claude  # Named session
 mobilecli bash                      # Plain shell
 mobilecli                           # Your default $SHELL
@@ -136,7 +135,7 @@ The daemon allocates a PTY (pseudo-terminal) for each session, streams the byte 
 
 ### Multi-session management
 
-Run multiple AI assistants simultaneously. The Sessions tab shows all active and historical sessions with live status indicators. Long-press to rename or close sessions. Tap the **+** button to spawn a new CLI directly from your phone — Claude Code, Codex, Gemini CLI, OpenCode, or a plain shell.
+Run multiple AI assistants simultaneously. The Sessions tab shows all active and historical sessions with live status indicators. Long-press to rename or close sessions. Tap the **+** button to spawn a new CLI directly from your phone — Claude Code, OpenAI Codex, or a plain shell.
 
 Sessions persist across daemon restarts. If you close the app and come back, your sessions are still there with full scrollback history.
 
@@ -149,8 +148,7 @@ The daemon automatically identifies which AI assistant is running in each sessio
 | **Claude Code** | ANSI output parsing | Tool calls, plan reviews, questions, completion |
 | **OpenAI Codex** | Output pattern matching | Approval prompts, completion signals |
 | **Gemini CLI** | Prompt detection | Yes/No prompts, input requests |
-| **OpenCode** | TUI state parsing | Navigation prompts, approval dialogs |
-| **Any command** | Generic | Full terminal with manual interaction |
+| **Shell** | Generic | Full terminal with manual interaction |
 
 When a wait state is detected, the daemon fires a push notification to your phone. You don't need to keep the app open or watch the session — you'll be alerted the moment your attention is needed.
 
