@@ -1895,17 +1895,37 @@ async fn process_client_msg(
                 *count += 1;
             }
             if st.tmux_viewport_supported && runtime_for_log == "tmux" {
-                let controller = st
-                    .tmux_viewport_controllers
-                    .entry(session_id.clone())
-                    .or_insert(addr);
-                if *controller != addr {
-                    tracing::debug!(
-                        session_id = %session_id,
-                        active_controller = %controller,
-                        requester = %addr,
-                        "Keeping existing tmux viewport controller on subscribe"
-                    );
+                let active_controller = st.tmux_viewport_controllers.get(&session_id).copied();
+                match active_controller {
+                    Some(controller) if controller != addr => {
+                        let controller_is_viewing = st
+                            .mobile_views
+                            .get(&controller)
+                            .map(|views| views.contains(&session_id))
+                            .unwrap_or(false);
+                        if controller_is_viewing {
+                            tracing::debug!(
+                                session_id = %session_id,
+                                active_controller = %controller,
+                                requester = %addr,
+                                "Keeping existing tmux viewport controller on subscribe"
+                            );
+                        } else {
+                            st.tmux_viewport_controllers
+                                .insert(session_id.clone(), addr);
+                            tracing::debug!(
+                                session_id = %session_id,
+                                stale_controller = %controller,
+                                new_controller = %addr,
+                                "Reassigned stale tmux viewport controller on subscribe"
+                            );
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        st.tmux_viewport_controllers
+                            .insert(session_id.clone(), addr);
+                    }
                 }
             }
             if use_attach_v2 {
@@ -2208,21 +2228,39 @@ async fn process_client_msg(
                                         .to_string(),
                                 ))
                             } else {
-                                match st.tmux_viewport_controllers.entry(session_id.clone()) {
-                                    std::collections::hash_map::Entry::Occupied(entry)
-                                        if *entry.get() != addr =>
-                                    {
-                                        Err((
-                                            "unauthorized_viewport",
-                                            "viewport control requires the active mobile controller"
-                                                .to_string(),
-                                        ))
+                                let active_controller =
+                                    st.tmux_viewport_controllers.get(&session_id).copied();
+                                match active_controller {
+                                    Some(controller) if controller != addr => {
+                                        let controller_is_viewing = st
+                                            .mobile_views
+                                            .get(&controller)
+                                            .map(|views| views.contains(&session_id))
+                                            .unwrap_or(false);
+                                        if controller_is_viewing {
+                                            Err((
+                                                "unauthorized_viewport",
+                                                "viewport control requires the active mobile controller"
+                                                    .to_string(),
+                                            ))
+                                        } else {
+                                            st.tmux_viewport_controllers
+                                                .insert(session_id.clone(), addr);
+                                            tracing::debug!(
+                                                session_id = %session_id,
+                                                stale_controller = %controller,
+                                                new_controller = %addr,
+                                                "Reclaimed stale tmux viewport controller on action"
+                                            );
+                                            Ok((tmux_socket, tmux_session))
+                                        }
                                     }
-                                    std::collections::hash_map::Entry::Occupied(_) => {
+                                    Some(_) => {
                                         Ok((tmux_socket, tmux_session))
                                     }
-                                    std::collections::hash_map::Entry::Vacant(entry) => {
-                                        entry.insert(addr);
+                                    None => {
+                                        st.tmux_viewport_controllers
+                                            .insert(session_id.clone(), addr);
                                         Ok((tmux_socket, tmux_session))
                                     }
                                 }
