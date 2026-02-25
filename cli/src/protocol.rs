@@ -273,7 +273,6 @@ pub enum ServerMessage {
     AttachBegin {
         session_id: String,
         attach_id: u64,
-        runtime: String,
         mode: String, // "fresh" | "reconnect"
         in_alt_screen: bool,
     },
@@ -423,11 +422,16 @@ pub struct SessionListItem {
     pub project_path: String,
     pub ws_port: u16,
     pub started_at: String,
-    /// Explicit CLI type identifier for mobile app disambiguation
+    /// Explicit CLI type identifier for mobile app disambiguation (deprecated, always "terminal")
+    #[serde(default = "default_cli_type")]
     pub cli_type: String,
-    /// Runtime backend for this session (`pty` or `tmux`).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Runtime backend for this session (deprecated, always None)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub runtime: Option<String>,
+}
+
+fn default_cli_type() -> String {
+    "terminal".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -3,9 +3,8 @@
 //! Single WebSocket server that all terminal sessions stream to.
 //! Mobile connects once and sees all active sessions.
 
-use crate::detection::{
-    detect_wait_event, strip_ansi_and_normalize, ApprovalModel, CliTracker, CliType, WaitType,
-};
+// CLI detection types removed - using pure terminal behavior
+// use crate::detection::...;
 use crate::filesystem::{config::FileSystemConfig, rate_limit::RateLimiter, FileSystemService};
 use crate::platform;
 use crate::protocol::{
@@ -42,6 +41,39 @@ fn http_client() -> &'static reqwest::Client {
 
 /// Default WebSocket port
 pub const DEFAULT_PORT: u16 = 9847;
+
+/// Check if buffer contains ANSI cursor positioning sequences.
+/// This is used to detect TUI applications and avoid jumbled scrollback replay.
+fn contains_cursor_positioning(bytes: &[u8]) -> bool {
+    // Common cursor positioning sequences:
+    // ESC [ row ; col H  (CUP - Cursor Position)
+    // ESC [ row ; col f  (HVP - Horizontal and Vertical Position)
+    // ESC [ ? 25 h/l     (DECTCEM - Show/Hide Cursor)
+    // ESC 7 / ESC 8      (Save/Restore Cursor)
+    
+    // Simple check for ESC [ ... H/f or ESC 7/8
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1B && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'[' => {
+                    // Look for H or f at the end of the sequence
+                    let mut j = i + 2;
+                    while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';' || bytes[j] == b'?') {
+                        j += 1;
+                    }
+                    if j < bytes.len() && (bytes[j] == b'H' || bytes[j] == b'f') {
+                        return true;
+                    }
+                }
+                b'7' | b'8' => return true, // Save/Restore cursor
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    false
+}
 
 /// PID file path (cross-platform)
 fn pid_file() -> PathBuf {
@@ -93,16 +125,6 @@ pub fn get_pid() -> Option<u32> {
     std::fs::read_to_string(pid_file())
         .ok()
         .and_then(|s| s.trim().parse().ok())
-}
-
-/// Waiting state for a session
-#[derive(Debug, Clone)]
-pub struct WaitingState {
-    pub wait_type: WaitType, // normalized waiting type
-    pub prompt_content: String,
-    pub timestamp: chrono::DateTime<Utc>,
-    pub approval_model: ApprovalModel,
-    pub prompt_hash: u64,
 }
 
 /// Push notification token
@@ -1442,7 +1464,7 @@ async fn process_client_msg(
                     ready_rows,
                 )
             } else {
-                (None, false, 0, 0, 0, 0)
+                (None::<Vec<u8>>, false, 0, 0, 0, 0)
             };
 
             tracing::debug!(
@@ -1478,7 +1500,6 @@ async fn process_client_msg(
                 let begin = ServerMessage::AttachBegin {
                     session_id: session_id.clone(),
                     attach_id,
-                    runtime: runtime.clone(),
                     mode: if last_seen_seq.is_some() {
                         "reconnect".to_string()
                     } else {
@@ -1540,9 +1561,8 @@ async fn process_client_msg(
 
             // ── Step 2: replay history ────────────────────────────────────
             //
-            // PTY text sessions replay daemon scrollback.
-            if !render_as_tui {
-                if let Some(bytes) = scrollback_bytes {
+            // PTY text sessions replay daemon scrollback (only if safe to replay).
+            if let Some(bytes) = scrollback_bytes {
                     replay_events.push(("daemon_scrollback", bytes.len()));
                     if use_attach_v2 {
                         let chunks = chunk_snapshot_payload(&bytes);
@@ -1591,7 +1611,6 @@ async fn process_client_msg(
                         replay_bytes = bytes.len(),
                         "Attach replay sent"
                     );
-                }
             }
 
             // Always send SubscribeAck so mobile knows whether to suppress
@@ -1626,7 +1645,7 @@ async fn process_client_msg(
                 let ack = ServerMessage::SubscribeAck {
                     session_id: session_id.clone(),
                     in_alt_screen: mobile_in_alt_screen,
-                    runtime: Some(runtime),
+                    runtime: None,
                 };
                 if let Ok(text) = serde_json::to_string(&ack) {
                     let _ = tx.send(Message::Text(text)).await;
@@ -1674,7 +1693,6 @@ async fn process_client_msg(
                 session_id = %session_id,
                 addr = %addr,
                 attach_id,
-                runtime = %runtime_for_log,
                 protocol = overhaul_flags.attach_protocol.as_str(),
                 use_attach_v2,
                 clear_mode,
@@ -1729,7 +1747,6 @@ async fn process_client_msg(
                     if dropped > 0 {
                         tracing::debug!(
                             session_id = %session_id,
-                            runtime = %session.runtime,
                             dropped_sequences = dropped,
                             original_len = payload.len(),
                             filtered_len = filtered.len(),
@@ -2014,102 +2031,28 @@ async fn process_client_msg(
         }
         ClientMessage::ToolApproval {
             session_id,
-            response,
+            response: _,
         } => {
-            let maybe_input = {
-                let mut st = state.write().await;
-                if let Some(session) = st.sessions.get_mut(&session_id) {
-                    let model = session
-                        .waiting_state
-                        .as_ref()
-                        .map(|w| w.approval_model)
-                        .unwrap_or_else(|| session.cli_tracker.current().default_approval_model());
-                    approval_input_for(model, response.as_str())
-                } else {
-                    None
-                }
-            };
-
-            let mut cleared = false;
-            if let Some(input) = maybe_input {
-                let mut st = state.write().await;
-                if let Some(session) = st.sessions.get_mut(&session_id) {
-                    let _ = session.input_tx.send(input.as_bytes().to_vec());
-                    session.waiting_state = None;
-                    session.last_wait_hash = None;
-                    cleared = true;
-                }
-            } else {
-                tracing::warn!(
-                    "Tool approval ignored (no applicable approval model) for session {}",
-                    session_id
-                );
-            }
-
-            if cleared {
-                broadcast_waiting_cleared(state, &session_id).await;
-            }
+            // DEPRECATED: CLI detection and tool approval removed
+            tracing::warn!(
+                "Tool approval ignored (feature removed) for session {}",
+                session_id
+            );
         }
         ClientMessage::GetSessionHistory {
             session_id,
             max_bytes,
         } => {
-            let mut tmux_capture_req: Option<(String, String, usize, bool)> = None;
-            let (fallback_bytes, fallback_total_bytes) = {
+            let (data, total_bytes) = {
                 let st = state.read().await;
                 if let Some(session) = st.sessions.get(&session_id) {
                     let max = max_bytes.unwrap_or(session.scrollback_max_bytes);
-                    let render_as_tui =
-                        should_treat_as_tui_for_mobile(&session.runtime, session.in_alt_screen);
-                    if session.runtime == "tmux" {
-                        if let (Some(socket), Some(name)) =
-                            (session.tmux_socket.clone(), session.tmux_session.clone())
-                        {
-                            tmux_capture_req = Some((socket, name, max, !render_as_tui));
-                        }
-                        (Vec::new(), 0)
-                    } else if render_as_tui {
-                        // PTY alternate-screen sessions are live-only.
-                        (Vec::new(), 0)
-                    } else {
-                        tail_scrollback_bytes(session, max)
-                    }
+                    let (bytes, total) = tail_scrollback_bytes(session, max);
+                    (BASE64.encode(&bytes), total)
                 } else {
-                    (Vec::new(), 0)
+                    (String::new(), 0)
                 }
             };
-
-            let (data, total_bytes) =
-                if let Some((socket, name, max, include_scrollback)) = tmux_capture_req {
-                    // On-demand history requests use the full depth so users can
-                    // retrieve the maximum available scrollback from tmux.
-                    let max_lines = if include_scrollback {
-                        HISTORY_SCROLLBACK_LINES
-                    } else {
-                        0
-                    };
-                    if let Some(snapshot) =
-                        capture_tmux_history_with_retry(socket, name, include_scrollback, max_lines)
-                            .await
-                    {
-                        let total = snapshot.len();
-                        let skip = total.saturating_sub(max);
-                        (BASE64.encode(&snapshot[skip..]), total)
-                    } else {
-                        tracing::warn!(
-                            session_id = %session_id,
-                            "tmux capture-pane unavailable for session_history request"
-                        );
-                        (String::new(), 0)
-                    }
-                } else {
-                    tracing::debug!(
-                        session_id = %session_id,
-                        fallback_total_bytes = fallback_total_bytes,
-                        "Using daemon scrollback replay for session_history"
-                    );
-                    (BASE64.encode(&fallback_bytes), fallback_total_bytes)
-                };
 
             let msg = ServerMessage::SessionHistory {
                 session_id,
@@ -2939,8 +2882,8 @@ async fn send_sessions_list(
             project_path: s.project_path.clone(),
             ws_port: port,
             started_at: s.started_at.to_rfc3339(),
-            cli_type: s.cli_tracker.current().as_str().to_string(),
-            runtime: Some(s.runtime.clone()),
+            cli_type: "terminal".to_string(),
+            runtime: None,
         })
         .collect();
     let msg = ServerMessage::Sessions { sessions: items };
@@ -2962,8 +2905,8 @@ async fn broadcast_sessions_update(state: &SharedState) {
             project_path: s.project_path.clone(),
             ws_port: port,
             started_at: s.started_at.to_rfc3339(),
-            cli_type: s.cli_tracker.current().as_str().to_string(),
-            runtime: Some(s.runtime.clone()),
+            cli_type: "terminal".to_string(),
+            runtime: None,
         })
         .collect();
     let msg = ServerMessage::Sessions { sessions: items };
@@ -2994,46 +2937,6 @@ async fn persist_sessions_to_file(state: &SharedState) {
         .collect();
     if let Err(e) = session::save_sessions(&sessions) {
         tracing::warn!("Failed to persist sessions: {}", e);
-    }
-}
-
-/// Broadcast waiting_for_input to all mobile clients
-async fn broadcast_waiting_for_input(state: &SharedState, session_id: &str) {
-    let st = state.read().await;
-    let session = match st.sessions.get(session_id) {
-        Some(s) => s,
-        None => return,
-    };
-    let waiting = match session.waiting_state.as_ref() {
-        Some(w) => w,
-        None => return,
-    };
-
-    let msg = ServerMessage::WaitingForInput {
-        session_id: session_id.to_string(),
-        timestamp: waiting.timestamp.to_rfc3339(),
-        prompt_content: waiting.prompt_content.clone(),
-        wait_type: waiting.wait_type.as_str().to_string(),
-        cli_type: session.cli_tracker.current().as_str().to_string(),
-    };
-    if let Ok(msg_str) = serde_json::to_string(&msg) {
-        for client in st.mobile_clients.values() {
-            let _ = client.try_send(Message::Text(msg_str.clone()));
-        }
-    }
-}
-
-/// Broadcast waiting_cleared to all mobile clients
-async fn broadcast_waiting_cleared(state: &SharedState, session_id: &str) {
-    let st = state.read().await;
-    let msg = ServerMessage::WaitingCleared {
-        session_id: session_id.to_string(),
-        timestamp: Utc::now().to_rfc3339(),
-    };
-    if let Ok(msg_str) = serde_json::to_string(&msg) {
-        for client in st.mobile_clients.values() {
-            let _ = client.try_send(Message::Text(msg_str.clone()));
-        }
     }
 }
 
@@ -3084,50 +2987,16 @@ async fn broadcast_pty_resized(
 }
 
 /// Send current waiting states to a newly connected mobile client.
+/// DEPRECATED: CLI detection removed, this function is now a no-op.
 async fn send_waiting_states(
-    state: &SharedState,
-    tx: &mut futures_util::stream::SplitSink<
+    _state: &SharedState,
+    _tx: &mut futures_util::stream::SplitSink<
         tokio_tungstenite::WebSocketStream<TcpStream>,
         Message,
     >,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let st = state.read().await;
-    for session in st.sessions.values() {
-        if let Some(waiting) = &session.waiting_state {
-            let msg = ServerMessage::WaitingForInput {
-                session_id: session.session_id.clone(),
-                timestamp: waiting.timestamp.to_rfc3339(),
-                prompt_content: waiting.prompt_content.clone(),
-                wait_type: waiting.wait_type.as_str().to_string(),
-                cli_type: session.cli_tracker.current().as_str().to_string(),
-            };
-            tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
-        }
-    }
+    // CLI detection removed - no waiting states to send
     Ok(())
-}
-
-fn approval_input_for(model: ApprovalModel, response: &str) -> Option<&'static str> {
-    match model {
-        ApprovalModel::Numbered => match response {
-            "yes" => Some("1\n"),
-            "yes_always" => Some("2\n"),
-            "no" => Some("3\n"),
-            _ => None,
-        },
-        ApprovalModel::YesNo => match response {
-            "yes" | "yes_always" => Some("y\n"),
-            "no" => Some("n\n"),
-            _ => None,
-        },
-        ApprovalModel::Arrow => match response {
-            "yes" => Some("\r"),
-            "yes_always" => Some("\x1b[C\r"),
-            "no" => Some("\x1b[C\x1b[C\r"),
-            _ => None,
-        },
-        ApprovalModel::None => None,
-    }
 }
 
 fn truncate_to_max_chars(input: &mut String, max_chars: usize) {
@@ -3341,40 +3210,6 @@ fn update_alt_screen_state(in_alt_screen: &mut bool, tail: &mut Vec<u8>, chunk: 
     let keep = ALT_TRACK_TAIL_BYTES.min(scan.len());
     tail.clear();
     tail.extend_from_slice(&scan[scan.len() - keep..]);
-}
-
-fn build_notification_text(
-    cli_type: CliType,
-    session_name: &str,
-    event: &crate::detection::WaitEvent,
-) -> (String, String) {
-    let cli_label = match cli_type {
-        CliType::Claude => "Claude",
-        CliType::Codex => "Codex",
-        CliType::Gemini => "Gemini",
-        CliType::OpenCode => "OpenCode",
-        CliType::Terminal | CliType::Unknown => "CLI",
-    };
-
-    let title = match event.wait_type {
-        WaitType::ToolApproval => "Tool Approval Needed",
-        WaitType::PlanApproval => "Plan Approval Needed",
-        WaitType::ClarifyingQuestion => "Question from CLI",
-        WaitType::AwaitingResponse => "Awaiting Your Response",
-    };
-
-    let body = match event.wait_type {
-        WaitType::ClarifyingQuestion => {
-            let snippet = event.prompt.chars().take(100).collect::<String>();
-            format!("{}: {}", cli_label, snippet)
-        }
-        WaitType::ToolApproval => format!("{} needs permission to proceed", cli_label),
-        WaitType::PlanApproval => format!("{} has a plan ready for review", cli_label),
-        WaitType::AwaitingResponse => format!("{} is waiting for input", cli_label),
-    };
-
-    let title_with_session = format!("{} · {}", session_name, title);
-    (title_with_session, body)
 }
 
 async fn cleanup_client_state(state: &SharedState, addr: SocketAddr) {
