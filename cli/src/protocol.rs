@@ -33,6 +33,17 @@ impl PtyResizeReason {
     }
 }
 
+/// Viewport actions for tmux-backed sessions.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TmuxViewportAction {
+    ScrollUp,
+    ScrollDown,
+    PageUp,
+    PageDown,
+    Follow,
+}
+
 /// Messages sent from mobile client to server
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -71,6 +82,13 @@ pub enum ClientMessage {
         epoch: Option<u64>,
         #[serde(default)]
         reason: Option<PtyResizeReason>,
+    },
+    /// Programmatic viewport control for tmux runtime sessions.
+    TmuxViewport {
+        session_id: String,
+        action: TmuxViewportAction,
+        #[serde(default)]
+        count: Option<u16>,
     },
     /// Heartbeat ping
     Ping,
@@ -314,6 +332,14 @@ pub enum ServerMessage {
         rows: u16,
         #[serde(skip_serializing_if = "Option::is_none")]
         epoch: Option<u64>,
+    },
+    /// tmux viewport state after a viewport-control action.
+    TmuxViewportState {
+        session_id: String,
+        in_copy_mode: bool,
+        scroll_position: usize,
+        history_size: usize,
+        following_live: bool,
     },
     /// Heartbeat pong
     Pong,

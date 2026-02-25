@@ -10,7 +10,7 @@ use crate::filesystem::{config::FileSystemConfig, rate_limit::RateLimiter, FileS
 use crate::platform;
 use crate::protocol::{
     ChangeType, ClientMessage, FileEncoding, FileSystemError, PtyResizeReason, ServerMessage,
-    SessionListItem,
+    SessionListItem, TmuxViewportAction,
 };
 use crate::session::{self, SessionInfo};
 use crate::tmux::sanitize_tmux_token;
@@ -138,6 +138,9 @@ const ALT_LEAVE_SEQS: &[&[u8]] = &[b"\x1b[?1049l", b"\x1b[?1047l", b"\x1b[?47l"]
 const ALT_TRACK_TAIL_BYTES: usize = 7;
 const SNAPSHOT_CHUNK_BYTES: usize = 48 * 1024;
 const CLIENT_CAP_ATTACH_V2: u32 = 1 << 0;
+const TMUX_VIEWPORT_MIN_MAJOR: u32 = 3;
+const TMUX_VIEWPORT_DEFAULT_COUNT: u16 = 1;
+const TMUX_VIEWPORT_MAX_COUNT: u16 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachProtocolMode {
@@ -171,6 +174,7 @@ pub struct OverhaulFlags {
     pub attach_protocol: AttachProtocolMode,
     pub enable_local_echo: bool,
     pub resize_simplified: bool,
+    pub tmux_shared_viewport: bool,
 }
 
 impl OverhaulFlags {
@@ -179,6 +183,7 @@ impl OverhaulFlags {
             attach_protocol: AttachProtocolMode::from_env(),
             enable_local_echo: env_flag("MOBILECLI_ENABLE_LOCAL_ECHO", false),
             resize_simplified: env_flag("MOBILECLI_RESIZE_SIMPLIFIED", true),
+            tmux_shared_viewport: env_flag("MOBILECLI_TMUX_SHARED_VIEWPORT", true),
         }
     }
 }
@@ -245,6 +250,7 @@ pub struct PtySession {
 pub struct DaemonState {
     pub sessions: HashMap<String, PtySession>,
     pub overhaul_flags: OverhaulFlags,
+    pub tmux_viewport_supported: bool,
     pub next_attach_id: u64,
     pub mobile_clients: HashMap<SocketAddr, mpsc::Sender<Message>>,
     pub mobile_client_capabilities: HashMap<SocketAddr, u32>,
@@ -256,6 +262,8 @@ pub struct DaemonState {
     pub port: u16, // The actual port the daemon is running on
     pub push_tokens: Vec<PushToken>,
     pub mobile_views: HashMap<SocketAddr, std::collections::HashSet<String>>,
+    /// Current mobile controller socket for tmux shared viewport per session.
+    pub tmux_viewport_controllers: HashMap<String, SocketAddr>,
     pub session_view_counts: HashMap<String, usize>,
     pub file_system: std::sync::Arc<FileSystemService>,
     pub file_watch_subscriptions: HashMap<SocketAddr, std::collections::HashSet<String>>,
@@ -271,6 +279,9 @@ impl DaemonState {
     pub fn new(port: u16) -> Self {
         let (pty_broadcast, _) = broadcast::channel(256);
         let file_system = std::sync::Arc::new(FileSystemService::new(FileSystemConfig::default()));
+        let overhaul_flags = OverhaulFlags::from_env();
+        let tmux_viewport_supported =
+            detect_tmux_viewport_support(overhaul_flags.tmux_shared_viewport);
 
         // Load device info from config. If missing, create a default config so we always
         // have a stable device_id for pairing.
@@ -283,7 +294,8 @@ impl DaemonState {
 
         Self {
             sessions: HashMap::new(),
-            overhaul_flags: OverhaulFlags::from_env(),
+            overhaul_flags,
+            tmux_viewport_supported,
             next_attach_id: 1,
             mobile_clients: HashMap::new(),
             mobile_client_capabilities: HashMap::new(),
@@ -293,6 +305,7 @@ impl DaemonState {
             port,
             push_tokens: Vec::new(),
             mobile_views: HashMap::new(),
+            tmux_viewport_controllers: HashMap::new(),
             session_view_counts: HashMap::new(),
             file_system,
             file_watch_subscriptions: HashMap::new(),
@@ -327,6 +340,8 @@ pub async fn run(port: u16) -> std::io::Result<()> {
             attach_protocol = st.overhaul_flags.attach_protocol.as_str(),
             enable_local_echo = st.overhaul_flags.enable_local_echo,
             resize_simplified = st.overhaul_flags.resize_simplified,
+            tmux_shared_viewport = st.overhaul_flags.tmux_shared_viewport,
+            tmux_viewport_supported = st.tmux_viewport_supported,
             "Loaded terminal overhaul Phase 0 flags"
         );
     }
@@ -1025,6 +1040,7 @@ async fn handle_pty_session(
     let was_present = {
         let mut st = state.write().await;
         if st.sessions.remove(&session_id).is_some() {
+            st.tmux_viewport_controllers.remove(&session_id);
             clear_mobile_attach_for_session(&mut st, &session_id);
             // Notify about session end
             let msg = ServerMessage::SessionEnded {
@@ -1878,6 +1894,40 @@ async fn process_client_msg(
                     .or_insert(0);
                 *count += 1;
             }
+            if st.tmux_viewport_supported && runtime_for_log == "tmux" {
+                let active_controller = st.tmux_viewport_controllers.get(&session_id).copied();
+                match active_controller {
+                    Some(controller) if controller != addr => {
+                        let controller_is_viewing = st
+                            .mobile_views
+                            .get(&controller)
+                            .map(|views| views.contains(&session_id))
+                            .unwrap_or(false);
+                        if controller_is_viewing {
+                            tracing::debug!(
+                                session_id = %session_id,
+                                active_controller = %controller,
+                                requester = %addr,
+                                "Keeping existing tmux viewport controller on subscribe"
+                            );
+                        } else {
+                            st.tmux_viewport_controllers
+                                .insert(session_id.clone(), addr);
+                            tracing::debug!(
+                                session_id = %session_id,
+                                stale_controller = %controller,
+                                new_controller = %addr,
+                                "Reassigned stale tmux viewport controller on subscribe"
+                            );
+                        }
+                    }
+                    Some(_) => {}
+                    None => {
+                        st.tmux_viewport_controllers
+                            .insert(session_id.clone(), addr);
+                    }
+                }
+            }
             if use_attach_v2 {
                 st.mobile_attach_ids
                     .entry(addr)
@@ -1923,6 +1973,7 @@ async fn process_client_msg(
             tracing::debug!("Client unsubscribed from session: {}", session_id);
             let mut st = state.write().await;
             let mut remove_attach_addr = false;
+            let mut should_restore = false;
             if let Some(attach_by_session) = st.mobile_attach_ids.get_mut(&addr) {
                 attach_by_session.remove(&session_id);
                 remove_attach_addr = attach_by_session.is_empty();
@@ -1938,12 +1989,24 @@ async fn process_client_msg(
                         }
                         if *count == 0 {
                             st.session_view_counts.remove(&session_id);
-                            drop(st);
-                            restore_pty_size(state, &session_id).await;
-                            return Ok(());
+                            should_restore = true;
                         }
                     }
                 }
+            }
+            if st.tmux_viewport_controllers.get(&session_id).copied() == Some(addr) {
+                st.tmux_viewport_controllers.remove(&session_id);
+                if let Some(next_addr) = st.mobile_views.iter().find_map(|(candidate, views)| {
+                    views.contains(&session_id).then_some(*candidate)
+                }) {
+                    st.tmux_viewport_controllers
+                        .insert(session_id.clone(), next_addr);
+                }
+            }
+            drop(st);
+            if should_restore {
+                restore_pty_size(state, &session_id).await;
+                return Ok(());
             }
         }
         ClientMessage::SendInput {
@@ -2124,6 +2187,146 @@ async fn process_client_msg(
                 broadcast_pty_resized(state, &session_id, ack_cols, ack_rows, ack_epoch).await;
             }
         }
+        ClientMessage::TmuxViewport {
+            session_id,
+            action,
+            count,
+        } => {
+            let auth_result = {
+                let mut st = state.write().await;
+                if !st.tmux_viewport_supported {
+                    Err((
+                        "tmux_viewport_disabled",
+                        "tmux shared viewport control is disabled".to_string(),
+                    ))
+                } else {
+                    let sender_is_viewing = st
+                        .mobile_views
+                        .get(&addr)
+                        .map(|views| views.contains(&session_id))
+                        .unwrap_or(false);
+                    match st.sessions.get(&session_id) {
+                        None => {
+                            let message = format!("Session {} not found", session_id);
+                            Err(("session_not_found", message))
+                        }
+                        Some(session) => {
+                            let runtime = session.runtime.clone();
+                            let tmux_socket = session.tmux_socket.clone();
+                            let tmux_session = session.tmux_session.clone();
+
+                            if runtime != "tmux" {
+                                Err((
+                                    "unsupported_runtime",
+                                    "tmux viewport controls require a tmux runtime session"
+                                        .to_string(),
+                                ))
+                            } else if !sender_is_viewing {
+                                Err((
+                                    "unauthorized_viewport",
+                                    "viewport control requires the active mobile controller"
+                                        .to_string(),
+                                ))
+                            } else {
+                                let active_controller =
+                                    st.tmux_viewport_controllers.get(&session_id).copied();
+                                match active_controller {
+                                    Some(controller) if controller != addr => {
+                                        let controller_is_viewing = st
+                                            .mobile_views
+                                            .get(&controller)
+                                            .map(|views| views.contains(&session_id))
+                                            .unwrap_or(false);
+                                        if controller_is_viewing {
+                                            Err((
+                                                "unauthorized_viewport",
+                                                "viewport control requires the active mobile controller"
+                                                    .to_string(),
+                                            ))
+                                        } else {
+                                            st.tmux_viewport_controllers
+                                                .insert(session_id.clone(), addr);
+                                            tracing::debug!(
+                                                session_id = %session_id,
+                                                stale_controller = %controller,
+                                                new_controller = %addr,
+                                                "Reclaimed stale tmux viewport controller on action"
+                                            );
+                                            Ok((tmux_socket, tmux_session))
+                                        }
+                                    }
+                                    Some(_) => Ok((tmux_socket, tmux_session)),
+                                    None => {
+                                        st.tmux_viewport_controllers
+                                            .insert(session_id.clone(), addr);
+                                        Ok((tmux_socket, tmux_session))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            let (tmux_socket, tmux_session) = match auth_result {
+                Ok(values) => values,
+                Err((code, message)) => {
+                    let msg = ServerMessage::Error {
+                        code: code.to_string(),
+                        message,
+                    };
+                    tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                    return Ok(());
+                }
+            };
+
+            let Some(socket) = tmux_socket else {
+                let msg = ServerMessage::Error {
+                    code: "tmux_missing_metadata".to_string(),
+                    message: "tmux socket metadata missing for session".to_string(),
+                };
+                tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                return Ok(());
+            };
+            let Some(name) = tmux_session else {
+                let msg = ServerMessage::Error {
+                    code: "tmux_missing_metadata".to_string(),
+                    message: "tmux session metadata missing for session".to_string(),
+                };
+                tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                return Ok(());
+            };
+
+            let clamped_count = count
+                .unwrap_or(TMUX_VIEWPORT_DEFAULT_COUNT)
+                .clamp(1, TMUX_VIEWPORT_MAX_COUNT);
+            let action_result = apply_tmux_viewport_action_with_retry(
+                socket.clone(),
+                name.clone(),
+                action,
+                clamped_count,
+            )
+            .await;
+            let viewport_state = query_tmux_viewport_state(socket, name)
+                .await
+                .unwrap_or_default();
+            let state_msg = ServerMessage::TmuxViewportState {
+                session_id: session_id.clone(),
+                in_copy_mode: viewport_state.in_copy_mode,
+                scroll_position: viewport_state.scroll_position,
+                history_size: viewport_state.history_size,
+                following_live: viewport_state.following_live,
+            };
+            tx.send(Message::Text(serde_json::to_string(&state_msg)?))
+                .await?;
+
+            if let Err(error) = action_result {
+                let msg = ServerMessage::Error {
+                    code: "tmux_viewport_action_failed".to_string(),
+                    message: error,
+                };
+                tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+            }
+        }
         ClientMessage::Ping => {
             tx.send(Message::Text(serde_json::to_string(&ServerMessage::Pong)?))
                 .await?;
@@ -2178,6 +2381,7 @@ async fn process_client_msg(
                     drop(session);
                     // Clean up view counts for this session
                     st.session_view_counts.remove(&session_id);
+                    st.tmux_viewport_controllers.remove(&session_id);
                     clear_mobile_attach_for_session(&mut st, &session_id);
                     for views in st.mobile_views.values_mut() {
                         views.remove(&session_id);
@@ -3410,6 +3614,213 @@ fn clear_mobile_attach_for_session(st: &mut DaemonState, session_id: &str) {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TmuxViewportStateSnapshot {
+    in_copy_mode: bool,
+    scroll_position: usize,
+    history_size: usize,
+    following_live: bool,
+}
+
+impl Default for TmuxViewportStateSnapshot {
+    fn default() -> Self {
+        Self {
+            in_copy_mode: false,
+            scroll_position: 0,
+            history_size: 0,
+            following_live: true,
+        }
+    }
+}
+
+fn parse_tmux_version_major(version: &str) -> Option<u32> {
+    let token = version.split_whitespace().nth(1)?;
+    let major = token.split('.').next()?;
+    major.parse::<u32>().ok()
+}
+
+fn detect_tmux_viewport_support(flag_enabled: bool) -> bool {
+    if !flag_enabled {
+        return false;
+    }
+    if which::which("tmux").is_err() {
+        return false;
+    }
+    let output = std::process::Command::new("tmux").arg("-V").output();
+    let Ok(out) = output else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let raw = String::from_utf8_lossy(&out.stdout);
+    parse_tmux_version_major(raw.trim())
+        .map(|major| major >= TMUX_VIEWPORT_MIN_MAJOR)
+        .unwrap_or(false)
+}
+
+fn tmux_targets(session: &str) -> [String; 3] {
+    [
+        format!("{}:0.0", session),
+        format!("{}:0", session),
+        session.to_string(),
+    ]
+}
+
+fn run_tmux_viewport_cmd(socket: &str, target: &str, args: &[&str]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("missing tmux command".to_string());
+    }
+    let mut cmd = std::process::Command::new("tmux");
+    cmd.arg("-L")
+        .arg(socket)
+        .arg("-f")
+        .arg("/dev/null")
+        .env_remove("TMUX")
+        .arg(args[0]);
+    if args[0] == "send-keys" {
+        cmd.arg("-t").arg(target).args(&args[1..]);
+    } else {
+        cmd.args(&args[1..]).arg("-t").arg(target);
+    }
+    let output = cmd.output().map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn run_tmux_viewport_action_once(
+    socket: &str,
+    session: &str,
+    action: TmuxViewportAction,
+    count: u16,
+) -> Result<(), String> {
+    let command = match action {
+        TmuxViewportAction::ScrollUp => "scroll-up",
+        TmuxViewportAction::ScrollDown => "scroll-down",
+        TmuxViewportAction::PageUp => "page-up",
+        TmuxViewportAction::PageDown => "page-down",
+        TmuxViewportAction::Follow => "cancel",
+    };
+
+    let mut last_error: Option<String> = None;
+    for target in tmux_targets(session) {
+        match action {
+            TmuxViewportAction::Follow => {
+                match run_tmux_viewport_cmd(socket, &target, &["send-keys", "-X", command]) {
+                    Ok(()) => return Ok(()),
+                    Err(error) => {
+                        // Already-following clients can report "not in a mode"; treat as success.
+                        if error.contains("not in a mode") {
+                            return Ok(());
+                        }
+                        last_error = Some(error);
+                    }
+                }
+            }
+            _ => {
+                // Enter copy-mode first to make paging deterministic.
+                let _ = run_tmux_viewport_cmd(socket, &target, &["copy-mode", "-e"]);
+                let count_str = count.to_string();
+                match run_tmux_viewport_cmd(
+                    socket,
+                    &target,
+                    &["send-keys", "-X", "-N", &count_str, command],
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| "tmux viewport action failed".to_string()))
+}
+
+async fn apply_tmux_viewport_action_with_retry(
+    socket: String,
+    session: String,
+    action: TmuxViewportAction,
+    count: u16,
+) -> Result<(), String> {
+    let first = tokio::task::spawn_blocking({
+        let socket = socket.clone();
+        let session = session.clone();
+        move || run_tmux_viewport_action_once(&socket, &session, action, count)
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    if first.is_ok() {
+        return first;
+    }
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    tokio::task::spawn_blocking(move || {
+        run_tmux_viewport_action_once(&socket, &session, action, count)
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn parse_tmux_viewport_state(raw: &str) -> Option<TmuxViewportStateSnapshot> {
+    let mut parts = raw.trim().split('|');
+    let pane_in_mode = parts.next()?;
+    let scroll_position = parts.next().unwrap_or("").trim();
+    let history_size = parts.next().unwrap_or("").trim();
+
+    let in_copy_mode = pane_in_mode.trim() == "1";
+    let scroll_position = scroll_position.parse::<usize>().unwrap_or(0);
+    let history_size = history_size.parse::<usize>().unwrap_or(0);
+    Some(TmuxViewportStateSnapshot {
+        in_copy_mode,
+        scroll_position,
+        history_size,
+        following_live: !in_copy_mode || scroll_position == 0,
+    })
+}
+
+fn query_tmux_viewport_state_blocking(
+    socket: &str,
+    session: &str,
+) -> Option<TmuxViewportStateSnapshot> {
+    for target in tmux_targets(session) {
+        let output = std::process::Command::new("tmux")
+            .arg("-L")
+            .arg(socket)
+            .arg("-f")
+            .arg("/dev/null")
+            .env_remove("TMUX")
+            .arg("display-message")
+            .arg("-p")
+            .arg("-t")
+            .arg(&target)
+            .arg("#{pane_in_mode}|#{scroll_position}|#{history_size}")
+            .output();
+        if let Ok(out) = output {
+            if !out.status.success() {
+                continue;
+            }
+            if let Some(snapshot) = parse_tmux_viewport_state(&String::from_utf8_lossy(&out.stdout))
+            {
+                return Some(snapshot);
+            }
+        }
+    }
+    None
+}
+
+async fn query_tmux_viewport_state(
+    socket: String,
+    session: String,
+) -> Option<TmuxViewportStateSnapshot> {
+    tokio::task::spawn_blocking(move || query_tmux_viewport_state_blocking(&socket, &session))
+        .await
+        .ok()
+        .flatten()
+}
+
 fn capture_tmux_history_blocking(
     socket: &str,
     session: &str,
@@ -3727,10 +4138,12 @@ async fn cleanup_client_state(state: &SharedState, addr: SocketAddr) {
         st.mobile_client_capabilities.remove(&addr);
         st.mobile_attach_ids.remove(&addr);
 
-        let sessions_to_restore = match st.mobile_views.remove(&addr) {
+        let (sessions_to_restore, sessions_detached) = match st.mobile_views.remove(&addr) {
             Some(sessions) => {
                 let mut restore = Vec::new();
+                let mut detached = Vec::new();
                 for session_id in sessions {
+                    detached.push(session_id.clone());
                     if let Some(count) = st.session_view_counts.get_mut(&session_id) {
                         if *count > 0 {
                             *count -= 1;
@@ -3741,9 +4154,9 @@ async fn cleanup_client_state(state: &SharedState, addr: SocketAddr) {
                         }
                     }
                 }
-                restore
+                (restore, detached)
             }
-            None => Vec::new(),
+            None => (Vec::new(), Vec::new()),
         };
 
         let to_unwatch = match st.file_watch_subscriptions.remove(&addr) {
@@ -3764,6 +4177,20 @@ async fn cleanup_client_state(state: &SharedState, addr: SocketAddr) {
             }
             None => Vec::new(),
         };
+
+        for session_id in &sessions_detached {
+            if st.tmux_viewport_controllers.get(session_id).copied() == Some(addr) {
+                st.tmux_viewport_controllers.remove(session_id);
+                if let Some(next_addr) = st
+                    .mobile_views
+                    .iter()
+                    .find_map(|(candidate, views)| views.contains(session_id).then_some(*candidate))
+                {
+                    st.tmux_viewport_controllers
+                        .insert(session_id.clone(), next_addr);
+                }
+            }
+        }
 
         (sessions_to_restore, to_unwatch)
     };
@@ -4180,11 +4607,13 @@ mod tests {
             attach_protocol: AttachProtocolMode::V1,
             enable_local_echo: false,
             resize_simplified: false,
+            tmux_shared_viewport: false,
         };
         let v2_flags = OverhaulFlags {
             attach_protocol: AttachProtocolMode::V2,
             enable_local_echo: false,
             resize_simplified: false,
+            tmux_shared_viewport: false,
         };
 
         assert!(!should_use_attach_v2(v1_flags, CLIENT_CAP_ATTACH_V2));
