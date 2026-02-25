@@ -336,6 +336,18 @@ pub enum ServerMessage {
     /// tmux viewport state after a viewport-control action.
     TmuxViewportState {
         session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        action_seq: Option<u64>,
+        in_copy_mode: bool,
+        scroll_position: usize,
+        history_size: usize,
+        following_live: bool,
+    },
+    /// tmux viewport frame captured after a viewport-control action.
+    TmuxViewportFrame {
+        session_id: String,
+        action_seq: u64,
+        data: String, // base64 encoded bytes
         in_copy_mode: bool,
         scroll_position: usize,
         history_size: usize,
