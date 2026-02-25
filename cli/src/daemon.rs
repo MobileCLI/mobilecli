@@ -4087,7 +4087,7 @@ fn build_notification_text(
 }
 
 async fn cleanup_client_state(state: &SharedState, addr: SocketAddr) {
-    let (sessions_to_restore, sessions_detached, to_unwatch) = {
+    let (sessions_to_restore, to_unwatch) = {
         let mut st = state.write().await;
         let stale_sender_ids: Vec<String> = st
             .mobile_sender_addrs
@@ -4156,7 +4156,7 @@ async fn cleanup_client_state(state: &SharedState, addr: SocketAddr) {
             }
         }
 
-        (sessions_to_restore, sessions_detached, to_unwatch)
+        (sessions_to_restore, to_unwatch)
     };
 
     let fs = { state.read().await.file_system.clone() };
@@ -4166,20 +4166,6 @@ async fn cleanup_client_state(state: &SharedState, addr: SocketAddr) {
 
     for session_id in sessions_to_restore {
         restore_pty_size(state, &session_id).await;
-    }
-
-    // Remove stale controller entries where no viewers remain.
-    if !sessions_detached.is_empty() {
-        let mut st = state.write().await;
-        for session_id in sessions_detached {
-            if !st
-                .mobile_views
-                .values()
-                .any(|views| views.contains(&session_id))
-            {
-                st.tmux_viewport_controllers.remove(&session_id);
-            }
-        }
     }
 }
 
