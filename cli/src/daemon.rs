@@ -6,6 +6,7 @@
 // CLI detection types removed - using pure terminal behavior
 // use crate::detection::...;
 use crate::filesystem::{config::FileSystemConfig, rate_limit::RateLimiter, FileSystemService};
+use crate::terminal::contains_cursor_positioning;
 use crate::platform;
 use crate::protocol::{
     ChangeType, ClientMessage, FileEncoding, FileSystemError, PtyResizeReason, ServerMessage,
@@ -41,39 +42,6 @@ fn http_client() -> &'static reqwest::Client {
 
 /// Default WebSocket port
 pub const DEFAULT_PORT: u16 = 9847;
-
-/// Check if buffer contains ANSI cursor positioning sequences.
-/// This is used to detect TUI applications and avoid jumbled scrollback replay.
-fn contains_cursor_positioning(bytes: &[u8]) -> bool {
-    // Common cursor positioning sequences:
-    // ESC [ row ; col H  (CUP - Cursor Position)
-    // ESC [ row ; col f  (HVP - Horizontal and Vertical Position)
-    // ESC [ ? 25 h/l     (DECTCEM - Show/Hide Cursor)
-    // ESC 7 / ESC 8      (Save/Restore Cursor)
-    
-    // Simple check for ESC [ ... H/f or ESC 7/8
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == 0x1B && i + 1 < bytes.len() {
-            match bytes[i + 1] {
-                b'[' => {
-                    // Look for H or f at the end of the sequence
-                    let mut j = i + 2;
-                    while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';' || bytes[j] == b'?') {
-                        j += 1;
-                    }
-                    if j < bytes.len() && (bytes[j] == b'H' || bytes[j] == b'f') {
-                        return true;
-                    }
-                }
-                b'7' | b'8' => return true, // Save/Restore cursor
-                _ => {}
-            }
-        }
-        i += 1;
-    }
-    false
-}
 
 /// PID file path (cross-platform)
 fn pid_file() -> PathBuf {
@@ -1412,39 +1380,29 @@ async fn process_client_msg(
             last_seen_seq,
             client_capabilities,
         } => {
+            // Phase 3: Simplified unified subscribe flow (always v2 protocol)
             tracing::debug!("Client subscribed to session: {}", session_id);
             let attach_started = std::time::Instant::now();
+            
             let mut st = state.write().await;
             if let Some(capabilities) = client_capabilities {
                 st.mobile_client_capabilities.insert(addr, capabilities);
             }
             let attach_id = st.next_attach_id;
             st.next_attach_id = st.next_attach_id.saturating_add(1);
-            let overhaul_flags = st.overhaul_flags;
-            let capabilities = st
-                .mobile_client_capabilities
-                .get(&addr)
-                .copied()
-                .unwrap_or(0);
-            let use_attach_v2 = should_use_attach_v2(overhaul_flags, capabilities);
-
-            // Collect session state under one lock, then drop it before sending.
-            // Get session info for subscribe
+            
+            // Collect session state under one lock
             let (
                 scrollback_bytes,
                 mobile_in_alt_screen,
-                scrollback_len,
-                initial_live_seq,
                 ready_cols,
                 ready_rows,
             ) = if let Some(session) = st.sessions.get(&session_id) {
-                let has_scrollback = !session.scrollback.is_empty();
                 let mobile_in_alt_screen = session.in_alt_screen;
                 
                 // Only replay scrollback if it's plain text (no cursor positioning)
-                let sb = if !mobile_in_alt_screen && has_scrollback {
+                let sb = if !mobile_in_alt_screen && !session.scrollback.is_empty() {
                     let bytes: Vec<u8> = session.scrollback.iter().copied().collect();
-                    // Check for cursor positioning sequences
                     if !contains_cursor_positioning(&bytes) {
                         Some(bytes)
                     } else {
@@ -1455,205 +1413,109 @@ async fn process_client_msg(
                 };
                 
                 let (ready_cols, ready_rows) = session.last_applied_size.unwrap_or((0, 0));
-                (
-                    sb,
-                    mobile_in_alt_screen,
-                    session.scrollback.len(),
-                    session.live_seq,
-                    ready_cols,
-                    ready_rows,
-                )
+                (sb, mobile_in_alt_screen, ready_cols, ready_rows)
             } else {
-                (None::<Vec<u8>>, false, 0, 0, 0, 0)
+                (None::<Vec<u8>>, false, 0, 0)
             };
-
-            tracing::debug!(
-                session_id = %session_id,
-                addr = %addr,
-                attach_id,
-                capabilities,
-                use_attach_v2,
-                last_seen_seq = ?last_seen_seq,
-                mobile_in_alt_screen,
-                scrollback_len,
-                text_replay_bytes = scrollback_bytes.as_ref().map(|b| b.len()).unwrap_or(0),
-                "Subscribe replay decision"
-            );
             drop(st);
+
             tracing::info!(
                 target: "overhaul.attach",
                 session_id = %session_id,
                 addr = %addr,
                 attach_id,
-                protocol = overhaul_flags.attach_protocol.as_str(),
-                use_attach_v2,
                 last_seen_seq = ?last_seen_seq,
+                in_alt_screen = mobile_in_alt_screen,
+                scrollback_bytes = scrollback_bytes.as_ref().map(|b| b.len()).unwrap_or(0),
                 "Attach sequence started"
             );
-            let clear_mode = if mobile_in_alt_screen {
-                "alternate_screen"
-            } else {
-                "main_screen"
+
+            // 1. Send AttachBegin
+            let begin = ServerMessage::AttachBegin {
+                session_id: session_id.clone(),
+                attach_id,
+                mode: if last_seen_seq.is_some() {
+                    "reconnect".to_string()
+                } else {
+                    "fresh".to_string()
+                },
+                in_alt_screen: mobile_in_alt_screen,
             };
-            let mut replay_events: Vec<(&'static str, usize)> = Vec::new();
-            if use_attach_v2 {
-                let begin = ServerMessage::AttachBegin {
-                    session_id: session_id.clone(),
-                    attach_id,
-                    mode: if last_seen_seq.is_some() {
-                        "reconnect".to_string()
-                    } else {
-                        "fresh".to_string()
-                    },
-                    in_alt_screen: mobile_in_alt_screen,
-                };
-                if let Ok(text) = serde_json::to_string(&begin) {
-                    let _ = tx.send(Message::Text(text)).await;
-                }
+            if let Ok(text) = serde_json::to_string(&begin) {
+                let _ = tx.send(Message::Text(text)).await;
             }
 
-            // ── Step 1: wipe mobile's xterm.js buffer ──────────────────
-            //
-            // On every (re-)subscribe we first clear the client terminal so
-            // that replay data doesn't append to stale content from a prior
-            // subscribe. Sessions in mobile alternate-screen use 1049h clear.
-            // Text main-buffer sessions erase display+scrollback so the next
-            // replay starts from a deterministic baseline.
-            //
-            {
-                if use_attach_v2 {
-                    let clear = ServerMessage::AttachClear {
+            // 2. Send AttachClear (always clear terminal first)
+            let clear = ServerMessage::AttachClear {
+                session_id: session_id.clone(),
+                attach_id,
+            };
+            if let Ok(text) = serde_json::to_string(&clear) {
+                let _ = tx.send(Message::Text(text)).await;
+            }
+
+            // 3. Send scrollback in chunks (if safe to replay)
+            let replay_bytes = scrollback_bytes.as_ref().map(|b| b.len()).unwrap_or(0);
+            if let Some(bytes) = scrollback_bytes {
+                let chunks = chunk_snapshot_payload(&bytes);
+                let total_chunks = chunks.len().max(1) as u32;
+                if chunks.is_empty() {
+                    let msg = ServerMessage::AttachSnapshotChunk {
                         session_id: session_id.clone(),
                         attach_id,
+                        chunk_seq: 1,
+                        total_chunks,
+                        is_last: true,
+                        data: String::new(),
                     };
-                    if let Ok(text) = serde_json::to_string(&clear) {
+                    if let Ok(text) = serde_json::to_string(&msg) {
                         let _ = tx.send(Message::Text(text)).await;
                     }
                 } else {
-                    let clear: &[u8] = if mobile_in_alt_screen {
-                        // \x1b[?1049h  enter alternate screen
-                        // \x1b[2J      erase display
-                        // \x1b[H       cursor home
-                        b"\x1b[?1049h\x1b[2J\x1b[H"
-                    } else {
-                        // \x1b[2J      erase display
-                        // \x1b[3J      erase scrollback (xterm extension, supported by xterm.js)
-                        // \x1b[H       cursor home
-                        b"\x1b[2J\x1b[3J\x1b[H"
-                    };
-                    let clear_msg = ServerMessage::PtyBytes {
-                        session_id: session_id.clone(),
-                        data: BASE64.encode(clear),
-                    };
-                    if let Ok(text) = serde_json::to_string(&clear_msg) {
-                        let _ = tx.send(Message::Text(text)).await;
+                    for (idx, chunk) in chunks.into_iter().enumerate() {
+                        let msg = ServerMessage::AttachSnapshotChunk {
+                            session_id: session_id.clone(),
+                            attach_id,
+                            chunk_seq: (idx + 1) as u32,
+                            total_chunks,
+                            is_last: idx + 1 == total_chunks as usize,
+                            data: chunk,
+                        };
+                        if let Ok(text) = serde_json::to_string(&msg) {
+                            let _ = tx.send(Message::Text(text)).await;
+                        }
                     }
                 }
                 tracing::info!(
                     target: "overhaul.attach",
                     session_id = %session_id,
                     attach_id,
-                    clear_mode,
-                    clear_bytes = if use_attach_v2 { 0 } else if mobile_in_alt_screen { b"\x1b[?1049h\x1b[2J\x1b[H".len() } else { b"\x1b[2J\x1b[3J\x1b[H".len() },
-                    "Attach clear frame sent"
+                    replay_bytes,
+                    "Scrollback replay sent"
                 );
             }
 
-            // ── Step 2: replay history ────────────────────────────────────
-            //
-            // PTY text sessions replay daemon scrollback (only if safe to replay).
-            if let Some(bytes) = scrollback_bytes {
-                    replay_events.push(("daemon_scrollback", bytes.len()));
-                    if use_attach_v2 {
-                        let chunks = chunk_snapshot_payload(&bytes);
-                        let total_chunks = chunks.len().max(1) as u32;
-                        if chunks.is_empty() {
-                            let msg = ServerMessage::AttachSnapshotChunk {
-                                session_id: session_id.clone(),
-                                attach_id,
-                                chunk_seq: 1,
-                                total_chunks,
-                                is_last: true,
-                                data: String::new(),
-                            };
-                            if let Ok(text) = serde_json::to_string(&msg) {
-                                let _ = tx.send(Message::Text(text)).await;
-                            }
-                        } else {
-                            for (idx, chunk) in chunks.into_iter().enumerate() {
-                                let msg = ServerMessage::AttachSnapshotChunk {
-                                    session_id: session_id.clone(),
-                                    attach_id,
-                                    chunk_seq: (idx + 1) as u32,
-                                    total_chunks,
-                                    is_last: idx + 1 == total_chunks as usize,
-                                    data: chunk,
-                                };
-                                if let Ok(text) = serde_json::to_string(&msg) {
-                                    let _ = tx.send(Message::Text(text)).await;
-                                }
-                            }
-                        }
-                    } else {
-                        let msg = ServerMessage::PtyBytes {
-                            session_id: session_id.clone(),
-                            data: BASE64.encode(&bytes),
-                        };
-                        if let Ok(text) = serde_json::to_string(&msg) {
-                            let _ = tx.send(Message::Text(text)).await;
-                        }
-                    }
-                    tracing::info!(
-                        target: "overhaul.attach",
-                        session_id = %session_id,
-                        attach_id,
-                        replay_source = "daemon_scrollback",
-                        replay_bytes = bytes.len(),
-                        "Attach replay sent"
-                    );
+            // 4. Get current live sequence and send AttachReady
+            let ready_live_seq = {
+                let st = state.read().await;
+                st.sessions
+                    .get(&session_id)
+                    .map(|s| s.live_seq)
+                    .unwrap_or(0)
+            };
+            
+            let ready = ServerMessage::AttachReady {
+                session_id: session_id.clone(),
+                attach_id,
+                last_live_seq: ready_live_seq,
+                cols: ready_cols,
+                rows: ready_rows,
+            };
+            if let Ok(text) = serde_json::to_string(&ready) {
+                let _ = tx.send(Message::Text(text)).await;
             }
 
-            // Always send SubscribeAck so mobile knows whether to suppress
-            // stale bytes and enter alt-screen mode before resizing (v1 path).
-            if use_attach_v2 {
-                let ready_live_seq = {
-                    let st = state.read().await;
-                    st.sessions
-                        .get(&session_id)
-                        .map(|session| session.live_seq)
-                        .unwrap_or(initial_live_seq)
-                };
-                tracing::debug!(
-                    target: "overhaul.sequence",
-                    session_id = %session_id,
-                    attach_id,
-                    initial_live_seq,
-                    ready_live_seq,
-                    "Attach ready sequence barrier"
-                );
-                let ready = ServerMessage::AttachReady {
-                    session_id: session_id.clone(),
-                    attach_id,
-                    last_live_seq: ready_live_seq,
-                    cols: ready_cols,
-                    rows: ready_rows,
-                };
-                if let Ok(text) = serde_json::to_string(&ready) {
-                    let _ = tx.send(Message::Text(text)).await;
-                }
-            } else {
-                let ack = ServerMessage::SubscribeAck {
-                    session_id: session_id.clone(),
-                    in_alt_screen: mobile_in_alt_screen,
-                    runtime: None,
-                };
-                if let Ok(text) = serde_json::to_string(&ack) {
-                    let _ = tx.send(Message::Text(text)).await;
-                }
-            }
-
-            // Register active view after initial clear/replay/ack sequence so
-            // live PTY stream can't interleave with bootstrap replay bytes.
+            // 5. Register viewer for session view count (needed for priority switching)
             let mut st = state.write().await;
             let entry = st.mobile_views.entry(addr).or_default();
             if entry.insert(session_id.clone()) {
@@ -1663,42 +1525,17 @@ async fn process_client_msg(
                     .or_insert(0);
                 *count += 1;
             }
-            if use_attach_v2 {
-                st.mobile_attach_ids
-                    .entry(addr)
-                    .or_default()
-                    .insert(session_id.clone(), attach_id);
-            } else {
-                let mut remove_addr = false;
-                if let Some(attach_by_session) = st.mobile_attach_ids.get_mut(&addr) {
-                    attach_by_session.remove(&session_id);
-                    remove_addr = attach_by_session.is_empty();
-                }
-                if remove_addr {
-                    st.mobile_attach_ids.remove(&addr);
-                }
-            }
-            let replay_sources = if replay_events.is_empty() {
-                "none".to_string()
-            } else {
-                replay_events
-                    .iter()
-                    .map(|(source, _)| *source)
-                    .collect::<Vec<_>>()
-                    .join(",")
-            };
-            let replay_bytes_total: usize = replay_events.iter().map(|(_, bytes)| *bytes).sum();
+            st.mobile_attach_ids
+                .entry(addr)
+                .or_default()
+                .insert(session_id.clone(), attach_id);
+
             tracing::info!(
                 target: "overhaul.attach",
                 session_id = %session_id,
                 addr = %addr,
                 attach_id,
-                protocol = overhaul_flags.attach_protocol.as_str(),
-                use_attach_v2,
-                clear_mode,
-                replay_sources = %replay_sources,
-                replay_events = replay_events.len(),
-                replay_bytes_total,
+                replay_bytes,
                 duration_ms = attach_started.elapsed().as_millis() as u64,
                 "Attach sequence completed"
             );
@@ -3371,13 +3208,14 @@ async fn send_push_notifications(tokens: &[PushToken], title: &str, body: &str, 
 #[cfg(test)]
 mod tests {
     use super::{
-        broadcast_pty_resized, build_upload_destination_path, capture_tmux_history,
+        broadcast_pty_resized, build_upload_destination_path,
         clear_mobile_attach_for_session, is_noop_resize, is_stale_resize_epoch,
         is_windows_reserved_device_name, resolve_resize_reason, sanitize_upload_file_name,
         should_ignore_resize_without_viewers, should_ignore_restore_resize,
-        should_mobile_enter_alt_screen, should_treat_as_tui_for_mobile, should_use_attach_v2,
+        should_use_attach_v2,
         strip_terminal_report_sequences, strip_terminal_report_sequences_stateful,
-        update_alt_screen_state, AttachProtocolMode, DaemonState, OverhaulFlags, PtyResizeReason,
+        update_alt_screen_state,
+        AttachProtocolMode, DaemonState, OverhaulFlags, PtyResizeReason,
         CLIENT_CAP_ATTACH_V2, DEFAULT_SCROLLBACK_MAX_BYTES, MAX_UPLOAD_FILE_NAME_BYTES,
     };
     use std::sync::Arc;
@@ -3442,59 +3280,6 @@ mod tests {
         assert_eq!(dropped2, 0);
         assert_eq!(out2, b"\x1b[A");
         assert!(tail.is_empty());
-    }
-
-    #[tokio::test]
-    async fn tmux_capture_history_returns_snapshot_text() {
-        if which::which("tmux").is_err() {
-            return;
-        }
-
-        let token = &uuid::Uuid::new_v4().to_string()[..8];
-        let socket = format!("mcli-test-{}-sock", token);
-        let session = format!("mcli-test-{}-session", token);
-
-        let spawn = std::process::Command::new("tmux")
-            .arg("-L")
-            .arg(&socket)
-            .arg("-f")
-            .arg("/dev/null")
-            .env_remove("TMUX")
-            .args([
-                "new-session",
-                "-d",
-                "-s",
-                &session,
-                "printf CAPTURE_OK; sleep 2",
-            ])
-            .output()
-            .expect("spawn tmux test session");
-        assert!(
-            spawn.status.success(),
-            "failed to spawn tmux test session: {}",
-            String::from_utf8_lossy(&spawn.stderr)
-        );
-
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        let snapshot = capture_tmux_history(socket.clone(), session.clone(), true, 1_000)
-            .await
-            .expect("tmux snapshot");
-        let text = String::from_utf8_lossy(&snapshot);
-        assert!(
-            text.contains("CAPTURE_OK"),
-            "snapshot missing expected marker: {}",
-            text
-        );
-
-        let _ = std::process::Command::new("tmux")
-            .arg("-L")
-            .arg(&socket)
-            .arg("-f")
-            .arg("/dev/null")
-            .env_remove("TMUX")
-            .arg("kill-server")
-            .status();
     }
 
     #[test]
@@ -3657,22 +3442,6 @@ mod tests {
             1,
             PtyResizeReason::GeometryChange
         ));
-    }
-
-    #[test]
-    fn tui_gating_uses_alt_screen_only() {
-        assert!(!should_treat_as_tui_for_mobile("tmux", false));
-        assert!(!should_treat_as_tui_for_mobile("tmux", true));
-        assert!(should_treat_as_tui_for_mobile("pty", true));
-        assert!(!should_treat_as_tui_for_mobile("pty", false));
-    }
-
-    #[test]
-    fn mobile_alt_screen_policy_preserves_tmux_scrollback() {
-        assert!(!should_mobile_enter_alt_screen("tmux", false));
-        assert!(!should_mobile_enter_alt_screen("tmux", true));
-        assert!(should_mobile_enter_alt_screen("pty", true));
-        assert!(!should_mobile_enter_alt_screen("pty", false));
     }
 
     #[test]

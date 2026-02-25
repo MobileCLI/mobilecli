@@ -21,6 +21,7 @@ mod qr;
 mod session;
 mod setup;
 mod shell_hook;
+mod terminal;
 
 
 use clap::{Parser, Subcommand};
