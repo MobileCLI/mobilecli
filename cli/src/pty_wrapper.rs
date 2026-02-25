@@ -76,17 +76,17 @@ enum DesktopResizePolicy {
 impl DesktopResizePolicy {
     fn from_env() -> Self {
         let raw = std::env::var("MOBILECLI_DESKTOP_RESIZE_POLICY")
-            .unwrap_or_else(|_| "preserve".to_string())
+            .unwrap_or_else(|_| "mirror".to_string())
             .to_lowercase();
         match raw.as_str() {
             "mirror" | "strict" | "legacy" => Self::Mirror,
             "preserve" | "off" | "none" | "" => Self::Preserve,
             other => {
                 tracing::warn!(
-                    "Unknown MOBILECLI_DESKTOP_RESIZE_POLICY='{}'. Defaulting to 'preserve'.",
+                    "Unknown MOBILECLI_DESKTOP_RESIZE_POLICY='{}'. Defaulting to 'mirror'.",
                     other
                 );
-                Self::Preserve
+                Self::Mirror
             }
         }
     }
@@ -746,8 +746,8 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                                             r = restore_r;
                                         } else {
                                             // Mobile active: always resize child PTY to mobile
-                                            // dimensions. Host terminal mirroring is opt-in via
-                                            // MOBILECLI_DESKTOP_RESIZE_POLICY=mirror.
+                                            // dimensions. Host terminal mirroring is the default;
+                                            // set MOBILECLI_DESKTOP_RESIZE_POLICY=preserve to opt out.
                                             if saved_local_size.is_none() {
                                                 saved_local_size = get_terminal_size_opt();
                                             }
