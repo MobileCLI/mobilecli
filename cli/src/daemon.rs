@@ -264,8 +264,6 @@ pub struct DaemonState {
     pub mobile_views: HashMap<SocketAddr, std::collections::HashSet<String>>,
     /// Current mobile controller socket for tmux shared viewport per session.
     pub tmux_viewport_controllers: HashMap<String, SocketAddr>,
-    /// Monotonic action sequence per tmux session for viewport frame/state ordering.
-    pub tmux_viewport_action_seq: HashMap<String, u64>,
     pub session_view_counts: HashMap<String, usize>,
     pub file_system: std::sync::Arc<FileSystemService>,
     pub file_watch_subscriptions: HashMap<SocketAddr, std::collections::HashSet<String>>,
@@ -308,7 +306,6 @@ impl DaemonState {
             push_tokens: Vec::new(),
             mobile_views: HashMap::new(),
             tmux_viewport_controllers: HashMap::new(),
-            tmux_viewport_action_seq: HashMap::new(),
             session_view_counts: HashMap::new(),
             file_system,
             file_watch_subscriptions: HashMap::new(),
@@ -1044,7 +1041,6 @@ async fn handle_pty_session(
         let mut st = state.write().await;
         if st.sessions.remove(&session_id).is_some() {
             st.tmux_viewport_controllers.remove(&session_id);
-            st.tmux_viewport_action_seq.remove(&session_id);
             clear_mobile_attach_for_session(&mut st, &session_id);
             // Notify about session end
             let msg = ServerMessage::SessionEnded {
@@ -2285,15 +2281,6 @@ async fn process_client_msg(
             let clamped_count = count
                 .unwrap_or(TMUX_VIEWPORT_DEFAULT_COUNT)
                 .clamp(1, TMUX_VIEWPORT_MAX_COUNT);
-            let action_seq = {
-                let mut st = state.write().await;
-                let seq = st
-                    .tmux_viewport_action_seq
-                    .entry(session_id.clone())
-                    .or_insert(0);
-                *seq = seq.saturating_add(1);
-                *seq
-            };
             let action_result = apply_tmux_viewport_action_with_retry(
                 socket.clone(),
                 name.clone(),
@@ -2304,35 +2291,39 @@ async fn process_client_msg(
             let viewport_state = query_tmux_viewport_state(socket.clone(), name.clone())
                 .await
                 .unwrap_or_default();
-            let viewport_frame = capture_tmux_viewport_frame(
-                socket.clone(),
-                name.clone(),
-                viewport_state.in_copy_mode,
-            )
-            .await;
-            if let Some(frame) = viewport_frame {
-                let frame_msg = ServerMessage::TmuxViewportFrame {
-                    session_id: session_id.clone(),
-                    action_seq,
-                    data: BASE64.encode(frame),
-                    in_copy_mode: viewport_state.in_copy_mode,
-                    scroll_position: viewport_state.scroll_position,
-                    history_size: viewport_state.history_size,
-                    following_live: viewport_state.following_live,
-                };
-                tx.send(Message::Text(serde_json::to_string(&frame_msg)?))
-                    .await?;
-            } else {
-                tracing::debug!(
-                    session_id = %session_id,
-                    action = ?action,
-                    action_seq,
-                    "tmux viewport frame capture returned no bytes"
-                );
+
+            // After scroll action, capture the visible viewport and send as PtyBytes
+            // so mobile terminal shows the scrolled content formatted for its dimensions.
+            // Only capture if we're still not following live (user is scrolled up).
+            if action_result.is_ok() && !viewport_state.following_live {
+                // Small delay to let tmux settle into its new scroll position
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                
+                // Re-check state after delay to avoid race conditions
+                let viewport_state = query_tmux_viewport_state(socket.clone(), name.clone())
+                    .await
+                    .unwrap_or_default();
+                
+                if !viewport_state.following_live {
+                    if let Some(frame_bytes) = capture_tmux_viewport_simple(socket, name).await {
+                        // Prepend clear + home escape sequences so mobile redraws fresh
+                        let mut payload = Vec::with_capacity(frame_bytes.len() + 16);
+                        payload.extend_from_slice(b"\x1b[2J\x1b[H"); // clear + home
+                        payload.extend_from_slice(&frame_bytes);
+
+                        let pty_msg = ServerMessage::PtyBytes {
+                            session_id: session_id.clone(),
+                            data: BASE64.encode(&payload),
+                        };
+                        if let Ok(json) = serde_json::to_string(&pty_msg) {
+                            let _ = tx.send(Message::Text(json)).await;
+                        }
+                    }
+                }
             }
+
             let state_msg = ServerMessage::TmuxViewportState {
                 session_id: session_id.clone(),
-                action_seq: Some(action_seq),
                 in_copy_mode: viewport_state.in_copy_mode,
                 scroll_position: viewport_state.scroll_position,
                 history_size: viewport_state.history_size,
@@ -2404,7 +2395,6 @@ async fn process_client_msg(
                     // Clean up view counts for this session
                     st.session_view_counts.remove(&session_id);
                     st.tmux_viewport_controllers.remove(&session_id);
-                    st.tmux_viewport_action_seq.remove(&session_id);
                     clear_mobile_attach_for_session(&mut st, &session_id);
                     for views in st.mobile_views.values_mut() {
                         views.remove(&session_id);
@@ -2609,7 +2599,9 @@ async fn process_client_msg(
             sort_by,
             sort_order,
         } => {
+            tracing::info!(request_id = %request_id, path = %path, "ListDirectory request");
             if let Err(retry_after_ms) = check_fs_rate_limit(state, addr).await {
+                tracing::warn!(request_id = %request_id, "ListDirectory rate limited");
                 send_fs_error(
                     tx,
                     request_id,
@@ -2620,13 +2612,16 @@ async fn process_client_msg(
                 .await?;
                 return Ok(());
             }
+            tracing::info!(request_id = %request_id, "ListDirectory calling fs.ops()");
             let fs = { state.read().await.file_system.clone() };
+            tracing::info!(request_id = %request_id, "ListDirectory got fs, calling list_directory");
             match fs
                 .ops()
                 .list_directory(&path, include_hidden, sort_by, sort_order)
                 .await
             {
                 Ok((path, entries, total_count, truncated)) => {
+                    tracing::info!(request_id = %request_id, total_count = total_count, "ListDirectory success");
                     let msg = ServerMessage::DirectoryListing {
                         request_id,
                         path,
@@ -2637,6 +2632,7 @@ async fn process_client_msg(
                     tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
                 }
                 Err(e) => {
+                    tracing::warn!(request_id = %request_id, error = ?e, "ListDirectory error");
                     send_fs_error(tx, request_id, "list_directory", &path, e).await?;
                 }
             }
@@ -3844,55 +3840,6 @@ async fn query_tmux_viewport_state(
         .flatten()
 }
 
-fn capture_tmux_viewport_frame_blocking(
-    socket: &str,
-    session: &str,
-    in_copy_mode: bool,
-) -> Option<Vec<u8>> {
-    let mode_attempts: &[bool] = if in_copy_mode {
-        &[true, false]
-    } else {
-        &[false]
-    };
-    for use_mode_capture in mode_attempts {
-        for target in tmux_targets(session) {
-            let mut cmd = std::process::Command::new("tmux");
-            cmd.arg("-L")
-                .arg(socket)
-                .arg("-f")
-                .arg("/dev/null")
-                .env_remove("TMUX")
-                .arg("capture-pane")
-                .arg("-p")
-                .arg("-e");
-            if *use_mode_capture {
-                cmd.arg("-M");
-            }
-            cmd.arg("-t").arg(&target);
-            let output = cmd.output();
-            if let Ok(out) = output {
-                if out.status.success() {
-                    return Some(out.stdout);
-                }
-            }
-        }
-    }
-    None
-}
-
-async fn capture_tmux_viewport_frame(
-    socket: String,
-    session: String,
-    in_copy_mode: bool,
-) -> Option<Vec<u8>> {
-    tokio::task::spawn_blocking(move || {
-        capture_tmux_viewport_frame_blocking(&socket, &session, in_copy_mode)
-    })
-    .await
-    .ok()
-    .flatten()
-}
-
 fn capture_tmux_history_blocking(
     socket: &str,
     session: &str,
@@ -3947,6 +3894,42 @@ fn snapshot_has_visible_content(bytes: &[u8]) -> bool {
     bytes
         .iter()
         .any(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+}
+
+/// Simple viewport capture for scrolled content.
+/// Captures the visible pane content in copy-mode formatted for mobile dimensions.
+fn capture_tmux_viewport_simple_blocking(socket: &str, session: &str) -> Option<Vec<u8>> {
+    for target in tmux_targets(session) {
+        let mut cmd = std::process::Command::new("tmux");
+        cmd.arg("-L")
+            .arg(socket)
+            .arg("-f")
+            .arg("/dev/null")
+            .env_remove("TMUX")
+            .arg("capture-pane")
+            .arg("-p")
+            .arg("-e") // Preserve escape sequences (colors, etc.)
+            .arg("-N") // No line numbers
+            .arg("-t")
+            .arg(&target);
+
+        match cmd.output() {
+            Ok(out) if out.status.success() && !out.stdout.is_empty() => {
+                return Some(out.stdout);
+            }
+            _ => continue,
+        }
+    }
+    None
+}
+
+async fn capture_tmux_viewport_simple(socket: String, session: String) -> Option<Vec<u8>> {
+    tokio::task::spawn_blocking(move || {
+        capture_tmux_viewport_simple_blocking(&socket, &session)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 async fn capture_tmux_history_with_retry(

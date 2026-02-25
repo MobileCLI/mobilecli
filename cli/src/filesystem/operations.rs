@@ -54,7 +54,11 @@ impl FileOperations {
         }
 
         let mut entries = Vec::new();
-        let git_statuses = super::git::status_map_for_path(&path).await;
+        // Git status is best-effort; don't block listing on it
+        let git_statuses = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            super::git::status_map_for_path(&path)
+        ).await.ok().flatten();
         let mut read_dir = fs::read_dir(&path)
             .await
             .map_err(|e| FileSystemError::IoError {

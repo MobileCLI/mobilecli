@@ -5,12 +5,12 @@ use tokio::process::Command;
 use crate::protocol::GitStatus;
 
 pub async fn status_map_for_path(path: &Path) -> Option<HashMap<PathBuf, GitStatus>> {
-    let repo_root = find_repo_root(path)?;
+    let repo_root = find_repo_root(path).await?;
     status_map(&repo_root).await
 }
 
 pub async fn status_for_path(path: &Path) -> Option<GitStatus> {
-    let repo_root = find_repo_root(path)?;
+    let repo_root = find_repo_root(path).await?;
     let rel = path.strip_prefix(&repo_root).ok()?;
 
     let output = Command::new("git")
@@ -71,7 +71,7 @@ async fn status_map(repo_root: &Path) -> Option<HashMap<PathBuf, GitStatus>> {
     Some(map)
 }
 
-fn find_repo_root(path: &Path) -> Option<PathBuf> {
+async fn find_repo_root(path: &Path) -> Option<PathBuf> {
     let mut current = if path.is_dir() {
         path.to_path_buf()
     } else {
@@ -79,8 +79,11 @@ fn find_repo_root(path: &Path) -> Option<PathBuf> {
     };
 
     loop {
-        if current.join(".git").exists() {
-            return Some(current);
+        // Use async metadata check instead of blocking exists()
+        let git_path = current.join(".git");
+        match tokio::fs::metadata(&git_path).await {
+            Ok(meta) if meta.is_dir() => return Some(current),
+            _ => {}
         }
         if !current.pop() {
             break;
