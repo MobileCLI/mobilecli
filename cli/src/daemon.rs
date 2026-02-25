@@ -1258,7 +1258,7 @@ async fn process_client_msg(
             // Already sent Welcome on connect, but log the client version
             tracing::debug!("Client hello, version: {}", client_version);
         }
-        ClientMessage::Subscribe { session_id } => {
+        ClientMessage::Subscribe { session_id, last_seen_seq: _, client_capabilities: _ } => {
             tracing::debug!("Client subscribed to session: {}", session_id);
             let mut st = state.write().await;
             let entry = st.mobile_views.entry(addr).or_default();
@@ -1303,6 +1303,7 @@ async fn process_client_msg(
             let ack = ServerMessage::SubscribeAck {
                 session_id,
                 in_alt_screen,
+                runtime: None,
             };
             if let Ok(text) = serde_json::to_string(&ack) {
                 let _ = tx.send(Message::Text(text)).await;
@@ -1340,6 +1341,7 @@ async fn process_client_msg(
             cols,
             rows,
             epoch,
+            reason: _,
         } => {
             let mut st = state.write().await;
             let is_restore = cols == 0 && rows == 0;
@@ -2396,6 +2398,7 @@ async fn send_sessions_list(
             ws_port: port,
             started_at: s.started_at.to_rfc3339(),
             cli_type: s.cli_tracker.current().as_str().to_string(),
+            runtime: None,
         })
         .collect();
     let msg = ServerMessage::Sessions { sessions: items };
@@ -2418,6 +2421,7 @@ async fn broadcast_sessions_update(state: &SharedState) {
             ws_port: port,
             started_at: s.started_at.to_rfc3339(),
             cli_type: s.cli_tracker.current().as_str().to_string(),
+            runtime: None,
         })
         .collect();
     let msg = ServerMessage::Sessions { sessions: items };
