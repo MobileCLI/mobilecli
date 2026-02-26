@@ -423,9 +423,15 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
     // Connect to daemon (use actual port from file, fallback to default)
     let port = get_port().unwrap_or(DEFAULT_PORT);
     let daemon_url = format!("ws://127.0.0.1:{}", port);
+    tracing::info!("Connecting to daemon at {}", daemon_url);
+    
     let (ws_stream, _) = connect_async(&daemon_url)
         .await
-        .map_err(|e| WrapError::DaemonConnection(format!("Failed to connect to daemon: {}", e)))?;
+        .map_err(|e| {
+            tracing::error!("Failed to connect to daemon at {}: {}", daemon_url, e);
+            WrapError::DaemonConnection(format!("Failed to connect to daemon: {}", e))
+        })?;
+    tracing::info!("WebSocket connected to daemon");
 
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
@@ -438,19 +444,44 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
         "project_path": cwd,
         "runtime": runtime_mode.as_str(),
     });
+    tracing::info!("Sending registration message: {}", register_msg);
+    
     ws_tx
         .send(Message::Text(register_msg.to_string()))
         .await
-        .map_err(|e| WrapError::DaemonConnection(format!("Failed to register: {}", e)))?;
+        .map_err(|e| {
+            tracing::error!("Failed to send registration message: {}", e);
+            WrapError::DaemonConnection(format!("Failed to register: {}", e))
+        })?;
+    tracing::info!("Registration message sent, waiting for acknowledgment");
 
     // Wait for registration acknowledgment
-    if let Some(Ok(Message::Text(text))) = ws_rx.next().await {
-        if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) {
-            if msg["type"].as_str() != Some("registered") {
-                return Err(WrapError::DaemonConnection(
-                    "Unexpected response from daemon".to_string(),
-                ));
+    match ws_rx.next().await {
+        Some(Ok(Message::Text(text))) => {
+            tracing::info!("Received response from daemon: {}", text);
+            if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) {
+                if msg["type"].as_str() != Some("registered") {
+                    tracing::error!("Unexpected response type from daemon: {:?}", msg["type"]);
+                    return Err(WrapError::DaemonConnection(
+                        "Unexpected response from daemon".to_string(),
+                    ));
+                }
+                tracing::info!("Successfully registered with daemon");
+            } else {
+                tracing::error!("Failed to parse daemon response");
             }
+        }
+        Some(Err(e)) => {
+            tracing::error!("WebSocket error while waiting for registration: {}", e);
+            return Err(WrapError::DaemonConnection(format!("WebSocket error: {}", e)));
+        }
+        None => {
+            tracing::error!("WebSocket closed before registration response");
+            return Err(WrapError::DaemonConnection("WebSocket closed unexpectedly".to_string()));
+        }
+        _ => {
+            tracing::warn!("Received non-text WebSocket message, ignoring");
+            return Err(WrapError::DaemonConnection("Unexpected message type from daemon".to_string()));
         }
     }
 
@@ -535,12 +566,25 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
     cmd.env("MOBILECLI_SESSION", "1");
 
     // Spawn the command
+    tracing::info!("Spawning PTY command: {} {:?}", cmd_path, config.args);
+    
+    #[cfg(windows)]
+    {
+        // On Windows, try to hide the console window for a cleaner experience
+        // Note: portable-pty doesn't expose creation_flags directly, so we rely on
+        // the PTY itself being created properly
+        tracing::info!("Spawning on Windows - PTY size: {}x{}", cols, rows);
+    }
+    
     let mut child = pair.slave.spawn_command(cmd).map_err(|e| {
+        tracing::error!("Failed to spawn PTY command: {}", e);
         if let Some(ctx) = &tmux_context {
             cleanup_tmux_session(ctx);
         }
         WrapError::Pty(e.to_string())
     })?;
+    
+    tracing::info!("PTY command spawned successfully, PID: {:?}", child.process_id());
 
     // Drop the slave - we communicate through the master
     drop(pair.slave);

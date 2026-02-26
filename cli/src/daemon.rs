@@ -1254,6 +1254,15 @@ fn spawn_session_windows(
 
     let session_name = name.unwrap_or(command);
     let mobilecli_bin = resolve_mobilecli_bin();
+    
+    // Map Unix shell commands to Windows equivalents
+    let (effective_command, effective_args): (&str, Vec<String>) = match command {
+        "bash" | "sh" | "zsh" => {
+            // Use PowerShell as the Windows equivalent
+            ("powershell", vec![])
+        }
+        _ => (command, args.to_vec()),
+    };
 
     let mut cmd = std::process::Command::new(&mobilecli_bin);
     cmd.arg("--name").arg(session_name);
@@ -1261,7 +1270,7 @@ fn spawn_session_windows(
         cmd.arg("--dir").arg(dir);
         cmd.current_dir(dir);
     }
-    cmd.arg(command).args(args);
+    cmd.arg(effective_command).args(effective_args);
 
     // Create a new console window so the session is visible and interactive.
     const CREATE_NEW_CONSOLE: u32 = 0x00000010;
