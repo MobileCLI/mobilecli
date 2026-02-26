@@ -158,10 +158,16 @@ fn request_terminal_resize(cols: u16, rows: u16) {
 
 fn tmux_base_command(socket_name: &str) -> Command {
     let mut cmd = Command::new("tmux");
+    // Use platform-appropriate null device
+    #[cfg(windows)]
+    let null_dev = "NUL";
+    #[cfg(not(windows))]
+    let null_dev = "/dev/null";
+    
     cmd.arg("-L")
         .arg(socket_name)
         .arg("-f")
-        .arg("/dev/null")
+        .arg(null_dev)
         .env_remove("TMUX");
     cmd
 }
@@ -497,11 +503,16 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
     // Build command
     let mut cmd = if let Some(ctx) = &tmux_context {
         let mut c = CommandBuilder::new("tmux");
+        #[cfg(windows)]
+        let null_dev = "NUL";
+        #[cfg(not(windows))]
+        let null_dev = "/dev/null";
+        
         c.args([
             "-L",
             ctx.socket_name.as_str(),
             "-f",
-            "/dev/null",
+            null_dev,
             "attach-session",
             "-t",
             ctx.session_name.as_str(),
@@ -583,10 +594,43 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
     let (stdin_tx, mut stdin_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let running_stdin = running.clone();
 
-    // Configure terminal for raw mode
+    // Configure terminal for raw mode (Unix only - Windows uses different mechanism)
+    #[cfg(unix)]
     let original_termios = setup_raw_mode();
+    #[cfg(not(unix))]
+    let original_termios: Option<()> = None;
+    
     if original_termios.is_none() {
         tracing::warn!("Failed to set raw terminal mode. Input may be line-buffered.");
+    }
+    
+    // On Windows, ensure console handles ANSI codes
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        unsafe {
+            let handle = std::io::stdout().as_raw_handle();
+            const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+            let mut mode: u32 = 0;
+            
+            type GetConsoleModeFn = unsafe extern "system" fn(*mut std::ffi::c_void, *mut u32) -> i32;
+            type SetConsoleModeFn = unsafe extern "system" fn(*mut std::ffi::c_void, u32) -> i32;
+            
+            let kernel32 = winapi::um::libloaderapi::GetModuleHandleA(b"kernel32.dll\0".as_ptr() as *const i8);
+            if !kernel32.is_null() {
+                let get_mode: GetConsoleModeFn = std::mem::transmute(
+                    winapi::um::libloaderapi::GetProcAddress(kernel32, b"GetConsoleMode\0".as_ptr() as *const i8)
+                );
+                let set_mode: SetConsoleModeFn = std::mem::transmute(
+                    winapi::um::libloaderapi::GetProcAddress(kernel32, b"SetConsoleMode\0".as_ptr() as *const i8)
+                );
+                
+                if get_mode(handle as *mut _, &mut mode) != 0 {
+                    let _ = set_mode(handle as *mut _, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+                    tracing::info!("Enabled Windows virtual terminal processing");
+                }
+            }
+        }
     }
 
     std::thread::spawn(move || {
@@ -615,8 +659,19 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
             // PTY output
             Some(data) = output_rx.recv() => {
                 // Always write to local terminal output.
-                let _ = stdout.write_all(&data);
-                let _ = stdout.flush();
+                if let Err(e) = stdout.write_all(&data) {
+                    tracing::error!("Failed to write PTY output to stdout: {}", e);
+                }
+                if let Err(e) = stdout.flush() {
+                    tracing::error!("Failed to flush stdout: {}", e);
+                }
+                #[cfg(windows)]
+                {
+                    // On Windows, also write to stderr for debugging black screen issue
+                    use std::io::Write;
+                    let _ = std::io::stderr().write_all(&data);
+                    let _ = std::io::stderr().flush();
+                }
 
                 // Send to daemon
                 let msg = serde_json::json!({

@@ -1251,6 +1251,7 @@ dependencies = [
  "uuid",
  "walkdir",
  "which",
+ "winapi",
 ]
 
 [[package]]
