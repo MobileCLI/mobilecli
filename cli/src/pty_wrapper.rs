@@ -59,6 +59,32 @@ impl RuntimeMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TmuxMouseMode {
+    On,
+    Off,
+}
+
+impl TmuxMouseMode {
+    fn as_tmux_value(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+
+    fn default_for_platform() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            Self::Off
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::On
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TmuxContext {
     socket_name: String,
@@ -76,17 +102,17 @@ enum DesktopResizePolicy {
 impl DesktopResizePolicy {
     fn from_env() -> Self {
         let raw = std::env::var("MOBILECLI_DESKTOP_RESIZE_POLICY")
-            .unwrap_or_else(|_| "mirror".to_string())
+            .unwrap_or_else(|_| "preserve".to_string())
             .to_lowercase();
         match raw.as_str() {
             "mirror" | "strict" | "legacy" => Self::Mirror,
             "preserve" | "off" | "none" | "" => Self::Preserve,
             other => {
                 tracing::warn!(
-                    "Unknown MOBILECLI_DESKTOP_RESIZE_POLICY='{}'. Defaulting to 'mirror'.",
+                    "Unknown MOBILECLI_DESKTOP_RESIZE_POLICY='{}'. Defaulting to 'preserve'.",
                     other
                 );
-                Self::Mirror
+                Self::Preserve
             }
         }
     }
@@ -234,6 +260,33 @@ fn resolve_runtime_mode() -> RuntimeMode {
     }
 }
 
+fn parse_tmux_mouse_mode(raw: &str) -> Option<TmuxMouseMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "on" | "1" | "true" | "yes" => Some(TmuxMouseMode::On),
+        "off" | "0" | "false" | "no" => Some(TmuxMouseMode::Off),
+        _ => None,
+    }
+}
+
+fn resolve_tmux_mouse_mode() -> TmuxMouseMode {
+    let default_mode = TmuxMouseMode::default_for_platform();
+    let Ok(raw) = std::env::var("MOBILECLI_TMUX_MOUSE") else {
+        return default_mode;
+    };
+    if raw.trim().is_empty() {
+        return default_mode;
+    }
+    if let Some(mode) = parse_tmux_mouse_mode(&raw) {
+        return mode;
+    }
+    tracing::warn!(
+        "Unknown MOBILECLI_TMUX_MOUSE='{}'. Defaulting to '{}'.",
+        raw,
+        default_mode.as_tmux_value()
+    );
+    default_mode
+}
+
 fn setup_tmux_session(
     socket_name: &str,
     session_name: &str,
@@ -242,6 +295,7 @@ fn setup_tmux_session(
     cwd: &str,
     cols: u16,
     rows: u16,
+    tmux_mouse_mode: TmuxMouseMode,
 ) -> Result<(), WrapError> {
     // Bootstrap a dedicated tmux server first so global options apply before
     // the wrapped CLI starts. We also disable alternate-screen globally here
@@ -299,10 +353,15 @@ fn setup_tmux_session(
         .arg("xterm*:smcup@:rmcup@");
     let _ = run_tmux_checked(&mut disable_altscreen_client, "terminal-overrides");
 
-    // Enable mouse so scroll wheel works with tmux's history buffer.
-    let mut mouse_on = tmux_base_command(socket_name);
-    mouse_on.arg("set-option").arg("-g").arg("mouse").arg("on");
-    let _ = run_tmux_checked(&mut mouse_on, "mouse");
+    // Mouse mode is configurable. Linux defaults to off so desktop emulators
+    // (e.g. Konsole) preserve normal drag-select clipboard behavior.
+    let mut set_mouse_mode = tmux_base_command(socket_name);
+    set_mouse_mode
+        .arg("set-option")
+        .arg("-g")
+        .arg("mouse")
+        .arg(tmux_mouse_mode.as_tmux_value());
+    let _ = run_tmux_checked(&mut set_mouse_mode, "mouse");
 
     // history-limit is set globally before new-session so the window is
     // allocated with the full 200K-line buffer from the start.
@@ -409,6 +468,13 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
     let cmd_path = resolve_command(&config.command)
         .ok_or_else(|| WrapError::CommandNotFound(config.command.clone()))?;
     let runtime_mode = resolve_runtime_mode();
+    let tmux_mouse_mode = resolve_tmux_mouse_mode();
+    let tmux_mouse_source = match std::env::var("MOBILECLI_TMUX_MOUSE") {
+        Ok(raw) if parse_tmux_mouse_mode(&raw).is_some() => "env_override",
+        Ok(raw) if raw.trim().is_empty() => "platform_default",
+        Ok(_) => "platform_default_invalid_env",
+        Err(_) => "platform_default",
+    };
 
     // Generate session ID (12 chars for better collision resistance)
     let session_id = uuid::Uuid::new_v4().to_string()[..12].to_string();
@@ -514,6 +580,11 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
 
     let mut tmux_context: Option<TmuxContext> = None;
     if runtime_mode == RuntimeMode::Tmux {
+        tracing::info!(
+            mode = tmux_mouse_mode.as_tmux_value(),
+            source = tmux_mouse_source,
+            "Resolved tmux mouse policy"
+        );
         let token = sanitize_tmux_token(&session_id);
         let ctx = TmuxContext {
             socket_name: format!("mcli-{}", token),
@@ -527,6 +598,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
             &cwd,
             cols,
             rows,
+            tmux_mouse_mode,
         )?;
         tmux_context = Some(ctx);
     }
@@ -639,14 +711,19 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
     let running_stdin = running.clone();
 
     // Configure terminal for raw mode (Unix only - Windows uses different mechanism)
+    // NOTE: Raw mode is disabled by default to preserve terminal selection/copy behavior.
+    // When raw mode is enabled, terminal emulators cannot handle text selection properly.
+    // Input will be line-buffered instead (press Enter to send to PTY).
+    // To enable raw mode, set MOBILECLI_RAW_MODE=1 environment variable.
     #[cfg(unix)]
-    let original_termios = setup_raw_mode();
+    let original_termios = if std::env::var("MOBILECLI_RAW_MODE").is_ok() {
+        setup_raw_mode()
+    } else {
+        tracing::info!("Running in line-buffered mode (set MOBILECLI_RAW_MODE=1 for raw mode)");
+        None
+    };
     #[cfg(not(unix))]
     let original_termios: Option<()> = None;
-    
-    if original_termios.is_none() {
-        tracing::warn!("Failed to set raw terminal mode. Input may be line-buffered.");
-    }
     
     // On Windows, ensure console handles ANSI codes
     #[cfg(windows)]
@@ -708,13 +785,6 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                 }
                 if let Err(e) = stdout.flush() {
                     tracing::error!("Failed to flush stdout: {}", e);
-                }
-                #[cfg(windows)]
-                {
-                    // On Windows, also write to stderr for debugging black screen issue
-                    use std::io::Write;
-                    let _ = std::io::stderr().write_all(&data);
-                    let _ = std::io::stderr().flush();
                 }
 
                 // Send to daemon
@@ -1006,8 +1076,9 @@ fn restore_terminal_mode(_original: Option<()>) {}
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_tmux_session, resolve_resize_reason, resolve_runtime_mode, sanitize_tmux_token,
-        setup_tmux_session, tmux_base_command, RuntimeMode, TmuxContext,
+        cleanup_tmux_session, parse_tmux_mouse_mode, resolve_resize_reason, resolve_runtime_mode,
+        sanitize_tmux_token, setup_tmux_session, tmux_base_command, RuntimeMode, TmuxContext,
+        TmuxMouseMode,
     };
     use crate::protocol::PtyResizeReason;
 
@@ -1058,6 +1129,28 @@ mod tests {
     }
 
     #[test]
+    fn tmux_mouse_mode_parser_accepts_common_aliases() {
+        assert_eq!(parse_tmux_mouse_mode("on"), Some(TmuxMouseMode::On));
+        assert_eq!(parse_tmux_mouse_mode("true"), Some(TmuxMouseMode::On));
+        assert_eq!(parse_tmux_mouse_mode("1"), Some(TmuxMouseMode::On));
+        assert_eq!(parse_tmux_mouse_mode("yes"), Some(TmuxMouseMode::On));
+        assert_eq!(parse_tmux_mouse_mode("off"), Some(TmuxMouseMode::Off));
+        assert_eq!(parse_tmux_mouse_mode("false"), Some(TmuxMouseMode::Off));
+        assert_eq!(parse_tmux_mouse_mode("0"), Some(TmuxMouseMode::Off));
+        assert_eq!(parse_tmux_mouse_mode("no"), Some(TmuxMouseMode::Off));
+        assert_eq!(parse_tmux_mouse_mode("maybe"), None);
+    }
+
+    #[test]
+    fn tmux_mouse_mode_default_matches_platform_policy() {
+        #[cfg(target_os = "linux")]
+        assert_eq!(TmuxMouseMode::default_for_platform(), TmuxMouseMode::Off);
+
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(TmuxMouseMode::default_for_platform(), TmuxMouseMode::On);
+    }
+
+    #[test]
     fn tmux_session_bootstrap_and_cleanup_roundtrip() {
         if which::which("tmux").is_err() {
             return;
@@ -1078,6 +1171,7 @@ mod tests {
             ".",
             80,
             24,
+            TmuxMouseMode::default_for_platform(),
         )
         .expect("setup tmux session");
 
@@ -1134,6 +1228,25 @@ mod tests {
             "expected tmux alternate-screen to be disabled to protect host terminal scrollback"
         );
 
+        let mut show_mouse_mode = tmux_base_command(&ctx.socket_name);
+        let output = show_mouse_mode
+            .arg("show-options")
+            .arg("-gv")
+            .arg("mouse")
+            .output()
+            .expect("show-options mouse output");
+        assert!(
+            output.status.success(),
+            "expected mouse option query success: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mouse_mode = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert_eq!(
+            mouse_mode,
+            TmuxMouseMode::default_for_platform().as_tmux_value(),
+            "expected tmux mouse option to follow platform default policy"
+        );
+
         cleanup_tmux_session(&ctx);
 
         let mut has_after_cleanup = tmux_base_command(&ctx.socket_name);
@@ -1147,5 +1260,50 @@ mod tests {
             !output.status.success(),
             "expected tmux session cleanup to remove server/session"
         );
+    }
+
+    #[test]
+    fn tmux_session_respects_explicit_mouse_override() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+
+        let token = sanitize_tmux_token(&uuid::Uuid::new_v4().to_string()[..12]);
+        let ctx = TmuxContext {
+            socket_name: format!("mcli-test-{}", token),
+            session_name: format!("mcli-test-{}", token),
+        };
+
+        setup_tmux_session(
+            &ctx.socket_name,
+            &ctx.session_name,
+            "/bin/sh",
+            &vec!["-lc".to_string(), "sleep 10 & wait".to_string()],
+            ".",
+            80,
+            24,
+            TmuxMouseMode::On,
+        )
+        .expect("setup tmux session with mouse override");
+
+        let mut show_mouse_mode = tmux_base_command(&ctx.socket_name);
+        let output = show_mouse_mode
+            .arg("show-options")
+            .arg("-gv")
+            .arg("mouse")
+            .output()
+            .expect("show-options mouse output");
+        assert!(
+            output.status.success(),
+            "expected mouse option query success: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mouse_mode = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert_eq!(
+            mouse_mode, "on",
+            "expected explicit tmux mouse override to enable mouse mode"
+        );
+
+        cleanup_tmux_session(&ctx);
     }
 }

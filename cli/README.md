@@ -136,6 +136,21 @@ If the daemon fails to start, check the log file:
 cat ~/.mobilecli/daemon.log
 ```
 
+If desktop drag-select copy is not working while tmux runtime is active:
+
+- On Linux, tmux mouse is now off by default to preserve terminal clipboard selection.
+- To explicitly enable tmux mouse behavior (scroll/click/copy-mode), launch with:
+
+```bash
+MOBILECLI_TMUX_MOUSE=on mobilecli
+```
+
+- To force clipboard-first behavior on any OS, launch with:
+
+```bash
+MOBILECLI_TMUX_MOUSE=off mobilecli
+```
+
 ## License
 
 MIT
