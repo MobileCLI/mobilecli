@@ -1239,10 +1239,11 @@ fn build_wrap_shell_command(
     args: &[String],
     working_dir: Option<&str>,
 ) -> String {
-    let mut tokens = Vec::new();
-    tokens.push(mobilecli_bin.to_string());
-    tokens.push("--name".to_string());
-    tokens.push(session_name.to_string());
+    let mut tokens = vec![
+        mobilecli_bin.to_string(),
+        "--name".to_string(),
+        session_name.to_string(),
+    ];
     // Use quiet mode to prevent "Connected!" message from scrolling the terminal
     tokens.push("--quiet".to_string());
     if let Some(dir) = working_dir {

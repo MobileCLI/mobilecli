@@ -321,10 +321,11 @@ fn setup_tmux_session(
     command_path: &str,
     args: &[String],
     cwd: &str,
-    cols: u16,
-    rows: u16,
+    terminal_size: (u16, u16),
     tmux_mouse_mode: TmuxMouseMode,
 ) -> Result<(), WrapError> {
+    let (cols, rows) = terminal_size;
+
     // Bootstrap a dedicated tmux server first so global options apply before
     // the wrapped CLI starts. We also disable alternate-screen globally here
     // because the pty_wrapper runs tmux attach-session inside the host
@@ -629,8 +630,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
             &cmd_path,
             &config.args,
             &cwd,
-            cols,
-            rows,
+            (cols, rows),
             tmux_mouse_mode,
         )?;
         tmux_context = Some(ctx);
@@ -1227,8 +1227,7 @@ mod tests {
             // Keep the session alive long enough for CI has-session checks.
             &vec!["-lc".to_string(), "sleep 10 & wait".to_string()],
             ".",
-            80,
-            24,
+            (80, 24),
             TmuxMouseMode::default_for_platform(),
         )
         .expect("setup tmux session");
@@ -1338,8 +1337,7 @@ mod tests {
             "/bin/sh",
             &vec!["-lc".to_string(), "sleep 10 & wait".to_string()],
             ".",
-            80,
-            24,
+            (80, 24),
             TmuxMouseMode::On,
         )
         .expect("setup tmux session with mouse override");
