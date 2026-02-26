@@ -1101,7 +1101,7 @@ async fn handle_pty_session(
 fn is_allowed_command(command: &str) -> bool {
     const ALLOWED_COMMANDS: &[&str] = &[
         "claude", "codex", "gemini", "opencode", "bash", "zsh", "sh", "fish", "nu", "pwsh",
-        "python", "python3", "node", "ruby",
+        "powershell", "python", "python3", "node", "ruby",
     ];
     // Get base command name (handle paths like /usr/bin/bash)
     let base = std::path::Path::new(command)
@@ -1264,32 +1264,20 @@ fn spawn_session_windows(
         _ => (command, args.to_vec()),
     };
 
-    // Use 'start' command to launch a visible terminal window on the desktop.
-    // This bypasses the service session isolation and creates the window
-    // in the user's interactive desktop session.
-    let mut cmd = std::process::Command::new("cmd");
-    let window_title = format!("MobileCLI - {}", session_name);
-    
-    cmd.arg("/c");
-    cmd.arg("start");
-    cmd.arg("\"".to_string() + &window_title + "\"");  // Window title in quotes
-    // Note: no /b flag so it creates a NEW visible window
-    
-    // The command to run inside the new window
-    cmd.arg("cmd");
-    cmd.arg("/k");
-    
-    // Build the mobilecli run command
-    cmd.arg(&mobilecli_bin);
+    // Spawn mobilecli directly with CREATE_NEW_CONSOLE to create a visible terminal window.
+    // Note: When the daemon runs as a service, windows may not be visible on the desktop
+    // due to session isolation. This is a Windows security limitation.
+    let mut cmd = std::process::Command::new(&mobilecli_bin);
     cmd.arg("--name").arg(session_name);
     if let Some(dir) = working_dir {
         cmd.arg("--dir").arg(dir);
+        cmd.current_dir(dir);
     }
-    cmd.arg("run");
     cmd.arg(effective_command);
     cmd.args(effective_args);
 
-    // CREATE_NEW_CONSOLE ensures the process gets its own console window
+    // CREATE_NEW_CONSOLE (0x00000010) creates a new console window for the process.
+    // This makes the terminal window visible when possible.
     const CREATE_NEW_CONSOLE: u32 = 0x00000010;
     cmd.creation_flags(CREATE_NEW_CONSOLE);
 
