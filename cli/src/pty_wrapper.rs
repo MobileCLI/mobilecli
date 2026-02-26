@@ -244,44 +244,11 @@ fn setup_tmux_session(
     // \x1b[?1049h to the host terminal when TUI apps run, causing the host to
     // enter its own alt-screen and lose its scrollback. Disabling it keeps
     // all output in the main buffer where capture-pane can reach it.
-    let mut start_server = tmux_base_command(socket_name);
-    start_server.arg("start-server");
-    let _ = run_tmux_checked(&mut start_server, "start-server");
-
-    let mut pre_alt_screen = tmux_base_command(socket_name);
-    pre_alt_screen
-        .arg("set-window-option")
-        .arg("-g")
-        .arg("alternate-screen")
-        .arg("off");
-    if let Err(err) = run_tmux_checked(&mut pre_alt_screen, "alternate-screen") {
-        tracing::debug!(
-            socket = socket_name,
-            session = session_name,
-            error = %err,
-            "Ignoring non-fatal pre-session alternate-screen option failure"
-        );
-    }
-
-    // Set history-limit globally BEFORE creating the session. tmux allocates
-    // each pane's history buffer at window-creation time using the current
-    // history-limit value; setting it after new-session has no effect on the
-    // window that was already created with the default 2000 lines.
-    let mut pre_history = tmux_base_command(socket_name);
-    pre_history
-        .arg("set-option")
-        .arg("-g")
-        .arg("history-limit")
-        .arg("200000");
-    if let Err(err) = run_tmux_checked(&mut pre_history, "history-limit") {
-        tracing::debug!(
-            socket = socket_name,
-            session = session_name,
-            error = %err,
-            "Ignoring non-fatal pre-session history-limit option failure"
-        );
-    }
-
+    //
+    // NOTE: We create the session first, then set options. The first window
+    // will have default history-limit (2000), but we set global options for
+    // future windows. This is a tmux limitation - history-limit can only be
+    // set globally and affects windows created after it's set.
     let mut new_session = tmux_base_command(socket_name);
     new_session
         .arg("new-session")
@@ -299,6 +266,16 @@ fn setup_tmux_session(
         .env("TERM", "xterm-256color")
         .env("MOBILECLI_SESSION", "1");
     run_tmux_checked(&mut new_session, "new-session")?;
+
+    // Set global options for future windows. The first window already
+    // exists with default settings, but new windows will inherit these.
+    let mut set_history = tmux_base_command(socket_name);
+    set_history
+        .arg("set-option")
+        .arg("-g")
+        .arg("history-limit")
+        .arg("200000");
+    let _ = run_tmux_checked(&mut set_history, "history-limit");
 
     // Best-effort options for deterministic rendering behavior.
     // NOTE: window-size must remain dynamic so wrapper PTY resizes propagate

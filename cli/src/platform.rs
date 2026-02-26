@@ -82,10 +82,10 @@ pub fn is_process_alive(pid: u32) -> bool {
 
 #[cfg(windows)]
 pub fn is_process_alive(pid: u32) -> bool {
-    // PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    // SYNCHRONIZE = 0x00100000 - allows waiting on process without requiring
+    // full query permissions. This works across sessions and elevation levels.
+    const SYNCHRONIZE: u32 = 0x00100000;
 
-    // OpenProcess and GetExitCodeProcess from Windows API
     #[link(name = "kernel32")]
     extern "system" {
         fn OpenProcess(
@@ -94,25 +94,28 @@ pub fn is_process_alive(pid: u32) -> bool {
             dwProcessId: u32,
         ) -> *mut std::ffi::c_void;
         fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
-        fn GetExitCodeProcess(hProcess: *mut std::ffi::c_void, lpExitCode: *mut u32) -> i32;
+        fn WaitForSingleObject(hHandle: *mut std::ffi::c_void, dwMilliseconds: u32) -> u32;
     }
 
-    const STILL_ACTIVE: u32 = 259;
+    const WAIT_OBJECT_0: u32 = 0;
+    const WAIT_TIMEOUT: u32 = 258;
 
     unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        // Try to open process with SYNCHRONIZE access
+        // If process exists, we can open it. If not, OpenProcess returns null.
+        let handle = OpenProcess(SYNCHRONIZE, 0, pid);
         if handle.is_null() {
             return false;
         }
 
-        let mut exit_code: u32 = 0;
-        let result = GetExitCodeProcess(handle, &mut exit_code);
-
-        // Store result before closing handle (cleaner pattern)
-        let is_alive = result != 0 && exit_code == STILL_ACTIVE;
+        // Check if process is still running by waiting with 0 timeout
+        // WAIT_TIMEOUT = process is still running
+        // WAIT_OBJECT_0 = process has exited
+        let result = WaitForSingleObject(handle, 0);
         CloseHandle(handle);
 
-        is_alive
+        // Process is alive if WaitForSingleObject times out (still running)
+        result == WAIT_TIMEOUT
     }
 }
 

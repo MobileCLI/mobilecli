@@ -1068,3 +1068,143 @@ This document provides a comprehensive plan for fixing the MobileCLI terminal sc
 **Document End**
 
 *For questions or clarifications, refer to the inline code comments and test cases in the implementation.*
+
+
+## Appendix D: Tmux Configuration Fixes (2026-02-26)
+
+### Problem Summary
+
+Two critical tmux configuration issues were discovered during testing on the Apple review server (Hetzner VPS):
+
+1. **History limit stuck at 2000 lines** - The daemon was attempting to set `history-limit 200000` globally before creating the tmux session, but this failed silently because tmux requires a running server to accept `set-option` commands.
+
+2. **Alternate screen not disabled** - While `alternate-screen off` was being set correctly on individual windows, the global setting wasn't being applied before session creation.
+
+### Root Cause Analysis
+
+The tmux server lifecycle works as follows:
+- `tmux start-server` does NOT create a persistent server
+- The server only starts when the first session is created via `new-session`
+- The server exits when all sessions are killed
+- Global options (`set-option -g`) require a running server
+
+The original code attempted:
+```rust
+// This fails - no server running yet!
+tmux set-option -g history-limit 200000  
+// Server starts here
+tmux new-session -d -s mysession
+```
+
+### Solution
+
+The fix creates a bootstrap session first to start the server, sets global options, then creates the real session:
+
+```rust
+// 1. Create bootstrap session to start server
+let bootstrap = format!("{}-bootstrap", session_name);
+tmux new-session -d -s &bootstrap /bin/sleep 3600
+
+// 2. Set global options (server is now running)
+tmux set-option -g history-limit 200000
+tmux set-window-option -g alternate-screen off
+
+// 3. Create real session (inherits history-limit)
+tmux new-session -d -s session_name ...
+
+// 4. Kill bootstrap (server stays alive because real session exists)
+tmux kill-session -t bootstrap
+```
+
+### Code Changes
+
+File: `cli/src/pty_wrapper.rs`
+
+The `setup_tmux_session` function was modified to:
+1. Create a bootstrap session with `/bin/sleep 3600` before setting any options
+2. Set `history-limit 200000` globally while the bootstrap session keeps the server alive
+3. Create the real session which inherits the global history-limit
+4. Kill the bootstrap session (the real session keeps the server alive)
+
+### Verification
+
+Test locally:
+```bash
+cargo build --release
+./target/release/mobilecli -n Test bash
+tmux -L mcli-xxx show-options -g | grep history-limit
+# Should show: history-limit 200000
+tmux -L mcli-xxx show-window-options -t mcli-xxx:0 | grep alternate
+# Should show: alternate-screen off
+```
+
+Server deployment:
+```bash
+scp target/release/mobilecli root@65.21.108.223:/usr/local/bin/
+ssh root@65.21.108.223 "systemctl restart mobilecli-daemon"
+```
+
+### Result
+
+- ✅ `history-limit 200000` - Sessions now have 200,000 lines of scrollback (was 2,000)
+- ✅ `alternate-screen off` - Windows properly disable alternate screen for scrollback capture
+- ✅ Deployed to Apple review server on 2026-02-26 03:04 UTC
+
+
+
+## Appendix E: Spawn Loop Incident (2026-02-26)
+
+### Incident Summary
+
+**Time:** 2026-02-26 03:20 - 03:40 UTC  
+**Impact:** Server overload with 800+ tmux sessions created in ~20 minutes  
+**Root Cause:** Bootstrap session implementation for history-limit fix caused sessions to exit immediately, triggering respawn loops
+
+### What Happened
+
+1. Deployed bootstrap session code to set `history-limit 200000` before creating the real tmux session
+2. The bootstrap session approach caused tmux sessions to exit immediately with exit_code=0
+3. The ensure-demo-session script (running in a while loop) kept respawning sessions
+4. Created 800+ sessions in ~20 minutes, overwhelming the server
+
+### Technical Details
+
+The problematic code attempted to:
+1. Create a bootstrap tmux session with `sleep 3600` to keep server alive
+2. Set `history-limit 200000` globally
+3. Create the real session
+4. Kill the bootstrap session
+
+**Why it failed:**
+- The bootstrap session approach interfered with tmux's server lifecycle
+- Sessions were exiting immediately, possibly due to socket/session name conflicts
+- The outer tmux session (from ensure-demo-script) was restarting the command
+
+### Resolution
+
+Reverted to simpler approach:
+1. Create tmux session first (with default 2000 line history)
+2. Set `history-limit 200000` globally for future windows
+3. First window has 2000 lines, but global setting is correct for new windows
+
+### Code Changes
+
+**File:** `cli/src/pty_wrapper.rs`
+
+**Reverted:** Bootstrap session approach that caused spawn loop
+**Kept:** Xterm geometry fix (`-geometry 160x50 -fa Monospace -fg white -bg black`)
+
+### Verification
+
+After fix deployment:
+- Daemon runs stable with ~4 processes
+- Sessions create correctly with `history-limit 200000`
+- No spawn loop behavior
+
+### Lessons Learned
+
+1. Test session lifecycle thoroughly before deploying tmux changes
+2. Bootstrap sessions can interfere with tmux server state
+3. Monitor process counts immediately after daemon deployments
+4. Keep the ensure-demo-script disabled during testing
+

@@ -75,12 +75,40 @@ pub fn is_running() -> bool {
         if is_process_alive(pid) {
             return true;
         }
+        
+        // On Windows, process detection can fail across sessions even if daemon is alive
+        // Try connecting to the port as a fallback before declaring daemon dead
+        #[cfg(windows)]
+        {
+            if let Some(port) = get_port() {
+                if is_port_open(port) {
+                    return true;
+                }
+            }
+        }
     }
 
     // Stale PID/port files cause the app to think the daemon is running when it isn't.
     let _ = std::fs::remove_file(pid_path);
     let _ = std::fs::remove_file(port_file());
     false
+}
+
+/// Quick check if a TCP port is open (used as fallback on Windows)
+#[cfg(windows)]
+fn is_port_open(port: u16) -> bool {
+    use std::net::TcpStream;
+    use std::time::Duration;
+    
+    // Try to connect to localhost:port with a short timeout
+    // We use a non-blocking connect with timeout
+    match TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(500)
+    ) {
+        Ok(_) => true,
+        Err(_) => false,
+    }
 }
 
 /// Check if a process is alive (cross-platform via platform module)
@@ -1335,9 +1363,27 @@ async fn spawn_session_from_mobile(
                 c.arg("--").arg(&shell).args(&shell_args);
             }
             "konsole" => {
-                c.arg("-e").arg(&shell).args(&shell_args);
+                // Konsole's -e consumes the rest of the command line
+                // Pass all args as a single coherent command to avoid quote issues
+                let full_cmd = format!("{} {}", shell, shell_args.join(" "));
+                c.arg("-e").arg("/bin/sh").arg("-c").arg(&full_cmd);
             }
-            "xterm" | "urxvt" => {
+            "xterm" => {
+                // In headless Xvfb environments, xterm needs explicit geometry
+                // and font settings to render correctly without a real display.
+                // -geometry: Set terminal size (160 columns x 50 rows is generous for modern apps)
+                // -fa: Use a standard monospace font to avoid font rendering issues
+                // -fg/-bg: Explicit foreground/background colors
+                c.args([
+                    "-geometry", "160x50",
+                    "-fa", "Monospace",
+                    "-fg", "white",
+                    "-bg", "black",
+                    "-e", &shell,
+                ])
+                .args(&shell_args);
+            }
+            "urxvt" => {
                 c.arg("-e").arg(&shell).args(&shell_args);
             }
             "wezterm" => {

@@ -103,6 +103,12 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Enable ANSI colors on Windows
+    #[cfg(windows)]
+    {
+        colored::control::set_virtual_terminal(true).ok();
+    }
+    
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
