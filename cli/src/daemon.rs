@@ -1264,15 +1264,32 @@ fn spawn_session_windows(
         _ => (command, args.to_vec()),
     };
 
-    let mut cmd = std::process::Command::new(&mobilecli_bin);
+    // Use 'start' command to launch a visible terminal window on the desktop.
+    // This bypasses the service session isolation and creates the window
+    // in the user's interactive desktop session.
+    let mut cmd = std::process::Command::new("cmd");
+    let window_title = format!("MobileCLI - {}", session_name);
+    
+    cmd.arg("/c");
+    cmd.arg("start");
+    cmd.arg("\"".to_string() + &window_title + "\"");  // Window title in quotes
+    // Note: no /b flag so it creates a NEW visible window
+    
+    // The command to run inside the new window
+    cmd.arg("cmd");
+    cmd.arg("/k");
+    
+    // Build the mobilecli run command
+    cmd.arg(&mobilecli_bin);
     cmd.arg("--name").arg(session_name);
     if let Some(dir) = working_dir {
         cmd.arg("--dir").arg(dir);
-        cmd.current_dir(dir);
     }
-    cmd.arg(effective_command).args(effective_args);
+    cmd.arg("run");
+    cmd.arg(effective_command);
+    cmd.args(effective_args);
 
-    // Create a new console window so the session is visible and interactive.
+    // CREATE_NEW_CONSOLE ensures the process gets its own console window
     const CREATE_NEW_CONSOLE: u32 = 0x00000010;
     cmd.creation_flags(CREATE_NEW_CONSOLE);
 
