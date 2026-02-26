@@ -647,10 +647,20 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
                                     if let Some(data) = msg["data"].as_str() {
                                         if let Ok(bytes) = BASE64.decode(data) {
                                             let normalized = normalize_input_newlines(&bytes);
+                                            tracing::debug!(
+                                                "Writing mobile input to PTY: {} bytes",
+                                                normalized.len()
+                                            );
                                             if let Err(e) = writer.write_all(normalized.as_ref()) {
-                                                tracing::debug!("Failed to write mobile input to PTY: {}", e);
+                                                tracing::error!("Failed to write mobile input to PTY: {}", e);
+                                            } else {
+                                                tracing::debug!("Successfully wrote input to PTY");
                                             }
-                                            let _ = writer.flush();
+                                            if let Err(e) = writer.flush() {
+                                                tracing::error!("Failed to flush PTY writer: {}", e);
+                                            }
+                                        } else {
+                                            tracing::warn!("Failed to base64 decode input data");
                                         }
                                     }
                                 }
