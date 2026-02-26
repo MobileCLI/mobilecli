@@ -75,7 +75,7 @@ pub fn is_running() -> bool {
         if is_process_alive(pid) {
             return true;
         }
-        
+
         // On Windows, process detection can fail across sessions even if daemon is alive
         // Try connecting to the port as a fallback before declaring daemon dead
         #[cfg(windows)]
@@ -99,12 +99,12 @@ pub fn is_running() -> bool {
 fn is_port_open(port: u16) -> bool {
     use std::net::TcpStream;
     use std::time::Duration;
-    
+
     // Try to connect to localhost:port with a short timeout
     // We use a non-blocking connect with timeout
     match TcpStream::connect_timeout(
         &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-        Duration::from_millis(500)
+        Duration::from_millis(500),
     ) {
         Ok(_) => true,
         Err(_) => false,
@@ -1100,8 +1100,21 @@ async fn handle_pty_session(
 /// Validate command name - only allow known safe CLI commands
 fn is_allowed_command(command: &str) -> bool {
     const ALLOWED_COMMANDS: &[&str] = &[
-        "claude", "codex", "gemini", "opencode", "bash", "zsh", "sh", "fish", "nu", "pwsh",
-        "powershell", "python", "python3", "node", "ruby",
+        "claude",
+        "codex",
+        "gemini",
+        "opencode",
+        "bash",
+        "zsh",
+        "sh",
+        "fish",
+        "nu",
+        "pwsh",
+        "powershell",
+        "python",
+        "python3",
+        "node",
+        "ruby",
     ];
     // Get base command name (handle paths like /usr/bin/bash)
     let base = std::path::Path::new(command)
@@ -1226,10 +1239,11 @@ fn build_wrap_shell_command(
     args: &[String],
     working_dir: Option<&str>,
 ) -> String {
-    let mut tokens = Vec::new();
-    tokens.push(mobilecli_bin.to_string());
-    tokens.push("--name".to_string());
-    tokens.push(session_name.to_string());
+    let mut tokens = vec![
+        mobilecli_bin.to_string(),
+        "--name".to_string(),
+        session_name.to_string(),
+    ];
     // Use quiet mode to prevent "Connected!" message from scrolling the terminal
     tokens.push("--quiet".to_string());
     if let Some(dir) = working_dir {
@@ -1256,7 +1270,7 @@ fn spawn_session_windows(
 
     let session_name = name.unwrap_or(command);
     let mobilecli_bin = resolve_mobilecli_bin();
-    
+
     // Map Unix shell commands to Windows equivalents
     let (effective_command, effective_args): (&str, Vec<String>) = match command {
         "bash" | "sh" | "zsh" => {
@@ -1279,6 +1293,9 @@ fn spawn_session_windows(
     }
     cmd.arg(effective_command);
     cmd.args(effective_args);
+    // Keep host desktop geometry stable for Windows demo sessions even if
+    // the machine has a legacy mirror policy set in the environment.
+    cmd.env("MOBILECLI_DESKTOP_RESIZE_POLICY", "preserve");
 
     // CREATE_NEW_CONSOLE (0x00000010) creates a new console window for the process.
     // This makes the terminal window visible when possible.
@@ -1393,11 +1410,16 @@ async fn spawn_session_from_mobile(
                 // -fa: Use a standard monospace font to avoid font rendering issues
                 // -fg/-bg: Explicit foreground/background colors
                 c.args([
-                    "-geometry", "160x50",
-                    "-fa", "Monospace",
-                    "-fg", "white",
-                    "-bg", "black",
-                    "-e", &shell,
+                    "-geometry",
+                    "160x50",
+                    "-fa",
+                    "Monospace",
+                    "-fg",
+                    "white",
+                    "-bg",
+                    "black",
+                    "-e",
+                    &shell,
                 ])
                 .args(&shell_args);
             }
@@ -2362,12 +2384,12 @@ async fn process_client_msg(
             if action_result.is_ok() && !viewport_state.following_live {
                 // Small delay to let tmux settle into its new scroll position
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                
+
                 // Re-check state after delay to avoid race conditions
                 let viewport_state = query_tmux_viewport_state(socket.clone(), name.clone())
                     .await
                     .unwrap_or_default();
-                
+
                 if !viewport_state.following_live {
                     if let Some(frame_bytes) = capture_tmux_viewport_simple(socket, name).await {
                         // Prepend clear + home escape sequences so mobile redraws fresh
@@ -3988,12 +4010,10 @@ fn capture_tmux_viewport_simple_blocking(socket: &str, session: &str) -> Option<
 }
 
 async fn capture_tmux_viewport_simple(socket: String, session: String) -> Option<Vec<u8>> {
-    tokio::task::spawn_blocking(move || {
-        capture_tmux_viewport_simple_blocking(&socket, &session)
-    })
-    .await
-    .ok()
-    .flatten()
+    tokio::task::spawn_blocking(move || capture_tmux_viewport_simple_blocking(&socket, &session))
+        .await
+        .ok()
+        .flatten()
 }
 
 async fn capture_tmux_history_with_retry(
@@ -4023,14 +4043,10 @@ async fn capture_tmux_history_with_retry(
 
 fn is_terminal_report_csi(body: &[u8], final_byte: u8) -> bool {
     match final_byte {
-        // Device Attributes response (e.g. ESC[>0;276;0c from xterm.js)
+        // Strip only Device Attributes replies (e.g. ESC[>0;276;0c from xterm.js).
+        // Keep CPR/DSR/mode reports intact because line editors (notably PSReadLine)
+        // rely on them for cursor math and prompt repaint fidelity.
         b'c' => body.starts_with(b">") || body.starts_with(b"?"),
-        // Cursor position report (ESC[row;colR)
-        b'R' => body.contains(&b';') && body.iter().all(|b| b.is_ascii_digit() || *b == b';'),
-        // Status reports (ESC[0n / ESC[3n / ESC[?...)
-        b'n' => body.starts_with(b"?") || body.iter().all(|b| b.is_ascii_digit() || *b == b';'),
-        // Mode reports (ESC[?...$y)
-        b'y' => body.starts_with(b"?") && body.contains(&b'$'),
         _ => false,
     }
 }
@@ -4487,6 +4503,22 @@ mod tests {
         assert_eq!(dropped2, 0);
         assert_eq!(out2, b"\x1b[A");
         assert!(tail.is_empty());
+    }
+
+    #[test]
+    fn strip_terminal_reports_preserves_cursor_position_report() {
+        let input = b"\x1b[12;45R";
+        let (out, dropped) = strip_terminal_report_sequences(input);
+        assert_eq!(dropped, 0);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn strip_terminal_reports_preserves_status_report() {
+        let input = b"\x1b[0n";
+        let (out, dropped) = strip_terminal_report_sequences(input);
+        assert_eq!(dropped, 0);
+        assert_eq!(out, input);
     }
 
     #[tokio::test]

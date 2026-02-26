@@ -416,7 +416,8 @@ MobileCLI/
 1. MobileCLI uses xterm.js with full ANSI 256-color support. Ensure your CLI sets `TERM=xterm-256color` (this is the default).
 2. The terminal auto-resizes to fit your phone screen. TUI applications (like `htop` or `vim`) should adapt automatically.
 3. Desktop terminal geometry is preserved by default. If you explicitly want mirrored desktop window resizing, launch with `MOBILECLI_DESKTOP_RESIZE_POLICY=mirror`.
-4. If a session looks garbled after switching tabs, tap the session to re-enter it — the terminal refits on activation.
+4. On Linux, tmux mouse mode is disabled by default so desktop terminals like Konsole keep normal drag-select clipboard behavior. Re-enable tmux mouse features with `MOBILECLI_TMUX_MOUSE=on mobilecli`.
+5. If a session looks garbled after switching tabs, tap the session to re-enter it — the terminal refits on activation.
 </details>
 
 <details>
