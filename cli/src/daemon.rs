@@ -1230,6 +1230,8 @@ fn build_wrap_shell_command(
     tokens.push(mobilecli_bin.to_string());
     tokens.push("--name".to_string());
     tokens.push(session_name.to_string());
+    // Use quiet mode to prevent "Connected!" message from scrolling the terminal
+    tokens.push("--quiet".to_string());
     if let Some(dir) = working_dir {
         tokens.push("--dir".to_string());
         tokens.push(dir.to_string());
@@ -1269,6 +1271,8 @@ fn spawn_session_windows(
     // due to session isolation. This is a Windows security limitation.
     let mut cmd = std::process::Command::new(&mobilecli_bin);
     cmd.arg("--name").arg(session_name);
+    // Use quiet mode to prevent "Connected!" message from scrolling the terminal
+    cmd.arg("--quiet");
     if let Some(dir) = working_dir {
         cmd.arg("--dir").arg(dir);
         cmd.current_dir(dir);
