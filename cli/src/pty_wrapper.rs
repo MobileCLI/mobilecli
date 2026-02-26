@@ -268,6 +268,34 @@ fn parse_tmux_mouse_mode(raw: &str) -> Option<TmuxMouseMode> {
     }
 }
 
+fn parse_bool_env_flag(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "on" | "1" | "true" | "yes" => Some(true),
+        "off" | "0" | "false" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn resolve_raw_mode() -> bool {
+    let Ok(raw) = std::env::var("MOBILECLI_RAW_MODE") else {
+        return false;
+    };
+
+    if raw.trim().is_empty() {
+        return false;
+    }
+
+    if let Some(enabled) = parse_bool_env_flag(&raw) {
+        return enabled;
+    }
+
+    tracing::warn!(
+        "Unknown MOBILECLI_RAW_MODE='{}'. Defaulting to line-buffered mode (disabled).",
+        raw
+    );
+    false
+}
+
 fn resolve_tmux_mouse_mode() -> TmuxMouseMode {
     let default_mode = TmuxMouseMode::default_for_platform();
     let Ok(raw) = std::env::var("MOBILECLI_TMUX_MOUSE") else {
@@ -716,7 +744,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
     // Input will be line-buffered instead (press Enter to send to PTY).
     // To enable raw mode, set MOBILECLI_RAW_MODE=1 environment variable.
     #[cfg(unix)]
-    let original_termios = if std::env::var("MOBILECLI_RAW_MODE").is_ok() {
+    let original_termios = if resolve_raw_mode() {
         setup_raw_mode()
     } else {
         tracing::info!("Running in line-buffered mode (set MOBILECLI_RAW_MODE=1 for raw mode)");
@@ -1076,9 +1104,9 @@ fn restore_terminal_mode(_original: Option<()>) {}
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_tmux_session, parse_tmux_mouse_mode, resolve_resize_reason, resolve_runtime_mode,
-        sanitize_tmux_token, setup_tmux_session, tmux_base_command, RuntimeMode, TmuxContext,
-        TmuxMouseMode,
+        cleanup_tmux_session, parse_bool_env_flag, parse_tmux_mouse_mode, resolve_resize_reason,
+        resolve_runtime_mode, sanitize_tmux_token, setup_tmux_session, tmux_base_command,
+        RuntimeMode, TmuxContext, TmuxMouseMode,
     };
     use crate::protocol::PtyResizeReason;
 
@@ -1148,6 +1176,22 @@ mod tests {
 
         #[cfg(not(target_os = "linux"))]
         assert_eq!(TmuxMouseMode::default_for_platform(), TmuxMouseMode::On);
+    }
+
+    #[test]
+    fn bool_flag_parser_accepts_common_aliases() {
+        assert_eq!(parse_bool_env_flag("on"), Some(true));
+        assert_eq!(parse_bool_env_flag("true"), Some(true));
+        assert_eq!(parse_bool_env_flag("1"), Some(true));
+        assert_eq!(parse_bool_env_flag("yes"), Some(true));
+
+        assert_eq!(parse_bool_env_flag("off"), Some(false));
+        assert_eq!(parse_bool_env_flag("false"), Some(false));
+        assert_eq!(parse_bool_env_flag("0"), Some(false));
+        assert_eq!(parse_bool_env_flag("no"), Some(false));
+
+        assert_eq!(parse_bool_env_flag(""), None);
+        assert_eq!(parse_bool_env_flag("maybe"), None);
     }
 
     #[test]
