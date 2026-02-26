@@ -75,7 +75,7 @@ pub fn is_running() -> bool {
         if is_process_alive(pid) {
             return true;
         }
-        
+
         // On Windows, process detection can fail across sessions even if daemon is alive
         // Try connecting to the port as a fallback before declaring daemon dead
         #[cfg(windows)]
@@ -99,12 +99,12 @@ pub fn is_running() -> bool {
 fn is_port_open(port: u16) -> bool {
     use std::net::TcpStream;
     use std::time::Duration;
-    
+
     // Try to connect to localhost:port with a short timeout
     // We use a non-blocking connect with timeout
     match TcpStream::connect_timeout(
         &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-        Duration::from_millis(500)
+        Duration::from_millis(500),
     ) {
         Ok(_) => true,
         Err(_) => false,
@@ -1100,8 +1100,21 @@ async fn handle_pty_session(
 /// Validate command name - only allow known safe CLI commands
 fn is_allowed_command(command: &str) -> bool {
     const ALLOWED_COMMANDS: &[&str] = &[
-        "claude", "codex", "gemini", "opencode", "bash", "zsh", "sh", "fish", "nu", "pwsh",
-        "powershell", "python", "python3", "node", "ruby",
+        "claude",
+        "codex",
+        "gemini",
+        "opencode",
+        "bash",
+        "zsh",
+        "sh",
+        "fish",
+        "nu",
+        "pwsh",
+        "powershell",
+        "python",
+        "python3",
+        "node",
+        "ruby",
     ];
     // Get base command name (handle paths like /usr/bin/bash)
     let base = std::path::Path::new(command)
@@ -1256,7 +1269,7 @@ fn spawn_session_windows(
 
     let session_name = name.unwrap_or(command);
     let mobilecli_bin = resolve_mobilecli_bin();
-    
+
     // Map Unix shell commands to Windows equivalents
     let (effective_command, effective_args): (&str, Vec<String>) = match command {
         "bash" | "sh" | "zsh" => {
@@ -1396,11 +1409,16 @@ async fn spawn_session_from_mobile(
                 // -fa: Use a standard monospace font to avoid font rendering issues
                 // -fg/-bg: Explicit foreground/background colors
                 c.args([
-                    "-geometry", "160x50",
-                    "-fa", "Monospace",
-                    "-fg", "white",
-                    "-bg", "black",
-                    "-e", &shell,
+                    "-geometry",
+                    "160x50",
+                    "-fa",
+                    "Monospace",
+                    "-fg",
+                    "white",
+                    "-bg",
+                    "black",
+                    "-e",
+                    &shell,
                 ])
                 .args(&shell_args);
             }
@@ -2365,12 +2383,12 @@ async fn process_client_msg(
             if action_result.is_ok() && !viewport_state.following_live {
                 // Small delay to let tmux settle into its new scroll position
                 tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                
+
                 // Re-check state after delay to avoid race conditions
                 let viewport_state = query_tmux_viewport_state(socket.clone(), name.clone())
                     .await
                     .unwrap_or_default();
-                
+
                 if !viewport_state.following_live {
                     if let Some(frame_bytes) = capture_tmux_viewport_simple(socket, name).await {
                         // Prepend clear + home escape sequences so mobile redraws fresh
@@ -3991,12 +4009,10 @@ fn capture_tmux_viewport_simple_blocking(socket: &str, session: &str) -> Option<
 }
 
 async fn capture_tmux_viewport_simple(socket: String, session: String) -> Option<Vec<u8>> {
-    tokio::task::spawn_blocking(move || {
-        capture_tmux_viewport_simple_blocking(&socket, &session)
-    })
-    .await
-    .ok()
-    .flatten()
+    tokio::task::spawn_blocking(move || capture_tmux_viewport_simple_blocking(&socket, &session))
+        .await
+        .ok()
+        .flatten()
 }
 
 async fn capture_tmux_history_with_retry(

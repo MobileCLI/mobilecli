@@ -108,7 +108,7 @@ async fn main() -> ExitCode {
     {
         colored::control::set_virtual_terminal(true).ok();
     }
-    
+
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(

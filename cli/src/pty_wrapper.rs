@@ -189,7 +189,7 @@ fn tmux_base_command(socket_name: &str) -> Command {
     let null_dev = "NUL";
     #[cfg(not(windows))]
     let null_dev = "/dev/null";
-    
+
     cmd.arg("-L")
         .arg(socket_name)
         .arg("-f")
@@ -518,13 +518,11 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
     let port = get_port().unwrap_or(DEFAULT_PORT);
     let daemon_url = format!("ws://127.0.0.1:{}", port);
     tracing::info!("Connecting to daemon at {}", daemon_url);
-    
-    let (ws_stream, _) = connect_async(&daemon_url)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to connect to daemon at {}: {}", daemon_url, e);
-            WrapError::DaemonConnection(format!("Failed to connect to daemon: {}", e))
-        })?;
+
+    let (ws_stream, _) = connect_async(&daemon_url).await.map_err(|e| {
+        tracing::error!("Failed to connect to daemon at {}: {}", daemon_url, e);
+        WrapError::DaemonConnection(format!("Failed to connect to daemon: {}", e))
+    })?;
     tracing::info!("WebSocket connected to daemon");
 
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
@@ -539,7 +537,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
         "runtime": runtime_mode.as_str(),
     });
     tracing::info!("Sending registration message: {}", register_msg);
-    
+
     ws_tx
         .send(Message::Text(register_msg.to_string()))
         .await
@@ -567,15 +565,22 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
         }
         Some(Err(e)) => {
             tracing::error!("WebSocket error while waiting for registration: {}", e);
-            return Err(WrapError::DaemonConnection(format!("WebSocket error: {}", e)));
+            return Err(WrapError::DaemonConnection(format!(
+                "WebSocket error: {}",
+                e
+            )));
         }
         None => {
             tracing::error!("WebSocket closed before registration response");
-            return Err(WrapError::DaemonConnection("WebSocket closed unexpectedly".to_string()));
+            return Err(WrapError::DaemonConnection(
+                "WebSocket closed unexpectedly".to_string(),
+            ));
         }
         _ => {
             tracing::warn!("Received non-text WebSocket message, ignoring");
-            return Err(WrapError::DaemonConnection("Unexpected message type from daemon".to_string()));
+            return Err(WrapError::DaemonConnection(
+                "Unexpected message type from daemon".to_string(),
+            ));
         }
     }
 
@@ -638,7 +643,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
         let null_dev = "NUL";
         #[cfg(not(windows))]
         let null_dev = "/dev/null";
-        
+
         c.args([
             "-L",
             ctx.socket_name.as_str(),
@@ -667,7 +672,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
 
     // Spawn the command
     tracing::info!("Spawning PTY command: {} {:?}", cmd_path, config.args);
-    
+
     #[cfg(windows)]
     {
         // On Windows, try to hide the console window for a cleaner experience
@@ -675,7 +680,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
         // the PTY itself being created properly
         tracing::info!("Spawning on Windows - PTY size: {}x{}", cols, rows);
     }
-    
+
     let mut child = pair.slave.spawn_command(cmd).map_err(|e| {
         tracing::error!("Failed to spawn PTY command: {}", e);
         if let Some(ctx) = &tmux_context {
@@ -683,8 +688,11 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
         }
         WrapError::Pty(e.to_string())
     })?;
-    
-    tracing::info!("PTY command spawned successfully, PID: {:?}", child.process_id());
+
+    tracing::info!(
+        "PTY command spawned successfully, PID: {:?}",
+        child.process_id()
+    );
 
     // Drop the slave - we communicate through the master
     drop(pair.slave);
@@ -752,7 +760,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
     };
     #[cfg(not(unix))]
     let original_termios: Option<()> = None;
-    
+
     // On Windows, ensure console handles ANSI codes
     #[cfg(windows)]
     {
@@ -761,19 +769,25 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
             let handle = std::io::stdout().as_raw_handle();
             const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
             let mut mode: u32 = 0;
-            
-            type GetConsoleModeFn = unsafe extern "system" fn(*mut std::ffi::c_void, *mut u32) -> i32;
+
+            type GetConsoleModeFn =
+                unsafe extern "system" fn(*mut std::ffi::c_void, *mut u32) -> i32;
             type SetConsoleModeFn = unsafe extern "system" fn(*mut std::ffi::c_void, u32) -> i32;
-            
-            let kernel32 = winapi::um::libloaderapi::GetModuleHandleA(b"kernel32.dll\0".as_ptr() as *const i8);
+
+            let kernel32 =
+                winapi::um::libloaderapi::GetModuleHandleA(b"kernel32.dll\0".as_ptr() as *const i8);
             if !kernel32.is_null() {
-                let get_mode: GetConsoleModeFn = std::mem::transmute(
-                    winapi::um::libloaderapi::GetProcAddress(kernel32, b"GetConsoleMode\0".as_ptr() as *const i8)
-                );
-                let set_mode: SetConsoleModeFn = std::mem::transmute(
-                    winapi::um::libloaderapi::GetProcAddress(kernel32, b"SetConsoleMode\0".as_ptr() as *const i8)
-                );
-                
+                let get_mode: GetConsoleModeFn =
+                    std::mem::transmute(winapi::um::libloaderapi::GetProcAddress(
+                        kernel32,
+                        b"GetConsoleMode\0".as_ptr() as *const i8,
+                    ));
+                let set_mode: SetConsoleModeFn =
+                    std::mem::transmute(winapi::um::libloaderapi::GetProcAddress(
+                        kernel32,
+                        b"SetConsoleMode\0".as_ptr() as *const i8,
+                    ));
+
                 if get_mode(handle as *mut _, &mut mode) != 0 {
                     let _ = set_mode(handle as *mut _, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
                     tracing::info!("Enabled Windows virtual terminal processing");
