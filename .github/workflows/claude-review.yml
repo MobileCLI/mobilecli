@@ -11,10 +11,9 @@ on:
 jobs:
   claude-review:
     if: |
-      secrets.ANTHROPIC_API_KEY != '' &&
-      ((github.event_name == 'pull_request') ||
+      (github.event_name == 'pull_request') ||
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')))
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
