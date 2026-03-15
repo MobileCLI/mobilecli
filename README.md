@@ -11,9 +11,10 @@ Approve tool calls from the couch. Browse and edit files on your dev machine fro
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?color=0A84FF)](LICENSE)
 [![Rust](https://img.shields.io/badge/daemon-Rust-orange.svg)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)]()
-[![iOS](https://img.shields.io/badge/iOS-App_Store-0A84FF.svg)](https://testflight.apple.com/join/MobileCLI)
+[![iOS](https://img.shields.io/badge/iOS-App_Store-0A84FF.svg)](https://apps.apple.com/us/app/mobilecli/id6757689455)
+[![Twitter](https://img.shields.io/twitter/follow/mobilecli?style=flat&color=0A84FF)](https://x.com/mobilecli)
 
-[Website](https://mobilecli.app) · [Download CLI](https://github.com/MobileCLI/mobilecli/releases) · [iOS App](https://testflight.apple.com/join/MobileCLI)
+[Website](https://mobilecli.app) · [Download CLI](https://github.com/MobileCLI/mobilecli/releases) · [iOS App](https://apps.apple.com/us/app/mobilecli/id6757689455)
 
 </div>
 
@@ -33,6 +34,8 @@ Approve tool calls from the couch. Browse and edit files on your dev machine fro
 </tr>
 </table>
 </div>
+
+> 📺 **[Watch the 60-second demo →](https://mobilecli.app)** — See MobileCLI stream a Claude Code session to an iPhone in real time.
 
 <br/>
 
@@ -284,7 +287,7 @@ MOBILECLI_NO_AUTO_LAUNCH=1 bash
 
 | Platform | Status |
 |----------|--------|
-| **iOS** (iPhone + iPad) | Available on TestFlight — [Join Beta](https://testflight.apple.com/join/MobileCLI) |
+| **iOS** (iPhone + iPad) | Available on the App Store — [Download MobileCLI](https://apps.apple.com/us/app/mobilecli/id6757689455) |
 | **Android** | In development |
 
 <br/>
@@ -463,6 +466,6 @@ MIT — see [LICENSE](LICENSE) for details.
 
 **Stop babysitting your AI assistant.** Start it, walk away, and get a push when it needs you.
 
-[Get the CLI](https://mobilecli.app) · [Join the iOS Beta](https://testflight.apple.com/join/MobileCLI) · [GitHub](https://github.com/MobileCLI/mobilecli)
+[Get the CLI](https://mobilecli.app) · [Download on the App Store](https://apps.apple.com/us/app/mobilecli/id6757689455) · [GitHub](https://github.com/MobileCLI/mobilecli)
 
 </div>
