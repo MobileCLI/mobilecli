@@ -1,0 +1,59 @@
+{
+  "posts": [
+    {
+      "hash": "52f7970e6d9a",
+      "title": "Why AI Coding Agents Need Mobile Monitoring in 2026",
+      "url": "https://mobilecli.app/blog/ai-coding-agents-mobile-monitoring-2026/",
+      "posted_at": "2026-03-15T03:19:28.694971+00:00",
+      "results": {
+        "bluesky": "failed",
+        "twitter": "failed",
+        "reddit": "success"
+      }
+    },
+    {
+      "hash": "39efb81d7711",
+      "title": "Aider on Your Phone: How to Monitor AI Pair Programming Sessions Remotely",
+      "url": "https://mobilecli.app/blog/aider-mobile-monitoring/",
+      "posted_at": "2026-03-15T03:19:28.695997+00:00",
+      "results": {
+        "bluesky": "failed",
+        "twitter": "failed",
+        "reddit": "success"
+      }
+    },
+    {
+      "hash": "c7d91eea9af2",
+      "title": "The Complete Guide to Using Claude Code on Your Phone in 2026",
+      "url": "https://mobilecli.app/blog/claude-code-phone-guide/",
+      "posted_at": "2026-03-15T03:19:28.700238+00:00",
+      "results": {
+        "bluesky": "failed",
+        "twitter": "failed",
+        "reddit": "success"
+      }
+    },
+    {
+      "hash": "02a6349b564a",
+      "title": "Stop Babysitting Claude Code: Approve Tool Calls From Your Phone",
+      "url": "https://mobilecli.app/blog/stop-babysitting-claude-code/",
+      "posted_at": "2026-03-15T03:19:28.701384+00:00",
+      "results": {
+        "bluesky": "failed",
+        "twitter": "failed",
+        "reddit": "success"
+      }
+    },
+    {
+      "hash": "f621dd4fd569",
+      "title": "What is MobileCLI? A Terminal Mirror for the AI Coding Age",
+      "url": "https://mobilecli.app/blog/what-is-mobilecli/",
+      "posted_at": "2026-03-15T03:19:28.701993+00:00",
+      "results": {
+        "bluesky": "failed",
+        "twitter": "failed",
+        "reddit": "success"
+      }
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+# MobileCLI Demo Flow
+# Customize this to match your app's UI
+appId: com.mobilecli.app
+---
+# Launch the app
+- launchApp
+
+# Wait for app to load
+- waitForAnimationToEnd
+
+# Tap on a session (customize selector)
+- tapOn: "Claude Code"
+
+# Wait for terminal to render
+- waitForAnimationToEnd
+- scroll:
+    direction: DOWN
+
+# Show the approval flow
+- waitForAnimationToEnd
+
+# Navigate to file browser
+- tapOn: "Files"
+- waitForAnimationToEnd
+
+# Go back to sessions
+- tapOn: "Sessions"
+- waitForAnimationToEnd
