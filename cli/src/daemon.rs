@@ -1552,6 +1552,27 @@ fn detect_terminal_emulator() -> Result<TerminalInfo, Box<dyn std::error::Error 
         }
     }
 
+    // On Linux/Unix, verify a display server is available before using GUI terminal emulators.
+    // Without DISPLAY or WAYLAND_DISPLAY, GUI terminals silently fail (e.g., when running
+    // as a systemd service), causing sessions to never appear on mobile.
+    #[cfg(not(target_os = "windows"))]
+    {
+        let has_display = std::env::var("DISPLAY")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+            || std::env::var("WAYLAND_DISPLAY")
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
+
+        if !has_display {
+            tracing::info!(
+                "No display server detected (DISPLAY/WAYLAND_DISPLAY not set), \
+                falling back to headless mode"
+            );
+            return Err("No display server available".into());
+        }
+    }
+
     // Check which terminals are available
     for (name, binary) in &terminals {
         if which::which(binary).is_ok() {
