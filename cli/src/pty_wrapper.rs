@@ -323,6 +323,7 @@ fn setup_tmux_session(
     cwd: &str,
     terminal_size: (u16, u16),
     tmux_mouse_mode: TmuxMouseMode,
+    headless: bool,
 ) -> Result<(), WrapError> {
     let (cols, rows) = terminal_size;
 
@@ -370,17 +371,25 @@ fn setup_tmux_session(
     // NOTE: window-size must remain dynamic so wrapper PTY resizes propagate
     // into tmux panes when mobile dimensions change.
     let window_target = format!("{}:0", session_name);
-    // Disable smcup/rmcup so tmux itself does NOT enter Konsole's alternate
-    // screen on attach. Without this, Konsole has zero scrollback while tmux
-    // is attached (alt-screen has no history buffer). With it disabled, tmux
-    // renders in Konsole's main buffer and the scrollbar works.
-    let mut disable_altscreen_client = tmux_base_command(socket_name);
-    disable_altscreen_client
-        .arg("set-option")
-        .arg("-g")
-        .arg("terminal-overrides")
-        .arg("xterm*:smcup@:rmcup@");
-    let _ = run_tmux_checked(&mut disable_altscreen_client, "terminal-overrides");
+    // Only disable alternate-screen in headless mode (phone-only sessions).
+    // In headless mode, there is no desktop terminal, so we disable smcup/rmcup
+    // to keep all output in the main buffer where capture-pane can reach it.
+    //
+    // In attach mode (desktop terminal present), we MUST keep alternate-screen
+    // enabled. Disabling it causes TUI apps (Claude Code tool approval, vim,
+    // less, etc.) to dump raw escape sequences into the main scroll buffer,
+    // garbling the output when the user scrolls on their desktop terminal.
+    // The mobile app can still capture scrollback via capture-pane on the main
+    // buffer — it just won't see TUI alt-screen content, which is acceptable.
+    if headless {
+        let mut disable_altscreen_client = tmux_base_command(socket_name);
+        disable_altscreen_client
+            .arg("set-option")
+            .arg("-g")
+            .arg("terminal-overrides")
+            .arg("xterm*:smcup@:rmcup@");
+        let _ = run_tmux_checked(&mut disable_altscreen_client, "terminal-overrides");
+    }
 
     // Mouse mode is configurable. Linux defaults to off so desktop emulators
     // (e.g. Konsole) preserve normal drag-select clipboard behavior.
@@ -394,17 +403,21 @@ fn setup_tmux_session(
 
     // history-limit is set globally before new-session so the window is
     // allocated with the full 200K-line buffer from the start.
-    let option_sets: [(&str, &str, &str, &str); 4] = [
+    let mut option_sets: Vec<(&str, &str, &str, &str)> = vec![
         ("set-option", session_name, "status", "off"),
         ("set-option", session_name, "allow-rename", "off"),
-        (
+        ("set-window-option", &window_target, "window-size", "latest"),
+    ];
+    // Only disable alternate-screen at the window level in headless mode.
+    // See the comment above for the full rationale.
+    if headless {
+        option_sets.push((
             "set-window-option",
             &window_target,
             "alternate-screen",
             "off",
-        ),
-        ("set-window-option", &window_target, "window-size", "latest"),
-    ];
+        ));
+    }
     for (command, target, key, value) in option_sets {
         let mut option_cmd = tmux_base_command(socket_name);
         option_cmd
@@ -624,6 +637,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
             socket_name: format!("mcli-{}", token),
             session_name: format!("mcli-{}", token),
         };
+        // attach mode: desktop terminal is present, keep alt-screen enabled
         setup_tmux_session(
             &ctx.socket_name,
             &ctx.session_name,
@@ -632,6 +646,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
             &cwd,
             (cols, rows),
             tmux_mouse_mode,
+            false, // headless=false: preserve alt-screen for desktop terminal
         )?;
         tmux_context = Some(ctx);
     }
@@ -1229,6 +1244,7 @@ mod tests {
             ".",
             (80, 24),
             TmuxMouseMode::default_for_platform(),
+            true, // headless: tests run without a desktop terminal
         )
         .expect("setup tmux session");
 
@@ -1339,6 +1355,7 @@ mod tests {
             ".",
             (80, 24),
             TmuxMouseMode::On,
+            true, // headless: tests run without a desktop terminal
         )
         .expect("setup tmux session with mouse override");
 
