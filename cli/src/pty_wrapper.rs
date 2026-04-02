@@ -845,8 +845,51 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
     let mut last_applied_pty_size: Option<(u16, u16)> = Some((cols, rows));
     let mut exit_code: i32 = 0;
 
+    // Listen for SIGWINCH (terminal resize) on Unix so we can forward new
+    // dimensions to the child PTY. Without this, resizing the desktop terminal
+    // window leaves the child PTY at stale dimensions, causing garbled output.
+    #[cfg(unix)]
+    let mut sigwinch = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::window_change(),
+    ).expect("failed to register SIGWINCH handler");
+
     loop {
+        // Helper future that resolves on SIGWINCH (unix) or never (other platforms).
+        let sigwinch_fut = async {
+            #[cfg(unix)]
+            { sigwinch.recv().await; }
+            #[cfg(not(unix))]
+            { std::future::pending::<()>().await; }
+        };
+
         tokio::select! {
+            // Desktop terminal resize (SIGWINCH)
+            _ = sigwinch_fut => {
+                let (new_cols, new_rows) = get_terminal_size();
+                if last_applied_pty_size != Some((new_cols, new_rows)) && new_cols > 0 && new_rows > 0 {
+                    tracing::debug!(
+                        cols = new_cols,
+                        rows = new_rows,
+                        "Desktop terminal resized (SIGWINCH), updating child PTY"
+                    );
+                    let resized = master.resize(PtySize {
+                        rows: new_rows,
+                        cols: new_cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    });
+                    if resized.is_ok() {
+                        last_applied_pty_size = Some((new_cols, new_rows));
+                    }
+                    // Notify daemon of new dimensions so mobile viewers know the PTY size.
+                    let resized_msg = serde_json::json!({
+                        "type": "pty_resized",
+                        "cols": new_cols,
+                        "rows": new_rows,
+                    });
+                    let _ = ws_tx.send(Message::Text(resized_msg.to_string())).await;
+                }
+            }
             // PTY output
             Some(data) = output_rx.recv() => {
                 // Always write to local terminal output.
