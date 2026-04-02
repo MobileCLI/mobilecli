@@ -561,6 +561,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
         "command": config.command,
         "project_path": cwd,
         "runtime": runtime_mode.as_str(),
+        "desktop": true,
     });
     tracing::info!("Sending registration message: {}", register_msg);
 

@@ -272,6 +272,10 @@ pub struct PtySession {
     /// Tail for raw mobile input filtering to handle escape sequences split
     /// across websocket messages.
     pub raw_input_tail: Vec<u8>,
+    /// Whether a desktop PTY wrapper is attached to this session. When true,
+    /// the desktop terminal controls the PTY dimensions and mobile resize
+    /// requests are suppressed to prevent dimension fights between viewers.
+    pub has_desktop_wrapper: bool,
 }
 
 /// Daemon shared state
@@ -752,6 +756,7 @@ async fn handle_pty_session(
     let command = reg_msg["command"].as_str().unwrap_or("shell").to_string();
     let project_path = reg_msg["project_path"].as_str().unwrap_or("").to_string();
     let runtime = reg_msg["runtime"].as_str().unwrap_or("pty").to_lowercase();
+    let has_desktop = reg_msg["desktop"].as_bool().unwrap_or(false);
     let (tmux_socket, tmux_session) = if runtime == "tmux" {
         let token = sanitize_tmux_token(&session_id);
         let name = format!("mcli-{}", token);
@@ -800,6 +805,7 @@ async fn handle_pty_session(
                 last_applied_size: None,
                 live_seq: 0,
                 raw_input_tail: Vec::new(),
+                has_desktop_wrapper: has_desktop,
             },
         );
         st.pty_broadcast.clone()
@@ -2211,6 +2217,30 @@ async fn process_client_msg(
             }
 
             if let Some(session) = st.sessions.get_mut(&session_id) {
+                // When a desktop terminal wrapper is attached, it controls
+                // the PTY dimensions. Suppress mobile resize requests to
+                // prevent the phone's small viewport (e.g. 42x18) from
+                // reflowing the desktop's layout (e.g. 120x40). The phone
+                // app should adapt its xterm.js viewport to the desktop
+                // dimensions rather than forcing the PTY to match its screen.
+                if session.has_desktop_wrapper {
+                    tracing::debug!(
+                        target: "overhaul.resize",
+                        session_id = %session_id,
+                        cols,
+                        rows,
+                        epoch = ?epoch,
+                        reason = reason.as_str(),
+                        decision = "ignored_desktop_wrapper",
+                        "Ignoring mobile PTY resize — desktop wrapper controls dimensions"
+                    );
+                    // Send synthetic ack with current dimensions so the mobile
+                    // app knows the actual PTY size it should render.
+                    let ack_dims = session.last_applied_size.unwrap_or((cols, rows));
+                    drop(st);
+                    broadcast_pty_resized(state, &session_id, ack_dims.0, ack_dims.1, epoch).await;
+                    return Ok(());
+                }
                 if is_stale_resize_epoch(session.last_resize_epoch, epoch) {
                     tracing::debug!(
                         target: "overhaul.resize",
