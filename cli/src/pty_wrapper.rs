@@ -1075,6 +1075,18 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
         cleanup_tmux_session(ctx);
     }
 
+    // Reset terminal state after tmux teardown. Tmux with mouse mode enabled
+    // activates mouse tracking escape sequences (\e[?1000h, \e[?1003h, etc.)
+    // on the host terminal. When the tmux server is killed, these tracking
+    // modes may remain active, causing raw mouse coordinates to leak into the
+    // shell prompt as garbled text. Explicitly disable all mouse tracking
+    // modes and reset the terminal to a clean state.
+    print!("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l");
+    // Also send a full terminal reset (RIS) to clear any other stale state
+    // left by TUI applications that may not have exited cleanly.
+    print!("\x1bc");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
     // Print exit message
     println!();
     if exit_code == 0 {
