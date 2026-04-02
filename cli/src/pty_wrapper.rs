@@ -74,14 +74,14 @@ impl TmuxMouseMode {
     }
 
     fn default_for_platform() -> Self {
-        #[cfg(target_os = "linux")]
-        {
-            Self::Off
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            Self::On
-        }
+        // Default to mouse OFF on all platforms. When mouse mode is enabled,
+        // tmux captures scroll wheel events and generates SGR mouse tracking
+        // escape sequences (\e[<64;x;yM). If the child application (e.g.
+        // Codex session picker) doesn't consume these, they flood the terminal
+        // as garbled text. Disabling mouse mode lets the desktop terminal
+        // handle scrolling natively. Users who want tmux mouse mode can set
+        // MOBILECLI_TMUX_MOUSE=on.
+        Self::Off
     }
 }
 
@@ -278,7 +278,19 @@ fn parse_bool_env_flag(raw: &str) -> Option<bool> {
 
 fn resolve_raw_mode() -> bool {
     let Ok(raw) = std::env::var("MOBILECLI_RAW_MODE") else {
-        return false;
+        // Default to raw mode when stdin is a TTY. AI CLI tools (Claude Code,
+        // Codex, Gemini CLI) are TUI applications that require character-by-
+        // character input for arrow keys, escape sequences, and interactive
+        // prompts. Line-buffered mode breaks all of these. Users who need
+        // text selection can use tmux copy-mode or set MOBILECLI_RAW_MODE=0.
+        #[cfg(unix)]
+        {
+            return std::io::IsTerminal::is_terminal(&std::io::stdin());
+        }
+        #[cfg(not(unix))]
+        {
+            return false;
+        }
     };
 
     if raw.trim().is_empty() {
@@ -1212,11 +1224,9 @@ mod tests {
 
     #[test]
     fn tmux_mouse_mode_default_matches_platform_policy() {
-        #[cfg(target_os = "linux")]
+        // Mouse mode defaults to Off on all platforms to prevent SGR mouse
+        // tracking sequences from flooding the terminal in desktop attach mode.
         assert_eq!(TmuxMouseMode::default_for_platform(), TmuxMouseMode::Off);
-
-        #[cfg(not(target_os = "linux"))]
-        assert_eq!(TmuxMouseMode::default_for_platform(), TmuxMouseMode::On);
     }
 
     #[test]
