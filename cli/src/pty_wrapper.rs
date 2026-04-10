@@ -74,14 +74,14 @@ impl TmuxMouseMode {
     }
 
     fn default_for_platform() -> Self {
-        #[cfg(target_os = "linux")]
-        {
-            Self::Off
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            Self::On
-        }
+        // Default to mouse OFF on all platforms. When mouse mode is enabled,
+        // tmux captures scroll wheel events and generates SGR mouse tracking
+        // escape sequences (\e[<64;x;yM). If the child application (e.g.
+        // Codex session picker) doesn't consume these, they flood the terminal
+        // as garbled text. Disabling mouse mode lets the desktop terminal
+        // handle scrolling natively. Users who want tmux mouse mode can set
+        // MOBILECLI_TMUX_MOUSE=on.
+        Self::Off
     }
 }
 
@@ -278,7 +278,19 @@ fn parse_bool_env_flag(raw: &str) -> Option<bool> {
 
 fn resolve_raw_mode() -> bool {
     let Ok(raw) = std::env::var("MOBILECLI_RAW_MODE") else {
-        return false;
+        // Default to raw mode when stdin is a TTY. AI CLI tools (Claude Code,
+        // Codex, Gemini CLI) are TUI applications that require character-by-
+        // character input for arrow keys, escape sequences, and interactive
+        // prompts. Line-buffered mode breaks all of these. Users who need
+        // text selection can use tmux copy-mode or set MOBILECLI_RAW_MODE=0.
+        #[cfg(unix)]
+        {
+            return std::io::IsTerminal::is_terminal(&std::io::stdin());
+        }
+        #[cfg(not(unix))]
+        {
+            return false;
+        }
     };
 
     if raw.trim().is_empty() {
@@ -323,6 +335,7 @@ fn setup_tmux_session(
     cwd: &str,
     terminal_size: (u16, u16),
     tmux_mouse_mode: TmuxMouseMode,
+    headless: bool,
 ) -> Result<(), WrapError> {
     let (cols, rows) = terminal_size;
 
@@ -370,17 +383,25 @@ fn setup_tmux_session(
     // NOTE: window-size must remain dynamic so wrapper PTY resizes propagate
     // into tmux panes when mobile dimensions change.
     let window_target = format!("{}:0", session_name);
-    // Disable smcup/rmcup so tmux itself does NOT enter Konsole's alternate
-    // screen on attach. Without this, Konsole has zero scrollback while tmux
-    // is attached (alt-screen has no history buffer). With it disabled, tmux
-    // renders in Konsole's main buffer and the scrollbar works.
-    let mut disable_altscreen_client = tmux_base_command(socket_name);
-    disable_altscreen_client
-        .arg("set-option")
-        .arg("-g")
-        .arg("terminal-overrides")
-        .arg("xterm*:smcup@:rmcup@");
-    let _ = run_tmux_checked(&mut disable_altscreen_client, "terminal-overrides");
+    // Only disable alternate-screen in headless mode (phone-only sessions).
+    // In headless mode, there is no desktop terminal, so we disable smcup/rmcup
+    // to keep all output in the main buffer where capture-pane can reach it.
+    //
+    // In attach mode (desktop terminal present), we MUST keep alternate-screen
+    // enabled. Disabling it causes TUI apps (Claude Code tool approval, vim,
+    // less, etc.) to dump raw escape sequences into the main scroll buffer,
+    // garbling the output when the user scrolls on their desktop terminal.
+    // The mobile app can still capture scrollback via capture-pane on the main
+    // buffer — it just won't see TUI alt-screen content, which is acceptable.
+    if headless {
+        let mut disable_altscreen_client = tmux_base_command(socket_name);
+        disable_altscreen_client
+            .arg("set-option")
+            .arg("-g")
+            .arg("terminal-overrides")
+            .arg("xterm*:smcup@:rmcup@");
+        let _ = run_tmux_checked(&mut disable_altscreen_client, "terminal-overrides");
+    }
 
     // Mouse mode is configurable. Linux defaults to off so desktop emulators
     // (e.g. Konsole) preserve normal drag-select clipboard behavior.
@@ -394,17 +415,21 @@ fn setup_tmux_session(
 
     // history-limit is set globally before new-session so the window is
     // allocated with the full 200K-line buffer from the start.
-    let option_sets: [(&str, &str, &str, &str); 4] = [
+    let mut option_sets: Vec<(&str, &str, &str, &str)> = vec![
         ("set-option", session_name, "status", "off"),
         ("set-option", session_name, "allow-rename", "off"),
-        (
+        ("set-window-option", &window_target, "window-size", "latest"),
+    ];
+    // Only disable alternate-screen at the window level in headless mode.
+    // See the comment above for the full rationale.
+    if headless {
+        option_sets.push((
             "set-window-option",
             &window_target,
             "alternate-screen",
             "off",
-        ),
-        ("set-window-option", &window_target, "window-size", "latest"),
-    ];
+        ));
+    }
     for (command, target, key, value) in option_sets {
         let mut option_cmd = tmux_base_command(socket_name);
         option_cmd
@@ -536,6 +561,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
         "command": config.command,
         "project_path": cwd,
         "runtime": runtime_mode.as_str(),
+        "desktop": true,
     });
     tracing::info!("Sending registration message: {}", register_msg);
 
@@ -624,6 +650,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
             socket_name: format!("mcli-{}", token),
             session_name: format!("mcli-{}", token),
         };
+        // attach mode: desktop terminal is present, keep alt-screen enabled
         setup_tmux_session(
             &ctx.socket_name,
             &ctx.session_name,
@@ -632,6 +659,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
             &cwd,
             (cols, rows),
             tmux_mouse_mode,
+            false, // headless=false: preserve alt-screen for desktop terminal
         )?;
         tmux_context = Some(ctx);
     }
@@ -817,8 +845,51 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
     let mut last_applied_pty_size: Option<(u16, u16)> = Some((cols, rows));
     let mut exit_code: i32 = 0;
 
+    // Listen for SIGWINCH (terminal resize) on Unix so we can forward new
+    // dimensions to the child PTY. Without this, resizing the desktop terminal
+    // window leaves the child PTY at stale dimensions, causing garbled output.
+    #[cfg(unix)]
+    let mut sigwinch = tokio::signal::unix::signal(
+        tokio::signal::unix::SignalKind::window_change(),
+    ).expect("failed to register SIGWINCH handler");
+
     loop {
+        // Helper future that resolves on SIGWINCH (unix) or never (other platforms).
+        let sigwinch_fut = async {
+            #[cfg(unix)]
+            { sigwinch.recv().await; }
+            #[cfg(not(unix))]
+            { std::future::pending::<()>().await; }
+        };
+
         tokio::select! {
+            // Desktop terminal resize (SIGWINCH)
+            _ = sigwinch_fut => {
+                let (new_cols, new_rows) = get_terminal_size();
+                if last_applied_pty_size != Some((new_cols, new_rows)) && new_cols > 0 && new_rows > 0 {
+                    tracing::debug!(
+                        cols = new_cols,
+                        rows = new_rows,
+                        "Desktop terminal resized (SIGWINCH), updating child PTY"
+                    );
+                    let resized = master.resize(PtySize {
+                        rows: new_rows,
+                        cols: new_cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    });
+                    if resized.is_ok() {
+                        last_applied_pty_size = Some((new_cols, new_rows));
+                    }
+                    // Notify daemon of new dimensions so mobile viewers know the PTY size.
+                    let resized_msg = serde_json::json!({
+                        "type": "pty_resized",
+                        "cols": new_cols,
+                        "rows": new_rows,
+                    });
+                    let _ = ws_tx.send(Message::Text(resized_msg.to_string())).await;
+                }
+            }
             // PTY output
             Some(data) = output_rx.recv() => {
                 // Always write to local terminal output.
@@ -1060,6 +1131,18 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
         cleanup_tmux_session(ctx);
     }
 
+    // Reset terminal state after tmux teardown. Tmux with mouse mode enabled
+    // activates mouse tracking escape sequences (\e[?1000h, \e[?1003h, etc.)
+    // on the host terminal. When the tmux server is killed, these tracking
+    // modes may remain active, causing raw mouse coordinates to leak into the
+    // shell prompt as garbled text. Explicitly disable all mouse tracking
+    // modes and reset the terminal to a clean state.
+    print!("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l");
+    // Also send a full terminal reset (RIS) to clear any other stale state
+    // left by TUI applications that may not have exited cleanly.
+    print!("\x1bc");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+
     // Print exit message
     println!();
     if exit_code == 0 {
@@ -1185,11 +1268,9 @@ mod tests {
 
     #[test]
     fn tmux_mouse_mode_default_matches_platform_policy() {
-        #[cfg(target_os = "linux")]
+        // Mouse mode defaults to Off on all platforms to prevent SGR mouse
+        // tracking sequences from flooding the terminal in desktop attach mode.
         assert_eq!(TmuxMouseMode::default_for_platform(), TmuxMouseMode::Off);
-
-        #[cfg(not(target_os = "linux"))]
-        assert_eq!(TmuxMouseMode::default_for_platform(), TmuxMouseMode::On);
     }
 
     #[test]
@@ -1229,6 +1310,7 @@ mod tests {
             ".",
             (80, 24),
             TmuxMouseMode::default_for_platform(),
+            true, // headless: tests run without a desktop terminal
         )
         .expect("setup tmux session");
 
@@ -1339,6 +1421,7 @@ mod tests {
             ".",
             (80, 24),
             TmuxMouseMode::On,
+            true, // headless: tests run without a desktop terminal
         )
         .expect("setup tmux session with mouse override");
 

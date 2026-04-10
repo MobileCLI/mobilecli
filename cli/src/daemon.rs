@@ -272,6 +272,10 @@ pub struct PtySession {
     /// Tail for raw mobile input filtering to handle escape sequences split
     /// across websocket messages.
     pub raw_input_tail: Vec<u8>,
+    /// Whether a desktop PTY wrapper is attached to this session. When true,
+    /// the desktop terminal controls the PTY dimensions and mobile resize
+    /// requests are suppressed to prevent dimension fights between viewers.
+    pub has_desktop_wrapper: bool,
 }
 
 /// Daemon shared state
@@ -293,6 +297,9 @@ pub struct DaemonState {
     /// Current mobile controller socket for tmux shared viewport per session.
     pub tmux_viewport_controllers: HashMap<String, SocketAddr>,
     pub session_view_counts: HashMap<String, usize>,
+    /// Per-session scroll offset (bytes from end of scrollback buffer) for PTY
+    /// runtime viewport scrolling. Offset 0 = following live output.
+    pub pty_scroll_offsets: HashMap<String, usize>,
     pub file_system: std::sync::Arc<FileSystemService>,
     pub file_watch_subscriptions: HashMap<SocketAddr, std::collections::HashSet<String>>,
     pub file_watch_counts: HashMap<String, usize>,
@@ -335,6 +342,7 @@ impl DaemonState {
             mobile_views: HashMap::new(),
             tmux_viewport_controllers: HashMap::new(),
             session_view_counts: HashMap::new(),
+            pty_scroll_offsets: HashMap::new(),
             file_system,
             file_watch_subscriptions: HashMap::new(),
             file_watch_counts: HashMap::new(),
@@ -752,6 +760,7 @@ async fn handle_pty_session(
     let command = reg_msg["command"].as_str().unwrap_or("shell").to_string();
     let project_path = reg_msg["project_path"].as_str().unwrap_or("").to_string();
     let runtime = reg_msg["runtime"].as_str().unwrap_or("pty").to_lowercase();
+    let has_desktop = reg_msg["desktop"].as_bool().unwrap_or(false);
     let (tmux_socket, tmux_session) = if runtime == "tmux" {
         let token = sanitize_tmux_token(&session_id);
         let name = format!("mcli-{}", token);
@@ -800,6 +809,7 @@ async fn handle_pty_session(
                 last_applied_size: None,
                 live_seq: 0,
                 raw_input_tail: Vec::new(),
+                has_desktop_wrapper: has_desktop,
             },
         );
         st.pty_broadcast.clone()
@@ -2211,6 +2221,30 @@ async fn process_client_msg(
             }
 
             if let Some(session) = st.sessions.get_mut(&session_id) {
+                // When a desktop terminal wrapper is attached, it controls
+                // the PTY dimensions. Suppress mobile resize requests to
+                // prevent the phone's small viewport (e.g. 42x18) from
+                // reflowing the desktop's layout (e.g. 120x40). The phone
+                // app should adapt its xterm.js viewport to the desktop
+                // dimensions rather than forcing the PTY to match its screen.
+                if session.has_desktop_wrapper {
+                    tracing::debug!(
+                        target: "overhaul.resize",
+                        session_id = %session_id,
+                        cols,
+                        rows,
+                        epoch = ?epoch,
+                        reason = reason.as_str(),
+                        decision = "ignored_desktop_wrapper",
+                        "Ignoring mobile PTY resize — desktop wrapper controls dimensions"
+                    );
+                    // Send synthetic ack with current dimensions so the mobile
+                    // app knows the actual PTY size it should render.
+                    let ack_dims = session.last_applied_size.unwrap_or((cols, rows));
+                    drop(st);
+                    broadcast_pty_resized(state, &session_id, ack_dims.0, ack_dims.1, epoch).await;
+                    return Ok(());
+                }
                 if is_stale_resize_epoch(session.last_resize_epoch, epoch) {
                     tracing::debug!(
                         target: "overhaul.resize",
@@ -2322,10 +2356,10 @@ async fn process_client_msg(
                             let tmux_socket = session.tmux_socket.clone();
                             let tmux_session = session.tmux_session.clone();
 
-                            if runtime != "tmux" {
+                            if runtime != "tmux" && runtime != "pty" {
                                 Err((
                                     "unsupported_runtime",
-                                    "tmux viewport controls require a tmux runtime session"
+                                    "viewport controls require a tmux or pty runtime session"
                                         .to_string(),
                                 ))
                             } else if !sender_is_viewing {
@@ -2368,55 +2402,127 @@ async fn process_client_msg(
                 }
             };
 
-            let Some(socket) = tmux_socket else {
-                let msg = ServerMessage::Error {
-                    code: "tmux_missing_metadata".to_string(),
-                    message: "tmux socket metadata missing for session".to_string(),
-                };
-                tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
-                return Ok(());
-            };
-            let Some(name) = tmux_session else {
-                let msg = ServerMessage::Error {
-                    code: "tmux_missing_metadata".to_string(),
-                    message: "tmux session metadata missing for session".to_string(),
-                };
-                tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
-                return Ok(());
-            };
-
-            let clamped_count = count
-                .unwrap_or(TMUX_VIEWPORT_DEFAULT_COUNT)
-                .clamp(1, TMUX_VIEWPORT_MAX_COUNT);
-            let action_result = apply_tmux_viewport_action_with_retry(
-                socket.clone(),
-                name.clone(),
-                action,
-                clamped_count,
-            )
-            .await;
-            let viewport_state = query_tmux_viewport_state(socket.clone(), name.clone())
-                .await
-                .unwrap_or_default();
-
-            // After scroll action, capture the visible viewport and send as PtyBytes
-            // so mobile terminal shows the scrolled content formatted for its dimensions.
-            // Only capture if we're still not following live (user is scrolled up).
-            if action_result.is_ok() && !viewport_state.following_live {
-                // Small delay to let tmux settle into its new scroll position
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-
-                // Re-check state after delay to avoid race conditions
+            // Branch: tmux runtime uses tmux copy-mode, PTY runtime uses scrollback buffer.
+            if let (Some(socket), Some(name)) = (tmux_socket, tmux_session) {
+                // ── tmux runtime: delegate scroll to tmux copy-mode ──
+                let clamped_count = count
+                    .unwrap_or(TMUX_VIEWPORT_DEFAULT_COUNT)
+                    .clamp(1, TMUX_VIEWPORT_MAX_COUNT);
+                let action_result = apply_tmux_viewport_action_with_retry(
+                    socket.clone(),
+                    name.clone(),
+                    action,
+                    clamped_count,
+                )
+                .await;
                 let viewport_state = query_tmux_viewport_state(socket.clone(), name.clone())
                     .await
                     .unwrap_or_default();
 
-                if !viewport_state.following_live {
-                    if let Some(frame_bytes) = capture_tmux_viewport_simple(socket, name).await {
-                        // Prepend clear + home escape sequences so mobile redraws fresh
-                        let mut payload = Vec::with_capacity(frame_bytes.len() + 16);
-                        payload.extend_from_slice(b"\x1b[2J\x1b[H"); // clear + home
-                        payload.extend_from_slice(&frame_bytes);
+                if action_result.is_ok() && !viewport_state.following_live {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                    let viewport_state = query_tmux_viewport_state(socket.clone(), name.clone())
+                        .await
+                        .unwrap_or_default();
+
+                    if !viewport_state.following_live {
+                        if let Some(frame_bytes) = capture_tmux_viewport_simple(socket, name).await {
+                            let mut payload = Vec::with_capacity(frame_bytes.len() + 16);
+                            payload.extend_from_slice(b"\x1b[2J\x1b[H");
+                            payload.extend_from_slice(&frame_bytes);
+
+                            let pty_msg = ServerMessage::PtyBytes {
+                                session_id: session_id.clone(),
+                                data: BASE64.encode(&payload),
+                            };
+                            if let Ok(json) = serde_json::to_string(&pty_msg) {
+                                let _ = tx.send(Message::Text(json)).await;
+                            }
+                        }
+                    }
+                }
+
+                let state_msg = ServerMessage::TmuxViewportState {
+                    session_id: session_id.clone(),
+                    in_copy_mode: viewport_state.in_copy_mode,
+                    scroll_position: viewport_state.scroll_position,
+                    history_size: viewport_state.history_size,
+                    following_live: viewport_state.following_live,
+                };
+                tx.send(Message::Text(serde_json::to_string(&state_msg)?))
+                    .await?;
+
+                if let Err(error) = action_result {
+                    let msg = ServerMessage::Error {
+                        code: "tmux_viewport_action_failed".to_string(),
+                        message: error,
+                    };
+                    tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                }
+            } else {
+                // ── PTY runtime: serve scroll from the in-memory scrollback buffer ──
+                // The scrollback buffer is a VecDeque<u8> of raw terminal output.
+                // We track a per-client scroll offset (in bytes from the end) and
+                // extract a viewport-sized chunk on each scroll action.
+                //
+                // Each "page" is approximately (cols * rows) bytes of visible content.
+                // We use a conservative estimate since ANSI escapes inflate byte count.
+                let page_bytes: usize = 120 * 40 * 3; // ~14KB per page (3x for ANSI overhead)
+                let scroll_step = match action {
+                    TmuxViewportAction::PageUp | TmuxViewportAction::PageDown => page_bytes,
+                    _ => page_bytes / 4, // scroll_up/scroll_down = quarter page
+                };
+                let clamped_count = count.unwrap_or(1).clamp(1, 20) as usize;
+                let scroll_amount = scroll_step * clamped_count;
+
+                // Update scroll offset and extract viewport chunk in one write lock.
+                let mut st = state.write().await;
+                let buf_len = st.sessions.get(&session_id)
+                    .map(|s| s.scrollback.len()).unwrap_or(0);
+
+                if buf_len > 0 {
+                    let max_offset = buf_len.saturating_sub(page_bytes);
+
+                    // Update scroll offset based on action.
+                    let current_offset = {
+                        let offset = st.pty_scroll_offsets
+                            .entry(session_id.clone())
+                            .or_insert(0usize);
+                        match action {
+                            TmuxViewportAction::ScrollUp | TmuxViewportAction::PageUp => {
+                                *offset = (*offset + scroll_amount).min(max_offset);
+                            }
+                            TmuxViewportAction::ScrollDown | TmuxViewportAction::PageDown => {
+                                *offset = offset.saturating_sub(scroll_amount);
+                            }
+                            TmuxViewportAction::Follow => {
+                                *offset = 0;
+                            }
+                        }
+                        *offset
+                    };
+
+                    let following_live = current_offset == 0;
+
+                    // Extract viewport chunk from scrollback buffer.
+                    let chunk: Vec<u8> = if let Some(session) = st.sessions.get(&session_id) {
+                        let buf = &session.scrollback;
+                        let start = buf.len().saturating_sub(current_offset + page_bytes);
+                        let end = buf.len().saturating_sub(current_offset);
+                        buf.range(start..end).copied().collect()
+                    } else {
+                        Vec::new()
+                    };
+
+                    let history_size = buf_len / 80;
+                    let scroll_position = if following_live { 0 } else { current_offset / 80 };
+                    drop(st);
+
+                    // Send viewport frame if scrolled (not following live).
+                    if !following_live && !chunk.is_empty() {
+                        let mut payload = Vec::with_capacity(chunk.len() + 16);
+                        payload.extend_from_slice(b"\x1b[2J\x1b[H");
+                        payload.extend_from_slice(&chunk);
 
                         let pty_msg = ServerMessage::PtyBytes {
                             session_id: session_id.clone(),
@@ -2426,25 +2532,17 @@ async fn process_client_msg(
                             let _ = tx.send(Message::Text(json)).await;
                         }
                     }
+
+                    let state_msg = ServerMessage::TmuxViewportState {
+                        session_id: session_id.clone(),
+                        in_copy_mode: !following_live,
+                        scroll_position,
+                        history_size,
+                        following_live,
+                    };
+                    tx.send(Message::Text(serde_json::to_string(&state_msg)?))
+                        .await?;
                 }
-            }
-
-            let state_msg = ServerMessage::TmuxViewportState {
-                session_id: session_id.clone(),
-                in_copy_mode: viewport_state.in_copy_mode,
-                scroll_position: viewport_state.scroll_position,
-                history_size: viewport_state.history_size,
-                following_live: viewport_state.following_live,
-            };
-            tx.send(Message::Text(serde_json::to_string(&state_msg)?))
-                .await?;
-
-            if let Err(error) = action_result {
-                let msg = ServerMessage::Error {
-                    code: "tmux_viewport_action_failed".to_string(),
-                    message: error,
-                };
-                tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
             }
         }
         ClientMessage::Ping => {
