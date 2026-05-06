@@ -72,3 +72,20 @@ cli/mobile/
 
 # Private mobile app repo lives in a separate GitHub repository.
 mobile/
+
+# Pairing / QR artifacts (never commit)
+reviewer-qr-*
+qr[0-9]*.png
+qr[0-9]*.jpg
+
+# Internal review/launch/marketing artifacts
+CODEX_*.md
+GROWTH_*.md
+LAUNCH_*.md
+SCROLLING_FIX_*.md
+photos/
+screenshots_v2/
+files.png
+script.txt
+.hermes.md
+.opencode/
