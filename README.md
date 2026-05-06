@@ -255,7 +255,7 @@ The daemon can register itself to start automatically when you log in:
 | **macOS** | launchd agent | `mobilecli autostart install` |
 | **Windows** | Task Scheduler | `mobilecli autostart install` |
 
-> **Windows Note:** See [WINDOWS_SETUP.md](WINDOWS_SETUP.md) for important details about running in user session for visible terminal windows.
+> **Windows Note:** See [docs/WINDOWS_SETUP.md](docs/WINDOWS_SETUP.md) for important details about running in user session for visible terminal windows.
 
 ### Shell hook
 
