@@ -16,6 +16,7 @@ use futures_util::{SinkExt, StreamExt};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::borrow::Cow;
 use std::io::{IsTerminal, Read, Write};
+use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -182,18 +183,27 @@ fn request_terminal_resize(cols: u16, rows: u16) {
     set_stdout_winsize(cols, rows);
 }
 
-fn tmux_base_command(socket_name: &str) -> Command {
-    let mut cmd = Command::new("tmux");
-    // Use platform-appropriate null device
+fn tmux_null_device() -> &'static str {
     #[cfg(windows)]
-    let null_dev = "NUL";
+    {
+        "NUL"
+    }
     #[cfg(not(windows))]
-    let null_dev = "/dev/null";
+    {
+        "/dev/null"
+    }
+}
+
+fn tmux_base_command(socket_name: &str, config_path: Option<&Path>) -> Command {
+    let mut cmd = Command::new("tmux");
+    let config_arg = config_path
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| tmux_null_device().to_string());
 
     cmd.arg("-L")
         .arg(socket_name)
         .arg("-f")
-        .arg(null_dev)
+        .arg(config_arg)
         .env_remove("TMUX");
     cmd
 }
@@ -327,6 +337,32 @@ fn resolve_tmux_mouse_mode() -> TmuxMouseMode {
     default_mode
 }
 
+/// Resolve an optional user-provided tmux config path.
+/// Priority: MOBILECLI_TMUX_CONFIG env var → ~/.mobilecli/tmux.conf → None
+fn resolve_tmux_config_path() -> Option<std::path::PathBuf> {
+    if let Ok(raw) = std::env::var("MOBILECLI_TMUX_CONFIG") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let path = std::path::PathBuf::from(trimmed);
+            if path.is_file() {
+                return Some(path);
+            }
+            tracing::warn!(
+                "MOBILECLI_TMUX_CONFIG='{}' does not exist or is not a file. Falling back to null config.",
+                trimmed
+            );
+        }
+    }
+
+    let default = crate::platform::config_dir().join("tmux.conf");
+    if default.is_file() {
+        return Some(default);
+    }
+
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
 fn setup_tmux_session(
     socket_name: &str,
     session_name: &str,
@@ -336,6 +372,7 @@ fn setup_tmux_session(
     terminal_size: (u16, u16),
     tmux_mouse_mode: TmuxMouseMode,
     headless: bool,
+    config_path: Option<&Path>,
 ) -> Result<(), WrapError> {
     let (cols, rows) = terminal_size;
 
@@ -351,7 +388,7 @@ fn setup_tmux_session(
     // will have default history-limit (2000), but we set global options for
     // future windows. This is a tmux limitation - history-limit can only be
     // set globally and affects windows created after it's set.
-    let mut new_session = tmux_base_command(socket_name);
+    let mut new_session = tmux_base_command(socket_name, config_path);
     new_session
         .arg("new-session")
         .arg("-d")
@@ -371,7 +408,7 @@ fn setup_tmux_session(
 
     // Set global options for future windows. The first window already
     // exists with default settings, but new windows will inherit these.
-    let mut set_history = tmux_base_command(socket_name);
+    let mut set_history = tmux_base_command(socket_name, config_path);
     set_history
         .arg("set-option")
         .arg("-g")
@@ -394,7 +431,7 @@ fn setup_tmux_session(
     // The mobile app can still capture scrollback via capture-pane on the main
     // buffer — it just won't see TUI alt-screen content, which is acceptable.
     if headless {
-        let mut disable_altscreen_client = tmux_base_command(socket_name);
+        let mut disable_altscreen_client = tmux_base_command(socket_name, config_path);
         disable_altscreen_client
             .arg("set-option")
             .arg("-g")
@@ -405,13 +442,24 @@ fn setup_tmux_session(
 
     // Mouse mode is configurable. Linux defaults to off so desktop emulators
     // (e.g. Konsole) preserve normal drag-select clipboard behavior.
-    let mut set_mouse_mode = tmux_base_command(socket_name);
+    let mut set_mouse_mode = tmux_base_command(socket_name, config_path);
     set_mouse_mode
         .arg("set-option")
         .arg("-g")
         .arg("mouse")
         .arg(tmux_mouse_mode.as_tmux_value());
     let _ = run_tmux_checked(&mut set_mouse_mode, "mouse");
+
+    // Enable extended key sequences so modern terminals and TUIs (e.g.
+    // applications using kitty keyboard protocol) do not emit warnings
+    // about extended-keys being disabled.
+    let mut set_extended_keys = tmux_base_command(socket_name, config_path);
+    set_extended_keys
+        .arg("set-option")
+        .arg("-g")
+        .arg("extended-keys")
+        .arg("on");
+    let _ = run_tmux_checked(&mut set_extended_keys, "extended-keys");
 
     // history-limit is set globally before new-session so the window is
     // allocated with the full 200K-line buffer from the start.
@@ -431,7 +479,7 @@ fn setup_tmux_session(
         ));
     }
     for (command, target, key, value) in option_sets {
-        let mut option_cmd = tmux_base_command(socket_name);
+        let mut option_cmd = tmux_base_command(socket_name, config_path);
         option_cmd
             .arg(command)
             .arg("-t")
@@ -451,8 +499,8 @@ fn setup_tmux_session(
     Ok(())
 }
 
-fn cleanup_tmux_session(ctx: &TmuxContext) {
-    let mut cmd = tmux_base_command(&ctx.socket_name);
+fn cleanup_tmux_session(ctx: &TmuxContext, config_path: Option<&Path>) {
+    let mut cmd = tmux_base_command(&ctx.socket_name, config_path);
     cmd.arg("kill-server");
     if let Err(err) = run_tmux_checked(&mut cmd, "kill-server") {
         tracing::debug!(
@@ -638,6 +686,11 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
         })
         .map_err(|e| WrapError::Pty(e.to_string()))?;
 
+    let tmux_config_path = resolve_tmux_config_path();
+    if let Some(path) = &tmux_config_path {
+        tracing::info!(path = %path.display(), "Using custom tmux config");
+    }
+
     let mut tmux_context: Option<TmuxContext> = None;
     if runtime_mode == RuntimeMode::Tmux {
         tracing::info!(
@@ -660,6 +713,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
             (cols, rows),
             tmux_mouse_mode,
             false, // headless=false: preserve alt-screen for desktop terminal
+            tmux_config_path.as_deref(),
         )?;
         tmux_context = Some(ctx);
     }
@@ -667,16 +721,16 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
     // Build command
     let mut cmd = if let Some(ctx) = &tmux_context {
         let mut c = CommandBuilder::new("tmux");
-        #[cfg(windows)]
-        let null_dev = "NUL";
-        #[cfg(not(windows))]
-        let null_dev = "/dev/null";
+        let config_arg = tmux_config_path
+            .as_deref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| tmux_null_device().to_string());
 
         c.args([
             "-L",
             ctx.socket_name.as_str(),
             "-f",
-            null_dev,
+            &config_arg,
             "attach-session",
             "-t",
             ctx.session_name.as_str(),
@@ -712,7 +766,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
     let mut child = pair.slave.spawn_command(cmd).map_err(|e| {
         tracing::error!("Failed to spawn PTY command: {}", e);
         if let Some(ctx) = &tmux_context {
-            cleanup_tmux_session(ctx);
+            cleanup_tmux_session(ctx, tmux_config_path.as_deref());
         }
         WrapError::Pty(e.to_string())
     })?;
@@ -1128,7 +1182,7 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
     let _ = reader_handle.join();
 
     if let Some(ctx) = &tmux_context {
-        cleanup_tmux_session(ctx);
+        cleanup_tmux_session(ctx, tmux_config_path.as_deref());
     }
 
     // Reset terminal state after tmux teardown. Tmux with mouse mode enabled
@@ -1311,10 +1365,11 @@ mod tests {
             (80, 24),
             TmuxMouseMode::default_for_platform(),
             true, // headless: tests run without a desktop terminal
+            None,
         )
         .expect("setup tmux session");
 
-        let mut has_session = tmux_base_command(&ctx.socket_name);
+        let mut has_session = tmux_base_command(&ctx.socket_name, None);
         let output = has_session
             .arg("has-session")
             .arg("-t")
@@ -1327,7 +1382,7 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
 
-        let mut show_window_size = tmux_base_command(&ctx.socket_name);
+        let mut show_window_size = tmux_base_command(&ctx.socket_name, None);
         let output = show_window_size
             .arg("show-window-options")
             .arg("-v")
@@ -1347,7 +1402,7 @@ mod tests {
             "expected tmux window-size to remain dynamic for client-driven resize propagation"
         );
 
-        let mut show_alt_screen = tmux_base_command(&ctx.socket_name);
+        let mut show_alt_screen = tmux_base_command(&ctx.socket_name, None);
         let output = show_alt_screen
             .arg("show-window-options")
             .arg("-v")
@@ -1367,7 +1422,7 @@ mod tests {
             "expected tmux alternate-screen to be disabled to protect host terminal scrollback"
         );
 
-        let mut show_mouse_mode = tmux_base_command(&ctx.socket_name);
+        let mut show_mouse_mode = tmux_base_command(&ctx.socket_name, None);
         let output = show_mouse_mode
             .arg("show-options")
             .arg("-gv")
@@ -1386,9 +1441,9 @@ mod tests {
             "expected tmux mouse option to follow platform default policy"
         );
 
-        cleanup_tmux_session(&ctx);
+        cleanup_tmux_session(&ctx, None);
 
-        let mut has_after_cleanup = tmux_base_command(&ctx.socket_name);
+        let mut has_after_cleanup = tmux_base_command(&ctx.socket_name, None);
         let output = has_after_cleanup
             .arg("has-session")
             .arg("-t")
@@ -1422,10 +1477,11 @@ mod tests {
             (80, 24),
             TmuxMouseMode::On,
             true, // headless: tests run without a desktop terminal
+            None,
         )
         .expect("setup tmux session with mouse override");
 
-        let mut show_mouse_mode = tmux_base_command(&ctx.socket_name);
+        let mut show_mouse_mode = tmux_base_command(&ctx.socket_name, None);
         let output = show_mouse_mode
             .arg("show-options")
             .arg("-gv")
@@ -1443,6 +1499,52 @@ mod tests {
             "expected explicit tmux mouse override to enable mouse mode"
         );
 
-        cleanup_tmux_session(&ctx);
+        cleanup_tmux_session(&ctx, None);
+    }
+
+    #[test]
+    fn tmux_session_enables_extended_keys_by_default() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+
+        let token = sanitize_tmux_token(&uuid::Uuid::new_v4().to_string()[..12]);
+        let ctx = TmuxContext {
+            socket_name: format!("mcli-test-{}", token),
+            session_name: format!("mcli-test-{}", token),
+        };
+
+        setup_tmux_session(
+            &ctx.socket_name,
+            &ctx.session_name,
+            "/bin/sh",
+            &vec!["-lc".to_string(), "sleep 10 & wait".to_string()],
+            ".",
+            (80, 24),
+            TmuxMouseMode::default_for_platform(),
+            true,
+            None,
+        )
+        .expect("setup tmux session for extended-keys test");
+
+        let mut show_extended_keys = tmux_base_command(&ctx.socket_name, None);
+        let output = show_extended_keys
+            .arg("show-options")
+            .arg("-gv")
+            .arg("extended-keys")
+            .output()
+            .expect("show-options extended-keys output");
+        assert!(
+            output.status.success(),
+            "expected extended-keys query success: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let extended_keys_mode = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        assert_eq!(
+            extended_keys_mode, "on",
+            "expected tmux extended-keys to be enabled by default"
+        );
+
+        cleanup_tmux_session(&ctx, None);
     }
 }

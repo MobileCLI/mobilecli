@@ -321,6 +321,7 @@ All config lives in `~/.mobilecli/`:
 |------|---------|
 | `config.json` | Device identity, connection URL, auth token hash |
 | `sessions.json` | Persisted session metadata (names, history) |
+| `tmux.conf` | Optional custom tmux config for mobilecli sessions |
 | `daemon.pid` | Running daemon's process ID |
 | `daemon.port` | Active WebSocket port (default: `9847`) |
 | `daemon.log` | Debug log output |
@@ -420,7 +421,17 @@ MobileCLI/
 2. The terminal auto-resizes to fit your phone screen. TUI applications (like `htop` or `vim`) should adapt automatically.
 3. Desktop terminal geometry is preserved by default. If you explicitly want mirrored desktop window resizing, launch with `MOBILECLI_DESKTOP_RESIZE_POLICY=mirror`.
 4. On Linux, tmux mouse mode is disabled by default so desktop terminals like Konsole keep normal drag-select clipboard behavior. Re-enable tmux mouse features with `MOBILECLI_TMUX_MOUSE=on mobilecli`.
-5. If a session looks garbled after switching tabs, tap the session to re-enter it — the terminal refits on activation.
+5. **Custom tmux config:** By default mobilecli runs tmux with an isolated config to ensure reliable streaming. Power users can opt-in to a custom config by creating `~/.mobilecli/tmux.conf` or setting `MOBILECLI_TMUX_CONFIG=/path/to/tmux.conf`. MobileCLI will still enforce its required options after loading your config:
+   - `history-limit 200000`
+   - `extended-keys on`
+   - `window-size latest`
+   - `mouse` (platform default)
+   - `status off`, `allow-rename off`
+   
+   ⚠️ Avoid setting `destroy-unattached` or `remain-on-exit` in your custom config, as these can interfere with session lifecycle management.
+   
+   *Note: Daemon-spawned headless sessions (phone-only, no desktop terminal) use the default tmux server and load your regular `~/.tmux.conf`, not `~/.mobilecli/tmux.conf`.*
+6. If a session looks garbled after switching tabs, tap the session to re-enter it — the terminal refits on activation.
 </details>
 
 <details>
