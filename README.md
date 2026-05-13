@@ -35,7 +35,7 @@ Approve tool calls from the couch. Browse and edit files on your dev machine fro
 </table>
 </div>
 
-> 📺 **[Watch the 60-second demo →]([https://x.com/AlexanderKnigge/status/2054322896760357124])**
+> 📺 **[Watch the 60-second demo ](https://x.com/AlexanderKnigge/status/2054322896760357124)**
 
 <br/>
 
