@@ -35,7 +35,7 @@ Approve tool calls from the couch. Browse and edit files on your dev machine fro
 </table>
 </div>
 
-> 📺 **[Watch the 60-second demo →](https://mobilecli.app)** — See MobileCLI stream a Claude Code session to an iPhone in real time.
+> 📺 **[Watch the 60-second demo →]([https://mobilecli.app](https://x.com/AlexanderKnigge/status/2054322896760357124?s=20))** — See MobileCLI stream a Claude Code session to an iPhone in real time.
 
 <br/>
 
