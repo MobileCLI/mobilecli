@@ -16,12 +16,53 @@ NC='\033[0m' # No Color
 
 REPO="MobileCLI/mobilecli"
 BINARY_NAME="mobilecli"
+CHECKSUM_FILE="SHA256SUMS.txt"
 
 # Print styled messages
 info() { echo -e "${CYAN}$1${NC}"; }
 success() { echo -e "${GREEN}✓ $1${NC}"; }
 warn() { echo -e "${YELLOW}⚠ $1${NC}"; }
 error() { echo -e "${RED}✗ $1${NC}" >&2; exit 1; }
+
+# Compute a SHA-256 digest using the platform's available tool.
+sha256_digest() {
+    local file="$1"
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file" | awk '{print $1}'
+    else
+        error "No SHA-256 checksum tool found. Install sha256sum or shasum and try again."
+    fi
+}
+
+# Verify the downloaded archive against the release checksum manifest.
+verify_archive_checksum() {
+    local archive_path="$1"
+    local archive_name="$2"
+    local checksum_path="$3"
+    local expected actual
+
+    if [ ! -s "$checksum_path" ]; then
+        error "Checksum manifest is missing or empty."
+    fi
+
+    expected=$(awk -v file="$archive_name" '($2 == file || $2 == "*" file || $2 == "./" file) { print $1; exit }' "$checksum_path")
+    if [ -z "$expected" ]; then
+        error "No checksum entry found for ${archive_name}. Refusing to install."
+    fi
+
+    expected=$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')
+    if ! printf '%s\n' "$expected" | grep -Eq '^[0-9a-f]{64}$'; then
+        error "Invalid checksum entry for ${archive_name}. Refusing to install."
+    fi
+
+    actual=$(sha256_digest "$archive_path" | tr '[:upper:]' '[:lower:]')
+    if [ "$actual" != "$expected" ]; then
+        error "Checksum verification failed for ${archive_name}. Refusing to install."
+    fi
+}
 
 # Map OS/arch to Rust target triple (matches release workflow archives)
 detect_target() {
@@ -69,7 +110,7 @@ get_install_dir() {
 
 # Download and install
 install() {
-    local platform version install_dir archive_name download_url tmp_dir
+    local platform version install_dir archive_name download_url checksums_url tmp_dir
 
     info "╔══════════════════════════════════════════════════════════════╗"
     info "║              📱 MobileCLI Installer                          ║"
@@ -92,10 +133,18 @@ install() {
     # Construct download URL
     archive_name="${BINARY_NAME}-${version}-${platform}.tar.gz"
     download_url="https://github.com/${REPO}/releases/download/${version}/${archive_name}"
+    checksums_url="https://github.com/${REPO}/releases/download/${version}/${CHECKSUM_FILE}"
 
     # Create temp directory
     tmp_dir=$(mktemp -d)
-    trap "rm -rf $tmp_dir" EXIT
+    trap "rm -rf '${tmp_dir}'" EXIT
+
+    # Download checksum manifest
+    info "Downloading ${CHECKSUM_FILE}..."
+    if ! curl -fsSL "$checksums_url" -o "${tmp_dir}/${CHECKSUM_FILE}"; then
+        error "Failed to download checksums from $checksums_url"
+    fi
+    success "Downloaded checksums"
 
     # Download archive
     info "Downloading ${archive_name}..."
@@ -103,6 +152,11 @@ install() {
         error "Failed to download from $download_url"
     fi
     success "Downloaded successfully"
+
+    # Verify archive before extraction
+    info "Verifying checksum..."
+    verify_archive_checksum "${tmp_dir}/${archive_name}" "$archive_name" "${tmp_dir}/${CHECKSUM_FILE}"
+    success "Checksum verified"
 
     # Extract archive
     info "Extracting..."
@@ -144,5 +198,8 @@ install() {
     fi
 }
 
-# Run installation
-install
+# Run installation when executed directly. Tests can source this file to exercise
+# checksum helpers without downloading or installing.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    install
+fi

@@ -39,6 +39,7 @@ pub fn format_permissions(metadata: &std::fs::Metadata) -> String {
     if readonly { "r--" } else { "rw-" }.to_string()
 }
 
+#[cfg(unix)]
 fn format_rwx(bits: u32) -> String {
     format!(
         "{}{}{}",

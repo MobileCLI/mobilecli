@@ -140,7 +140,7 @@ impl PathValidator {
     pub fn is_writable(&self, path: &Path) -> bool {
         let normalized = normalize_for_match(path);
         for pattern in &self.config.read_only_patterns {
-            if glob_match(pattern, &normalized) {
+            if glob_match(&normalize_pattern_for_match(pattern), &normalized) {
                 return false;
             }
         }
@@ -153,7 +153,7 @@ impl PathValidator {
         self.config
             .denied_patterns
             .iter()
-            .any(|pattern| glob_match(pattern, &normalized))
+            .any(|pattern| glob_match(&normalize_pattern_for_match(pattern), &normalized))
     }
 
     fn ensure_allowed(&self, path: &Path) -> Result<(), FileSystemError> {
@@ -172,7 +172,7 @@ impl PathValidator {
     fn ensure_not_denied(&self, path: &Path) -> Result<(), FileSystemError> {
         let normalized = normalize_for_match(path);
         for pattern in &self.config.denied_patterns {
-            if glob_match(pattern, &normalized) {
+            if glob_match(&normalize_pattern_for_match(pattern), &normalized) {
                 return Err(FileSystemError::PermissionDenied {
                     path: path_utils::to_protocol_path(path),
                     reason: format!("Path matches denied pattern: {}", pattern),
@@ -217,11 +217,60 @@ fn contains_parent_dir(path: &Path) -> bool {
 }
 
 fn normalize_for_match(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    normalize_match_text(&path.to_string_lossy())
+}
+
+fn normalize_pattern_for_match(pattern: &str) -> String {
+    normalize_match_text(pattern)
+}
+
+fn normalize_match_text(raw: &str) -> String {
+    normalize_match_text_with_case(raw, cfg!(windows))
+}
+
+fn normalize_match_text_with_case(raw: &str, case_insensitive: bool) -> String {
+    let mut normalized = raw.replace('\\', "/");
+
+    if let Some(rest) = normalized.strip_prefix("//?/UNC/") {
+        normalized = format!("//{}", rest);
+    } else if let Some(rest) = normalized.strip_prefix("//?/") {
+        normalized = rest.to_string();
+    }
+
+    if case_insensitive {
+        normalized = normalized.to_ascii_lowercase();
+    }
+
+    normalized
 }
 
 fn find_existing_ancestor(path: &Path) -> Option<PathBuf> {
     path.ancestors()
         .find(|p| p.exists())
         .map(|p| p.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_match_text_with_case;
+
+    #[test]
+    fn windows_match_normalization_strips_verbatim_prefixes_and_lowercases() {
+        assert_eq!(
+            normalize_match_text_with_case(r"\\?\C:\Windows\System32", true),
+            "c:/windows/system32"
+        );
+        assert_eq!(
+            normalize_match_text_with_case(r"\\?\UNC\Server\Share\File", true),
+            "//server/share/file"
+        );
+    }
+
+    #[test]
+    fn unix_match_normalization_keeps_case() {
+        assert_eq!(
+            normalize_match_text_with_case("/Users/Alice/File", false),
+            "/Users/Alice/File"
+        );
+    }
 }

@@ -48,6 +48,24 @@ pub enum TmuxViewportAction {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
+    AuthStart {
+        auth_version: u8,
+        credential_id: String,
+        client_nonce: String,
+        mobile_installation_id: String,
+        #[serde(default)]
+        sender_id: Option<String>,
+        client_version: String,
+        #[serde(default)]
+        client_capabilities: Option<u32>,
+    },
+    AuthResponse {
+        credential_id: String,
+        client_nonce: String,
+        server_nonce: String,
+        mobile_installation_id: String,
+        proof: String,
+    },
     Hello {
         client_version: String,
         #[serde(default)]
@@ -238,12 +256,22 @@ pub enum ClientMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    AuthChallenge {
+        auth_version: u8,
+        server_id: String,
+        credential_id: String,
+        server_nonce: String,
+    },
     Welcome {
         server_version: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         device_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         device_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        server_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        auth_version: Option<u8>,
     },
     Error {
         code: String,
@@ -616,11 +644,23 @@ pub struct ConnectionInfo {
     /// Device name/hostname (for display)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_name: Option<String>,
+    /// Auth protocol version for paired mobile clients.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_version: Option<u8>,
+    /// Stable desktop daemon auth identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_id: Option<String>,
+    /// Credential id for this mobile pairing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<String>,
+    /// One-time displayed pairing token. Stored only on mobile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
 }
 
 impl ConnectionInfo {
     /// Encode as compact string for QR code (smaller QR)
-    /// Format: mobilecli://host:port?device_id=UUID&device_name=HOSTNAME[&wss=1]
+    /// Format: mobilecli://host:port?device_id=UUID&device_name=HOSTNAME&auth=v2&server_id=...&credential_id=...&auth_token=...[&wss=1]
     ///
     /// Note: This format is for device-level pairing, not session-specific connections.
     /// The mobile app connects to the device and then fetches the session list via
@@ -648,6 +688,21 @@ impl ConnectionInfo {
         if let Some(name) = &self.device_name {
             params.push(format!("device_name={}", urlencoding::encode(name)));
         }
+        if let Some(version) = self.auth_version {
+            params.push(format!("auth=v{}", version));
+        }
+        if let Some(server_id) = &self.server_id {
+            params.push(format!("server_id={}", urlencoding::encode(server_id)));
+        }
+        if let Some(credential_id) = &self.credential_id {
+            params.push(format!(
+                "credential_id={}",
+                urlencoding::encode(credential_id)
+            ));
+        }
+        if let Some(auth_token) = &self.auth_token {
+            params.push(format!("auth_token={}", urlencoding::encode(auth_token)));
+        }
         if is_wss {
             params.push("wss=1".to_string());
         }
@@ -658,5 +713,57 @@ impl ConnectionInfo {
         }
 
         url
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_qr_includes_auth_v2_pairing_fields() {
+        let info = ConnectionInfo {
+            ws_url: "ws://100.64.0.10:9847".to_string(),
+            session_id: String::new(),
+            session_name: None,
+            encryption_key: None,
+            version: "0.1.0".to_string(),
+            device_id: Some("desktop-device".to_string()),
+            device_name: Some("Desktop One".to_string()),
+            auth_version: Some(2),
+            server_id: Some("server-id".to_string()),
+            credential_id: Some("credential-id".to_string()),
+            auth_token: Some("secret-token".to_string()),
+        };
+
+        let qr = info.to_compact_qr();
+        assert!(qr.starts_with("mobilecli://100.64.0.10:9847?"));
+        assert!(qr.contains("device_id=desktop-device"));
+        assert!(qr.contains("device_name=Desktop%20One"));
+        assert!(qr.contains("auth=v2"));
+        assert!(qr.contains("server_id=server-id"));
+        assert!(qr.contains("credential_id=credential-id"));
+        assert!(qr.contains("auth_token=secret-token"));
+    }
+
+    #[test]
+    fn compact_qr_preserves_wss_flag_with_auth_fields() {
+        let info = ConnectionInfo {
+            ws_url: "wss://example.test/ws".to_string(),
+            session_id: String::new(),
+            session_name: None,
+            encryption_key: None,
+            version: "0.1.0".to_string(),
+            device_id: None,
+            device_name: None,
+            auth_version: Some(2),
+            server_id: Some("server-id".to_string()),
+            credential_id: Some("credential-id".to_string()),
+            auth_token: Some("secret-token".to_string()),
+        };
+
+        let qr = info.to_compact_qr();
+        assert!(qr.contains("auth=v2"));
+        assert!(qr.contains("wss=1"));
     }
 }

@@ -44,6 +44,12 @@ jobs:
         working-directory: cli
         run: cargo test
 
+      - name: Verify installer script
+        run: bash -n install.sh
+
+      - name: Test installer checksum verification
+        run: bash scripts/test-installer-checksum.sh
+
   cross-compile-check:
     name: Cross-compile check
     runs-on: ubuntu-latest
@@ -82,3 +88,30 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         working-directory: cli
         run: cross build --target ${{ matrix.target }}
+
+  desktop-platform-check:
+    name: Desktop platform check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+
+      - name: Check desktop build
+        working-directory: cli
+        run: cargo check

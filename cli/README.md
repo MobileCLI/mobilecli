@@ -78,7 +78,7 @@ Terminal 3 ──┘
 
 ## Mobile App
 
-Scan the QR code with the MobileCLI mobile app during setup, or enter the daemon URL/IP manually in app settings. The app connects to the daemon and shows all active terminal sessions.
+Scan the QR code with the MobileCLI mobile app during setup. If you cannot scan the QR code, use `mobilecli pair` and enter the full manual pairing details in app settings: WebSocket URL, credential id, server id, and pairing token. URL-only manual setup is not enough for auth-v2 daemons.
 
 ## Session Management
 
@@ -95,13 +95,13 @@ Sessions: 2 active session(s):
 
 ## Security Model
 
-MobileCLI uses network-level access control, with optional QR pairing metadata:
+MobileCLI uses auth-v2 QR pairing plus constrained network binds:
 
-- **Pairing Token (Optional)**: `mobilecli setup` (or `mobilecli --setup`) generates an `auth_token` and embeds it in the QR code for convenience.
-- **Local Network**: Only devices on the same WiFi can connect
-- **Tailscale**: Only authenticated Tailscale network members can connect
-
-The daemon binds to all interfaces (0.0.0.0) intentionally so mobile devices can connect. For remote access, use Tailscale or terminate TLS (`wss://`) with a reverse proxy.
+- **QR Pairing Credential**: `mobilecli setup` (or `mobilecli --setup`) creates a fresh mobile credential and embeds the daemon URL, device id/name, server id, credential id, and one-time pairing token in the QR code. The desktop config stores only a derived verifier.
+- **Challenge-response auth**: mobile clients must send `auth_start`, answer `auth_challenge`, and prove possession of the pairing token before receiving `welcome`, sessions, terminal output, filesystem data, or push-token registration.
+- **Credential management**: use `mobilecli credentials list`, `mobilecli credentials revoke <credential_id>`, or `mobilecli pair --rotate` to manage paired devices.
+- **Constrained bind policy**: the daemon always binds loopback for desktop traffic, then binds the configured LAN or Tailscale address for mobile access. It does not silently bind `0.0.0.0`.
+- **Network isolation**: auth is not a reason to expose the daemon directly to the public internet. For remote access, use Tailscale or a protected `wss://` endpoint you operate.
 
 ## Protocol
 
@@ -109,6 +109,8 @@ The WebSocket server uses a JSON protocol compatible with the MobileCLI mobile a
 
 ### Client → Server
 
+- `auth_start` - Begin auth-v2 challenge-response pairing proof
+- `auth_response` - Complete auth-v2 proof
 - `send_input` - Send keyboard input
 - `pty_resize` - Resize terminal (cols, rows)
 - `get_sessions` - List available sessions
@@ -118,6 +120,7 @@ The WebSocket server uses a JSON protocol compatible with the MobileCLI mobile a
 
 ### Server → Client
 
+- `auth_challenge` - Auth-v2 server challenge
 - `welcome` - Connection established
 - `session_info` - Session details
 - `pty_bytes` - Terminal output (base64)

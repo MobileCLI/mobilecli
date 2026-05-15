@@ -9,7 +9,7 @@
 - **Process**: Manages PTY sessions, WebSocket server
 
 ### Mobile App (React Native)
-- **Framework**: Expo SDK 52
+- **Framework**: Expo SDK 54
 - **Terminal**: xterm.js
 - **Storage**: expo-secure-store (device links)
 - **Notifications**: expo-notifications (push)
@@ -19,13 +19,15 @@
 ```
 1. Desktop: mobilecli setup (or mobilecli --setup)
    ↓
-2. Generate QR: mobilecli://ip:9847?device_id=xxx
+2. Generate auth-v2 QR: mobilecli://ip:9847?...credential_id=xxx&server_id=yyy&auth_token=zzz
    ↓
-3. Mobile: Scan QR → Store device
+3. Mobile: Scan QR → Store device and pairing secret
    ↓
-4. WebSocket: Connect & authenticate
+4. WebSocket: Connect over configured LAN/Tailscale/custom path
    ↓
-5. Stream: PTY bytes ↔ Terminal display
+5. Auth: auth_start → auth_challenge → auth_response
+   ↓
+6. Stream: PTY bytes ↔ Terminal display
 ```
 
 ## Key Protocol Messages
@@ -33,7 +35,9 @@
 ### Client → Server
 ```typescript
 {
-  type: "hello",              // Initial handshake
+  type: "auth_start",         // Initial mobile handshake
+  type: "auth_response",      // Challenge-response proof
+  type: "hello",              // Legacy/no-op after auth
   type: "get_sessions",       // List active terminals
   type: "subscribe",          // Subscribe to session
   type: "send_input",         // Send terminal input
@@ -46,6 +50,7 @@
 ### Server → Client
 ```typescript
 {
+  type: "auth_challenge",    // Auth-v2 server challenge
   type: "welcome",           // Handshake response
   type: "sessions",          // Session list
   type: "pty_bytes",         // Terminal output (base64)
@@ -81,13 +86,14 @@ mobile/
 
 ## Security Model
 
-- **Pairing Token (Optional)**: A per-device `auth_token` is generated during setup and embedded in the pairing QR code for convenience.
+- **Auth-v2 Pairing**: Setup creates a mobile credential. The QR code contains the daemon URL, device metadata, server id, credential id, and one-time pairing token. The desktop stores only a derived verifier.
 - **Device IDs**: UUID per computer (for multi-device support / display)
 - **Network Options**: 
   - Local WiFi (192.168.x.x)
   - Tailscale VPN (100.x.x.x)
   - Custom URL
-- **Data**: Never leaves your network
+- **Access Control**: Mobile clients must complete challenge-response auth before receiving sessions, terminal data, filesystem data, or push-token registration. Keep port 9847 on a trusted LAN, Tailnet, firewall allowlist, or protected custom endpoint.
+- **Terminal Data**: Terminal streams are not sent through a MobileCLI relay. Push notifications use Expo's push service and include notification metadata.
 
 ## AI CLI Detection
 
@@ -100,17 +106,13 @@ Automatically detects and adapts UI for:
 
 ## Testing Infrastructure
 
-### Minimum Requirements
-- **VPS**: 1 vCPU, 1GB RAM, 20GB storage
-- **OS**: Ubuntu 22.04 LTS
-- **Ports**: 22 (SSH), 9847 (WebSocket)
-- **Cost**: ~$6/month
-
-### Recommended Stack
-- **Server**: Hetzner CPX21 (€5.83/month)
-- **Process Manager**: systemd
-- **Monitoring**: journalctl logs
-- **Sessions**: tmux for persistence
+### Minimum Release Smoke
+- **Desktop OS**: macOS Apple Silicon, macOS Intel, Linux x86_64, Linux ARM64, Windows x64
+- **Mobile OS**: iOS release candidate, Android release candidate if Android is distributed
+- **Networks**: Same LAN and Tailscale
+- **Auth**: QR pair, manual pair, bad token rejection, revoked credential rejection
+- **Filesystem**: allowed project roots work; MobileCLI config and common secret paths are denied
+- **Installer**: archive checksum is verified before extraction
 
 ## Quick Commands
 
@@ -128,18 +130,10 @@ journalctl -u mobilecli-daemon -f
 ss -tlnp | grep 9847
 
 # Debug
+# Expected: legacy hello gets auth_required and no sensitive data
 websocat ws://localhost:9847
 tcpdump -i any port 9847
 ```
-
-## Budget Breakdown
-
-| Service | Monthly Cost | Purpose |
-|---------|--------------|---------|
-| Hetzner VPS | $6.30 | Test server |
-| Domain (optional) | $1 | Custom URL |
-| SSL (Let's Encrypt) | $0 | HTTPS |
-| **Total** | **$7.30** | Complete setup |
 
 ## Apple Review Tips
 

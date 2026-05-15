@@ -1,6 +1,6 @@
 # Desktop System Component Map
 
-Last updated: 2026-02-14
+Last updated: 2026-05-15
 Scope: `cli/` Rust daemon + wrapper + filesystem + setup/link flows.
 
 ## 1. Runtime Topology
@@ -9,9 +9,9 @@ Scope: `cli/` Rust daemon + wrapper + filesystem + setup/link flows.
   - Command router for: daemon start/stop/status, setup, QR display, session list, linked mode, wrapped PTY mode.
   - Delegates long-running websocket server to `daemon::run`.
 - `cli/src/daemon.rs`
-  - Single websocket server on `0.0.0.0:<port>`.
+  - WebSocket daemon with loopback plus configured LAN/Tailscale/custom listener policy.
   - Accepts two client classes:
-    - Mobile clients (`hello`, `get_sessions`, FS ops, push token registration, spawn requests).
+    - Mobile clients (`auth_start`/`auth_response`, `get_sessions`, FS ops, push token registration, spawn requests).
     - PTY wrapper clients (`register_pty`, `pty_output`, terminal lifecycle).
   - Owns shared state: sessions, mobile subscribers, waiting states, push tokens, file watchers, rate limiters.
 - `cli/src/pty_wrapper.rs`
@@ -27,9 +27,10 @@ Scope: `cli/` Rust daemon + wrapper + filesystem + setup/link flows.
 ## 2. Request/Response Flow Map
 
 ### 2.1 Mobile connect
-1. Mobile opens WS -> sends `hello`.
-2. Daemon accepts mobile client, replies `welcome` + `sessions` + waiting states.
-3. Mobile subscribes/unsubscribes per active session.
+1. Mobile opens WS -> sends `auth_start`.
+2. Daemon replies `auth_challenge`; mobile sends `auth_response`.
+3. Daemon accepts the client only after the challenge-response proof verifies, then replies `welcome`.
+4. Mobile requests sessions and subscribes/unsubscribes per active session.
 
 ### 2.2 PTY session registration
 1. Wrapper opens WS and first message is `register_pty`.

@@ -29,9 +29,15 @@ pub fn home_dir() -> Option<PathBuf> {
 /// Note: We use a dot-prefix directory on all platforms for consistency.
 /// On Windows, this won't be hidden by default, but keeps paths predictable.
 pub fn config_dir() -> PathBuf {
-    home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".mobilecli")
+    if let Some(home) = home_dir() {
+        return home.join(".mobilecli");
+    }
+
+    if let Some(config) = dirs_next::config_dir() {
+        return config.join("mobilecli");
+    }
+
+    panic!("Cannot determine a safe MobileCLI config directory");
 }
 
 /// Get the default shell for the current platform.
@@ -97,7 +103,6 @@ pub fn is_process_alive(pid: u32) -> bool {
         fn WaitForSingleObject(hHandle: *mut std::ffi::c_void, dwMilliseconds: u32) -> u32;
     }
 
-    const WAIT_OBJECT_0: u32 = 0;
     const WAIT_TIMEOUT: u32 = 258;
 
     unsafe {
@@ -178,7 +183,7 @@ mod tests {
     #[test]
     fn test_config_dir() {
         let dir = config_dir();
-        assert!(dir.ends_with(".mobilecli"));
+        assert!(dir.ends_with(".mobilecli") || dir.ends_with("mobilecli"));
     }
 
     #[test]

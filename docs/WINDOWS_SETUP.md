@@ -143,19 +143,11 @@ mobilecli.exe autolaunch install
 reg add "HKCU\Software\Microsoft\Command Processor" /v AutoRun /t REG_SZ /d "mobilecli" /f
 ```
 
-## Public Tunnel for Testing
+## Remote Access for Testing
 
-For Apple Review or remote access:
+Do not expose the MobileCLI daemon through a public tunnel. Current builds require auth-v2 pairing before sending sessions or terminal data, but a public listener still increases attack surface and brute-force/DoS risk.
 
-```powershell
-# Install localtunnel
-npm install -g localtunnel
-
-# Start tunnel (in separate window)
-lt --port 9847
-```
-
-This gives a public URL like `https://xxx.loca.lt` for mobile connection.
+For remote testing, use Tailscale on both the Windows machine and the mobile device, or place the daemon behind a protected `wss://` endpoint you control.
 
 ## Commands Reference
 
