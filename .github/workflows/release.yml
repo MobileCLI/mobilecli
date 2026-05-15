@@ -9,8 +9,61 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  verify:
+    name: Security release gates
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+
+      - name: Check CLI formatting
+        working-directory: cli
+        run: cargo fmt --check
+
+      - name: Lint CLI
+        working-directory: cli
+        run: cargo clippy --all-targets -- -D warnings -A dead-code
+
+      - name: Test CLI
+        working-directory: cli
+        run: cargo test
+
+      - name: Verify installer script
+        run: bash -n install.sh
+
+      - name: Test installer checksum verification
+        run: bash scripts/test-installer-checksum.sh
+
+      - name: Verify tag matches crate version
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import sys
+          import tomllib
+
+          version = tomllib.loads(pathlib.Path("cli/Cargo.toml").read_text())["package"]["version"]
+          expected = f"v{version}"
+          actual = os.environ["GITHUB_REF_NAME"]
+          if actual != expected:
+              print(f"::error::Release tag {actual} must match cli/Cargo.toml version {expected}")
+              sys.exit(1)
+          PY
+
   build:
     name: Build ${{ matrix.target }}
+    needs: verify
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -54,6 +107,11 @@ jobs:
       - name: Install cross (for cross-compilation)
         if: matrix.cross
         run: command -v cross || cargo install cross --git https://github.com/cross-rs/cross --tag v0.2.5
+
+      - name: Test CLI on native runner
+        if: ${{ !matrix.cross }}
+        working-directory: cli
+        run: cargo test --release
 
       - name: Build (native)
         if: ${{ !matrix.cross }}
@@ -113,11 +171,47 @@ jobs:
           mkdir release
           find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -exec cp {} release/ \;
           ls -la release/
+          expected=(
+            "mobilecli-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz"
+            "mobilecli-${{ github.ref_name }}-aarch64-unknown-linux-gnu.tar.gz"
+            "mobilecli-${{ github.ref_name }}-x86_64-apple-darwin.tar.gz"
+            "mobilecli-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz"
+            "mobilecli-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip"
+          )
+          for file in "${expected[@]}"; do
+            test -f "release/$file" || {
+              echo "::error::Missing release archive: $file"
+              exit 1
+            }
+          done
+          count="$(find release -maxdepth 1 -type f \( -name "*.tar.gz" -o -name "*.zip" \) | wc -l)"
+          test "$count" -eq "${#expected[@]}" || {
+            echo "::error::Expected ${#expected[@]} release archives, found $count"
+            exit 1
+          }
 
       - name: Generate checksums
         working-directory: release
         run: |
           sha256sum * > SHA256SUMS.txt
+          expected=(
+            "mobilecli-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz"
+            "mobilecli-${{ github.ref_name }}-aarch64-unknown-linux-gnu.tar.gz"
+            "mobilecli-${{ github.ref_name }}-x86_64-apple-darwin.tar.gz"
+            "mobilecli-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz"
+            "mobilecli-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip"
+          )
+          for file in "${expected[@]}"; do
+            grep -Eq "  ${file}$" SHA256SUMS.txt || {
+              echo "::error::Missing checksum entry: $file"
+              exit 1
+            }
+          done
+          line_count="$(wc -l < SHA256SUMS.txt | tr -d ' ')"
+          test "$line_count" -eq "${#expected[@]}" || {
+            echo "::error::Expected ${#expected[@]} checksum entries, found $line_count"
+            exit 1
+          }
           cat SHA256SUMS.txt
 
       - name: Create Release

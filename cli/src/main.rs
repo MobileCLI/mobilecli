@@ -9,6 +9,7 @@
 //!   mobilecli daemon       # Run the background server
 //!   mobilecli --help       # Show help
 
+mod auth;
 mod autostart;
 mod daemon;
 mod detection;
@@ -72,7 +73,16 @@ enum Commands {
     /// Run the setup wizard and show QR code for pairing
     Setup,
     /// Show QR code for mobile pairing
-    Pair,
+    Pair {
+        /// Revoke all existing mobile credentials before creating a new pairing QR
+        #[arg(long)]
+        rotate: bool,
+    },
+    /// Manage paired mobile credentials
+    Credentials {
+        #[command(subcommand)]
+        command: CredentialCommand,
+    },
     /// Start the background daemon server
     Daemon {
         /// Port to listen on
@@ -98,6 +108,17 @@ enum Commands {
     ShellHook {
         #[command(subcommand)]
         command: shell_hook::ShellHookCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CredentialCommand {
+    /// List paired mobile credentials without showing secrets
+    List,
+    /// Revoke one paired mobile credential
+    Revoke {
+        /// Credential ID to revoke
+        credential_id: String,
     },
 }
 
@@ -147,10 +168,17 @@ async fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             },
-            Commands::Pair => match show_pair_qr().await {
+            Commands::Pair { rotate } => match show_pair_qr(*rotate).await {
                 Ok(_) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("{}: {}", "Error".red().bold(), e);
+                    ExitCode::FAILURE
+                }
+            },
+            Commands::Credentials { command } => match handle_credentials(command) {
+                Ok(_) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("{}: {}", "Credentials error".red().bold(), e);
                     ExitCode::FAILURE
                 }
             },
@@ -199,15 +227,6 @@ async fn main() -> ExitCode {
     // Get run args (or defaults)
     let run_args = cli.run_args.unwrap_or_default();
 
-    // Ensure daemon is running
-    if !daemon::is_running() {
-        // Start daemon in background
-        if let Err(e) = start_daemon_background().await {
-            eprintln!("{}: {}", "Failed to start daemon".red().bold(), e);
-            return ExitCode::FAILURE;
-        }
-    }
-
     // Check for first run - show setup wizard
     if setup::is_first_run() && run_args.args.is_empty() {
         println!();
@@ -221,6 +240,15 @@ async fn main() -> ExitCode {
                 eprintln!("{}: {}", "Setup error".red().bold(), e);
                 return ExitCode::FAILURE;
             }
+        }
+    }
+
+    // Ensure daemon is running after setup/pairing has had a chance to create credentials.
+    if !daemon::is_running() {
+        // Start daemon in background
+        if let Err(e) = start_daemon_background().await {
+            eprintln!("{}: {}", "Failed to start daemon".red().bold(), e);
+            return ExitCode::FAILURE;
         }
     }
 
@@ -384,12 +412,8 @@ async fn run_setup() -> Result<(), Box<dyn std::error::Error>> {
     // Run the interactive setup
     let _config = setup::run_setup_wizard()?;
 
-    // Ensure daemon is running
-    if !daemon::is_running() {
-        start_daemon_background().await?;
-    }
-
-    // Show QR code for pairing
+    // Create the mobile credential before starting the daemon so remote mobile
+    // listeners do not start in auth-locked mode.
     println!();
     println!(
         "{}",
@@ -397,15 +421,20 @@ async fn run_setup() -> Result<(), Box<dyn std::error::Error>> {
     );
     println!();
 
-    show_pair_qr().await?;
+    show_pair_qr(false).await?;
+
+    // Ensure daemon is running after credentials have been saved.
+    if !daemon::is_running() {
+        start_daemon_background().await?;
+    }
 
     Ok(())
 }
 
 /// Show QR code for pairing
-async fn show_pair_qr() -> Result<(), Box<dyn std::error::Error>> {
+async fn show_pair_qr(rotate: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Get connection config (includes device_id and device_name)
-    let config = setup::load_config().unwrap_or_default();
+    let mut config = setup::load_config().unwrap_or_default();
 
     // Get the actual daemon port (fallback to default if not running)
     let port = daemon::get_port().unwrap_or(daemon::DEFAULT_PORT);
@@ -425,10 +454,11 @@ async fn show_pair_qr() -> Result<(), Box<dyn std::error::Error>> {
                 setup::ConnectionMode::Tailscale => {
                     let ts = setup::check_tailscale();
                     if ts.logged_in {
-                        ts.ip.or_else(setup::get_local_ip)
+                        ts.ip
                     } else {
-                        eprintln!("{}", "⚠ Tailscale not connected".yellow());
-                        setup::get_local_ip()
+                        return Err(
+                            "Tailscale mode is selected but Tailscale is not connected".into()
+                        );
                     }
                 }
                 setup::ConnectionMode::Custom(_) => None,
@@ -441,6 +471,16 @@ async fn show_pair_qr() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     if !ws_url.is_empty() {
+        if rotate {
+            for credential in &mut config.credentials {
+                credential.revoke();
+            }
+        }
+        let pairing = config.create_pairing_credential("Mobile app");
+        setup::save_config(&config)?;
+        if rotate {
+            println!("{}", "Revoked existing mobile credentials.".yellow());
+        }
         let info = protocol::ConnectionInfo {
             ws_url,
             session_id: String::new(), // Not session-specific
@@ -449,11 +489,81 @@ async fn show_pair_qr() -> Result<(), Box<dyn std::error::Error>> {
             version: env!("CARGO_PKG_VERSION").to_string(),
             device_id: Some(config.device_id),
             device_name: Some(config.device_name),
+            auth_version: Some(crate::auth::AUTH_VERSION),
+            server_id: Some(config.server_id),
+            credential_id: Some(pairing.credential.credential_id),
+            auth_token: Some(pairing.auth_token),
         };
 
         qr::display_session_qr(&info);
     } else {
         println!("  {} ws://localhost:{}", "Connect:".dimmed(), port);
+    }
+
+    Ok(())
+}
+
+fn handle_credentials(command: &CredentialCommand) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        CredentialCommand::List => list_credentials(),
+        CredentialCommand::Revoke { credential_id } => revoke_credential(credential_id),
+    }
+}
+
+fn list_credentials() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(config) = setup::load_config() else {
+        println!("{}", "No MobileCLI config found.".yellow());
+        println!(
+            "  Run {} to create a pairing credential.",
+            "mobilecli pair".cyan()
+        );
+        return Ok(());
+    };
+
+    if config.credentials.is_empty() {
+        println!("{}", "No mobile credentials are paired.".yellow());
+        println!("  Run {} to create one.", "mobilecli pair".cyan());
+        return Ok(());
+    }
+
+    println!("{}", "Paired Mobile Credentials".cyan().bold());
+    for credential in &config.credentials {
+        let status = if credential.is_active() {
+            "active".green()
+        } else {
+            "revoked".red()
+        };
+        let last_used = credential.last_used_at.as_deref().unwrap_or("never");
+        println!();
+        println!("  {} {}", "ID:".bold(), credential.credential_id);
+        println!("  {} {}", "Name:".bold(), credential.name);
+        println!("  {} {}", "Status:".bold(), status);
+        println!("  {} {}", "Created:".bold(), credential.created_at);
+        println!("  {} {}", "Last used:".bold(), last_used);
+        if let Some(revoked_at) = &credential.revoked_at {
+            println!("  {} {}", "Revoked:".bold(), revoked_at);
+        }
+    }
+
+    Ok(())
+}
+
+fn revoke_credential(credential_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut config = setup::load_config().ok_or("No MobileCLI config found")?;
+    let Some(credential) = config
+        .credentials
+        .iter_mut()
+        .find(|c| c.credential_id == credential_id)
+    else {
+        return Err(format!("Credential not found: {}", credential_id).into());
+    };
+
+    if credential.is_active() {
+        credential.revoke();
+        setup::save_config(&config)?;
+        println!("{} Revoked {}", "✓".green(), credential_id);
+    } else {
+        println!("{} Credential already revoked", "•".dimmed());
     }
 
     Ok(())

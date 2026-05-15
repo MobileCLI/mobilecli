@@ -7,8 +7,10 @@
 //! 4. Relays input from daemon (mobile) to the PTY
 //! 5. Handles terminal resize events
 
+use crate::auth;
 use crate::daemon::{get_port, DEFAULT_PORT};
 use crate::protocol::PtyResizeReason;
+use crate::setup;
 use crate::tmux::sanitize_tmux_token;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use colored::Colorize;
@@ -268,6 +270,7 @@ fn parse_tmux_mouse_mode(raw: &str) -> Option<TmuxMouseMode> {
     }
 }
 
+#[cfg(any(unix, test))]
 fn parse_bool_env_flag(raw: &str) -> Option<bool> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "on" | "1" | "true" | "yes" => Some(true),
@@ -276,6 +279,7 @@ fn parse_bool_env_flag(raw: &str) -> Option<bool> {
     }
 }
 
+#[cfg(unix)]
 fn resolve_raw_mode() -> bool {
     let Ok(raw) = std::env::var("MOBILECLI_RAW_MODE") else {
         // Default to raw mode when stdin is a TTY. AI CLI tools (Claude Code,
@@ -327,17 +331,19 @@ fn resolve_tmux_mouse_mode() -> TmuxMouseMode {
     default_mode
 }
 
-fn setup_tmux_session(
-    socket_name: &str,
-    session_name: &str,
-    command_path: &str,
-    args: &[String],
-    cwd: &str,
+struct TmuxSessionOptions<'a> {
+    socket_name: &'a str,
+    session_name: &'a str,
+    command_path: &'a str,
+    args: &'a [String],
+    cwd: &'a str,
     terminal_size: (u16, u16),
     tmux_mouse_mode: TmuxMouseMode,
     headless: bool,
-) -> Result<(), WrapError> {
-    let (cols, rows) = terminal_size;
+}
+
+fn setup_tmux_session(options: TmuxSessionOptions<'_>) -> Result<(), WrapError> {
+    let (cols, rows) = options.terminal_size;
 
     // Bootstrap a dedicated tmux server first so global options apply before
     // the wrapped CLI starts. We also disable alternate-screen globally here
@@ -351,27 +357,27 @@ fn setup_tmux_session(
     // will have default history-limit (2000), but we set global options for
     // future windows. This is a tmux limitation - history-limit can only be
     // set globally and affects windows created after it's set.
-    let mut new_session = tmux_base_command(socket_name);
+    let mut new_session = tmux_base_command(options.socket_name);
     new_session
         .arg("new-session")
         .arg("-d")
         .arg("-s")
-        .arg(session_name)
+        .arg(options.session_name)
         .arg("-x")
         .arg(cols.to_string())
         .arg("-y")
         .arg(rows.to_string())
         .arg("--")
-        .arg(command_path)
-        .args(args)
-        .current_dir(cwd)
+        .arg(options.command_path)
+        .args(options.args)
+        .current_dir(options.cwd)
         .env("TERM", "xterm-256color")
         .env("MOBILECLI_SESSION", "1");
     run_tmux_checked(&mut new_session, "new-session")?;
 
     // Set global options for future windows. The first window already
     // exists with default settings, but new windows will inherit these.
-    let mut set_history = tmux_base_command(socket_name);
+    let mut set_history = tmux_base_command(options.socket_name);
     set_history
         .arg("set-option")
         .arg("-g")
@@ -382,7 +388,7 @@ fn setup_tmux_session(
     // Best-effort options for deterministic rendering behavior.
     // NOTE: window-size must remain dynamic so wrapper PTY resizes propagate
     // into tmux panes when mobile dimensions change.
-    let window_target = format!("{}:0", session_name);
+    let window_target = format!("{}:0", options.session_name);
     // Only disable alternate-screen in headless mode (phone-only sessions).
     // In headless mode, there is no desktop terminal, so we disable smcup/rmcup
     // to keep all output in the main buffer where capture-pane can reach it.
@@ -393,8 +399,8 @@ fn setup_tmux_session(
     // garbling the output when the user scrolls on their desktop terminal.
     // The mobile app can still capture scrollback via capture-pane on the main
     // buffer — it just won't see TUI alt-screen content, which is acceptable.
-    if headless {
-        let mut disable_altscreen_client = tmux_base_command(socket_name);
+    if options.headless {
+        let mut disable_altscreen_client = tmux_base_command(options.socket_name);
         disable_altscreen_client
             .arg("set-option")
             .arg("-g")
@@ -405,24 +411,24 @@ fn setup_tmux_session(
 
     // Mouse mode is configurable. Linux defaults to off so desktop emulators
     // (e.g. Konsole) preserve normal drag-select clipboard behavior.
-    let mut set_mouse_mode = tmux_base_command(socket_name);
+    let mut set_mouse_mode = tmux_base_command(options.socket_name);
     set_mouse_mode
         .arg("set-option")
         .arg("-g")
         .arg("mouse")
-        .arg(tmux_mouse_mode.as_tmux_value());
+        .arg(options.tmux_mouse_mode.as_tmux_value());
     let _ = run_tmux_checked(&mut set_mouse_mode, "mouse");
 
     // history-limit is set globally before new-session so the window is
     // allocated with the full 200K-line buffer from the start.
     let mut option_sets: Vec<(&str, &str, &str, &str)> = vec![
-        ("set-option", session_name, "status", "off"),
-        ("set-option", session_name, "allow-rename", "off"),
+        ("set-option", options.session_name, "status", "off"),
+        ("set-option", options.session_name, "allow-rename", "off"),
         ("set-window-option", &window_target, "window-size", "latest"),
     ];
     // Only disable alternate-screen at the window level in headless mode.
     // See the comment above for the full rationale.
-    if headless {
+    if options.headless {
         option_sets.push((
             "set-window-option",
             &window_target,
@@ -431,7 +437,7 @@ fn setup_tmux_session(
         ));
     }
     for (command, target, key, value) in option_sets {
-        let mut option_cmd = tmux_base_command(socket_name);
+        let mut option_cmd = tmux_base_command(options.socket_name);
         option_cmd
             .arg(command)
             .arg("-t")
@@ -440,8 +446,8 @@ fn setup_tmux_session(
             .arg(value);
         if let Err(err) = run_tmux_checked(&mut option_cmd, key) {
             tracing::debug!(
-                socket = socket_name,
-                session = session_name,
+                socket = options.socket_name,
+                session = options.session_name,
                 option = key,
                 error = %err,
                 "Ignoring non-fatal tmux option failure"
@@ -539,6 +545,15 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| ".".to_string())
     });
+    let desktop_link_token = setup::load_config()
+        .map(|cfg| cfg.desktop_link_token)
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| {
+            WrapError::DaemonConnection(
+                "Missing desktop link token; run `mobilecli setup` or `mobilecli pair` first"
+                    .to_string(),
+            )
+        })?;
 
     // Connect to daemon (use actual port from file, fallback to default)
     let port = get_port().unwrap_or(DEFAULT_PORT);
@@ -554,8 +569,19 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
 
     // Register with daemon as a PTY session
+    let transcript = auth::build_pty_registration_transcript(
+        &session_id,
+        &config.session_name,
+        &config.command,
+        &cwd,
+        runtime_mode.as_str(),
+        true,
+    );
+    let pty_proof = auth::local_pty_proof_from_token(&desktop_link_token, &transcript);
     let register_msg = serde_json::json!({
         "type": "register_pty",
+        "pty_auth_version": auth::LOCAL_PTY_AUTH_VERSION,
+        "pty_proof": pty_proof,
         "session_id": session_id,
         "name": config.session_name,
         "command": config.command,
@@ -563,7 +589,11 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
         "runtime": runtime_mode.as_str(),
         "desktop": true,
     });
-    tracing::info!("Sending registration message: {}", register_msg);
+    tracing::info!(
+        session_id = %session_id,
+        runtime = runtime_mode.as_str(),
+        "Sending authenticated PTY registration"
+    );
 
     ws_tx
         .send(Message::Text(register_msg.to_string()))
@@ -651,16 +681,16 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
             session_name: format!("mcli-{}", token),
         };
         // attach mode: desktop terminal is present, keep alt-screen enabled
-        setup_tmux_session(
-            &ctx.socket_name,
-            &ctx.session_name,
-            &cmd_path,
-            &config.args,
-            &cwd,
-            (cols, rows),
+        setup_tmux_session(TmuxSessionOptions {
+            socket_name: &ctx.socket_name,
+            session_name: &ctx.session_name,
+            command_path: &cmd_path,
+            args: &config.args,
+            cwd: &cwd,
+            terminal_size: (cols, rows),
             tmux_mouse_mode,
-            false, // headless=false: preserve alt-screen for desktop terminal
-        )?;
+            headless: false, // Preserve alt-screen for desktop terminal.
+        })?;
         tmux_context = Some(ctx);
     }
 
@@ -849,17 +879,21 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
     // dimensions to the child PTY. Without this, resizing the desktop terminal
     // window leaves the child PTY at stale dimensions, causing garbled output.
     #[cfg(unix)]
-    let mut sigwinch = tokio::signal::unix::signal(
-        tokio::signal::unix::SignalKind::window_change(),
-    ).expect("failed to register SIGWINCH handler");
+    let mut sigwinch =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+            .expect("failed to register SIGWINCH handler");
 
     loop {
         // Helper future that resolves on SIGWINCH (unix) or never (other platforms).
         let sigwinch_fut = async {
             #[cfg(unix)]
-            { sigwinch.recv().await; }
+            {
+                sigwinch.recv().await;
+            }
             #[cfg(not(unix))]
-            { std::future::pending::<()>().await; }
+            {
+                std::future::pending::<()>().await;
+            }
         };
 
         tokio::select! {
@@ -1178,11 +1212,6 @@ fn setup_raw_mode() -> Option<nix::sys::termios::Termios> {
     None
 }
 
-#[cfg(not(unix))]
-fn setup_raw_mode() -> Option<()> {
-    None
-}
-
 /// Restore terminal mode
 #[cfg(unix)]
 fn restore_terminal_mode(original: Option<nix::sys::termios::Termios>) {
@@ -1203,7 +1232,7 @@ mod tests {
     use super::{
         cleanup_tmux_session, parse_bool_env_flag, parse_tmux_mouse_mode, resolve_resize_reason,
         resolve_runtime_mode, sanitize_tmux_token, setup_tmux_session, tmux_base_command,
-        RuntimeMode, TmuxContext, TmuxMouseMode,
+        RuntimeMode, TmuxContext, TmuxMouseMode, TmuxSessionOptions,
     };
     use crate::protocol::PtyResizeReason;
 
@@ -1301,17 +1330,18 @@ mod tests {
             session_name: format!("mcli-test-{}", token),
         };
 
-        setup_tmux_session(
-            &ctx.socket_name,
-            &ctx.session_name,
-            "/bin/sh",
+        let args = vec!["-lc".to_string(), "sleep 10 & wait".to_string()];
+        setup_tmux_session(TmuxSessionOptions {
+            socket_name: &ctx.socket_name,
+            session_name: &ctx.session_name,
+            command_path: "/bin/sh",
             // Keep the session alive long enough for CI has-session checks.
-            &vec!["-lc".to_string(), "sleep 10 & wait".to_string()],
-            ".",
-            (80, 24),
-            TmuxMouseMode::default_for_platform(),
-            true, // headless: tests run without a desktop terminal
-        )
+            args: &args,
+            cwd: ".",
+            terminal_size: (80, 24),
+            tmux_mouse_mode: TmuxMouseMode::default_for_platform(),
+            headless: true, // Tests run without a desktop terminal.
+        })
         .expect("setup tmux session");
 
         let mut has_session = tmux_base_command(&ctx.socket_name);
@@ -1413,16 +1443,17 @@ mod tests {
             session_name: format!("mcli-test-{}", token),
         };
 
-        setup_tmux_session(
-            &ctx.socket_name,
-            &ctx.session_name,
-            "/bin/sh",
-            &vec!["-lc".to_string(), "sleep 10 & wait".to_string()],
-            ".",
-            (80, 24),
-            TmuxMouseMode::On,
-            true, // headless: tests run without a desktop terminal
-        )
+        let args = vec!["-lc".to_string(), "sleep 10 & wait".to_string()];
+        setup_tmux_session(TmuxSessionOptions {
+            socket_name: &ctx.socket_name,
+            session_name: &ctx.session_name,
+            command_path: "/bin/sh",
+            args: &args,
+            cwd: ".",
+            terminal_size: (80, 24),
+            tmux_mouse_mode: TmuxMouseMode::On,
+            headless: true, // Tests run without a desktop terminal.
+        })
         .expect("setup tmux session with mouse override");
 
         let mut show_mouse_mode = tmux_base_command(&ctx.socket_name);

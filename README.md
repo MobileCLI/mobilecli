@@ -45,9 +45,9 @@ You kick off Claude Code on a large refactor. You go make coffee. You come back 
 
 This happens constantly with AI coding assistants. They're powerful but need a human in the loop. That human doesn't need to be chained to a desk.
 
-**MobileCLI streams your terminal to your phone over your local network.** When your AI assistant asks a question, requests tool access, or finishes a task, you get a push notification. Tap it, read the context, approve or deny, and go back to what you were doing.
+**MobileCLI streams your terminal to your phone over a network path you control.** When your AI assistant asks a question, requests tool access, or finishes a task, you get a push notification. Tap it, read the context, approve or deny, and go back to what you were doing.
 
-No cloud. No accounts. No relay servers. Just a direct WebSocket between your machine and your phone.
+The terminal stream is served by a local daemon over WebSocket. Mobile clients pair with auth-v2 QR credentials and then prove possession with a challenge-response handshake before the daemon sends sessions, terminal output, filesystem data, or push-token registration. There is no MobileCLI terminal relay or account system, but push notifications are delivered through Expo's push service, and the daemon should still only be reachable from a trusted LAN, Tailscale network, or protected custom endpoint.
 
 <br/>
 
@@ -59,7 +59,7 @@ No cloud. No accounts. No relay servers. Just a direct WebSocket between your ma
 curl -fsSL https://mobilecli.app/install.sh | bash
 ```
 
-This downloads a single static binary and puts it on your PATH. The daemon is written in Rust — no runtime dependencies, no Docker, no Node.js.
+This macOS/Linux installer downloads the matching GitHub Release archive, verifies it against that release's `SHA256SUMS.txt` manifest before extraction, and puts the binary on your PATH. Windows users should install from the GitHub Releases `.zip` or with Cargo. The checksum protects against a corrupted or tampered archive relative to the published release manifest; for stronger supply-chain assurance, inspect the source or build from source with Cargo.
 
 <details>
 <summary>Other install methods</summary>
@@ -83,7 +83,7 @@ cd mobilecli/cli && cargo install --path .
 mobilecli setup
 ```
 
-This starts the daemon, generates a cryptographic auth token, and displays a QR code. Open the MobileCLI iOS app, tap **Scan QR Code**, and you're connected. The QR encodes a `ws://` URL with your token — no manual entry needed.
+This starts the daemon, saves your connection mode, creates a fresh mobile credential, and displays a QR code. Open the MobileCLI iOS app, tap **Scan QR Code**, and you're connected. The QR encodes the `ws://` or `wss://` URL, device id/name metadata, credential id, server id, and one-time pairing token. The desktop stores only a derived verifier, not the raw token.
 
 ### 3. Start a session
 
@@ -126,8 +126,8 @@ Your Machine                                     Your Phone
 └─────────────────────────────────┘
           │
     Port 9847 (default)
-    Auth token required
-    Never leaves your network
+    Trusted network required
+    Protect from untrusted clients
 ```
 
 The daemon allocates a PTY (pseudo-terminal) for each session, streams the byte output over WebSocket, and relays keyboard input from your phone back to the PTY. The mobile app renders the stream using a bundled xterm.js instance — full ANSI color, cursor positioning, and alternate screen buffer support.
@@ -174,33 +174,34 @@ The Files tab gives you direct access to your dev machine's filesystem:
 - **Search** files by name across your entire project tree
 - **Edit** files with a built-in editor featuring Save/Undo/Redo, Markdown formatting shortcuts (Bold, Italic, Code, H1, List, Link), and syntax awareness
 - **Create** new files and folders from your phone
+- **Destructive actions stay opt-in** — delete and rename are disabled by default in the daemon config and must be explicitly enabled during setup or config review
 - **Upload** photos, files, or camera captures from your phone to your dev machine — the daemon saves them and returns the desktop path so you can paste it into your terminal
 - **Git integration** — file listings show git status indicators
 
 ### Push notifications
 
-Notifications are delivered through APNs (Apple Push Notification service). The daemon sends a push when:
+Notifications are delivered through Expo's push notification service for the current iOS app. The daemon sends a push when:
 
 - An AI CLI enters a wait state (tool approval, plan review, question)
 - A session finishes or exits
 - A long-running command completes
 
-The push token is registered over the WebSocket connection — no external services, no Firebase, no accounts. The daemon talks directly to APNs using your device token.
+The push token is registered over the WebSocket connection and then used by the daemon to call Expo's push API. Notification payloads include the notification title/body and session id, not the full terminal stream.
 
 <br/>
 
 ## Privacy and security
 
-MobileCLI is **fully self-hosted**. There is no cloud component.
+MobileCLI keeps the terminal streaming path self-hosted, but the current iOS push-notification path uses Expo's cloud push service.
 
-- **No relay servers.** Your terminal output travels directly from your machine to your phone over your local network.
+- **No MobileCLI terminal relay.** Your terminal output is served by the daemon over your configured network path.
 - **No accounts.** No sign-up, no email, no OAuth.
 - **No telemetry.** The daemon collects nothing.
-- **Auth token.** Every WebSocket connection requires a cryptographic token generated during `mobilecli setup`. The token is stored in iOS Keychain and `~/.mobilecli/config.json`.
-- **Token stripping.** Auth tokens are scrubbed from session output before streaming, preventing accidental exposure.
+- **Auth-v2 pairing.** Each mobile app stores a pairing token in SecureStore and authenticates with a challenge-response proof before receiving sessions or terminal data. Use `mobilecli pair --rotate` or `mobilecli credentials revoke <credential_id>` to replace or revoke mobile access.
+- **Network isolation still matters.** Keep port `9847` on a trusted LAN, Tailnet, firewall allowlist, or protected custom endpoint. Do not expose it directly to the public internet.
 - **Bounded resources.** The daemon limits concurrent connections, channel buffer sizes, and session counts to prevent resource exhaustion.
 
-Your terminal output **never touches the internet** unless you explicitly configure Tailscale or a custom URL for remote access.
+Your terminal stream does not go through MobileCLI-operated servers. If push notifications are enabled, Expo receives the notification title/body and session id. If you configure Tailscale or a custom remote URL, traffic follows that network provider or endpoint.
 
 <br/>
 
@@ -208,9 +209,9 @@ Your terminal output **never touches the internet** unless you explicitly config
 
 | Mode | How it works | Setup |
 |------|-------------|-------|
-| **LAN** | Direct WebSocket over your WiFi/ethernet. Fastest and simplest. | Auto-detected during `mobilecli setup` |
-| **Tailscale** | WireGuard mesh VPN. Access from anywhere, still peer-to-peer. | `mobilecli setup` → select your Tailscale IP |
-| **Custom URL** | Your own proxy, port-forward, or TLS terminator. | Provide a `ws://` or `wss://` URL |
+| **LAN** | WebSocket over your trusted WiFi/ethernet. Fastest and simplest. | Auto-detected during `mobilecli setup` |
+| **Tailscale** | WireGuard-based mesh VPN. Access from your Tailnet without opening the daemon to the public internet. | `mobilecli setup` → select your Tailscale IP |
+| **Custom URL** | Your own protected `ws://` or `wss://` endpoint, such as a private reverse proxy or TLS terminator. | Provide the URL during setup |
 
 For most users, LAN mode is all you need. Open a terminal, scan the QR, done.
 
@@ -230,6 +231,9 @@ Session commands:
 Setup and management:
   mobilecli setup                     Interactive setup wizard (generates QR code)
   mobilecli pair                      Show QR code for pairing additional devices
+  mobilecli pair --rotate             Revoke existing mobile credentials and pair again
+  mobilecli credentials list          List paired mobile credentials without secrets
+  mobilecli credentials revoke <id>   Revoke one paired mobile credential
   mobilecli status                    Show daemon status, active sessions, connections
   mobilecli stop                      Stop the daemon
 
@@ -319,7 +323,7 @@ All config lives in `~/.mobilecli/`:
 
 | File | Purpose |
 |------|---------|
-| `config.json` | Device identity, connection URL, auth token hash |
+| `config.json` | Device identity and connection mode/URL |
 | `sessions.json` | Persisted session metadata (names, history) |
 | `daemon.pid` | Running daemon's process ID |
 | `daemon.port` | Active WebSocket port (default: `9847`) |
@@ -402,14 +406,14 @@ MobileCLI/
 2. **Daemon running?** Run `mobilecli status` to check. If not running, `mobilecli daemon` starts it.
 3. **Firewall?** Ensure port `9847` (or whatever `~/.mobilecli/daemon.port` says) allows inbound TCP.
 4. **Re-pair:** Run `mobilecli pair` to show a fresh QR code and scan it again.
-5. **Check logs:** `~/.mobilecli/daemon.log` will show connection attempts and auth failures.
+5. **Check logs:** `~/.mobilecli/daemon.log` will show connection attempts and connection errors.
 </details>
 
 <details>
 <summary><b>No push notifications</b></summary>
 
 1. Verify notifications are enabled for MobileCLI in iOS Settings.
-2. The push token registers automatically when the WebSocket connects — check the Config tab shows "connected" status.
+2. The push token registers automatically after the WebSocket auth-v2 handshake completes — check the Config tab shows "connected" status.
 3. Notifications require the daemon to be running. If you restart your machine, make sure the daemon is back up (`mobilecli autostart install` handles this automatically).
 </details>
 

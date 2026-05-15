@@ -2,8 +2,8 @@
 //!
 //! Similar to `screen -x` or `tmux attach` - joins an existing PTY session.
 
-use crate::daemon;
 use crate::protocol::{ClientMessage, ServerMessage, SessionListItem};
+use crate::{auth, daemon, setup};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use colored::Colorize;
 use futures_util::{SinkExt, StreamExt};
@@ -21,15 +21,7 @@ pub async fn run(session_id: Option<String>) -> Result<(), Box<dyn std::error::E
     let ws_url = format!("ws://127.0.0.1:{}", port);
     // Connect to daemon to get session list
     let (mut ws, _) = connect_async(&ws_url).await?;
-
-    // Send hello
-    let hello = ClientMessage::Hello {
-        client_version: env!("CARGO_PKG_VERSION").to_string(),
-        sender_id: None,
-        client_capabilities: None,
-    };
-    ws.send(Message::Text(serde_json::to_string(&hello)?))
-        .await?;
+    authenticate_local_client(&mut ws).await?;
 
     // Wait for welcome and sessions list
     let mut sessions: Vec<SessionListItem> = Vec::new();
@@ -168,17 +160,9 @@ async fn run_linked_mode(
     session: &SessionListItem,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Connect to daemon
-    let (ws, _) = connect_async(ws_url).await?;
+    let (mut ws, _) = connect_async(ws_url).await?;
+    authenticate_local_client(&mut ws).await?;
     let (mut tx, mut rx) = ws.split();
-
-    // Send hello
-    let hello = ClientMessage::Hello {
-        client_version: env!("CARGO_PKG_VERSION").to_string(),
-        sender_id: None,
-        client_capabilities: None,
-    };
-    tx.send(Message::Text(serde_json::to_string(&hello)?))
-        .await?;
 
     // Subscribe to session
     let subscribe = ClientMessage::Subscribe {
@@ -322,6 +306,72 @@ async fn run_linked_mode(
         println!("\r\n{}", "Disconnected from session.".dimmed());
     }
 
+    Ok(())
+}
+
+async fn authenticate_local_client(
+    ws: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let cfg = setup::load_config().ok_or("MobileCLI is not configured. Run `mobilecli pair`.")?;
+    let credential = cfg
+        .credentials
+        .iter()
+        .find(|credential| credential.is_active())
+        .ok_or("No active MobileCLI credentials. Run `mobilecli pair`.")?;
+    let client_nonce = auth::generate_nonce();
+    let mobile_installation_id = "desktop-link".to_string();
+    let start = ClientMessage::AuthStart {
+        auth_version: auth::AUTH_VERSION,
+        credential_id: credential.credential_id.clone(),
+        client_nonce: client_nonce.clone(),
+        mobile_installation_id: mobile_installation_id.clone(),
+        sender_id: Some("desktop-link".to_string()),
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
+        client_capabilities: None,
+    };
+    ws.send(Message::Text(serde_json::to_string(&start)?))
+        .await?;
+
+    let challenge = loop {
+        let Some(msg) = ws.next().await else {
+            return Err("Daemon closed before auth challenge".into());
+        };
+        if let Message::Text(text) = msg? {
+            match serde_json::from_str::<ServerMessage>(&text)? {
+                ServerMessage::AuthChallenge {
+                    server_id,
+                    credential_id,
+                    server_nonce,
+                    ..
+                } => break (server_id, credential_id, server_nonce),
+                ServerMessage::Error { code, message } => {
+                    return Err(format!("Daemon auth error {}: {}", code, message).into());
+                }
+                _ => continue,
+            }
+        }
+    };
+    let (server_id, credential_id, server_nonce) = challenge;
+    let transcript = auth::build_auth_transcript(
+        &server_id,
+        &credential_id,
+        &client_nonce,
+        &server_nonce,
+        &mobile_installation_id,
+    );
+    let proof = auth::proof_from_verifier(&credential.verifier, &transcript)
+        .ok_or("Could not compute auth proof")?;
+    let response = ClientMessage::AuthResponse {
+        credential_id,
+        client_nonce,
+        server_nonce,
+        mobile_installation_id,
+        proof,
+    };
+    ws.send(Message::Text(serde_json::to_string(&response)?))
+        .await?;
     Ok(())
 }
 

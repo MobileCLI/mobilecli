@@ -35,6 +35,33 @@ fn test_path_validation_allows_valid_paths() {
         .is_ok());
 }
 
+#[test]
+fn test_path_validation_blocks_mobilecli_config_secrets() {
+    let Some(home) = dirs_next::home_dir() else {
+        return;
+    };
+
+    let config = Arc::new(FileSystemConfig {
+        allowed_roots: vec![home.clone()],
+        ..Default::default()
+    });
+    let validator = PathValidator::new(config);
+    let config_path = home.join(".mobilecli").join("config.json");
+    assert!(validator.is_denied(&config_path));
+}
+
+#[test]
+fn test_path_validation_allows_project_mobilecli_upload_cache() {
+    let temp = TempDir::new().unwrap();
+    let upload_path = temp.path().join(".mobilecli/uploads/image.png");
+    let config = Arc::new(FileSystemConfig {
+        allowed_roots: vec![temp.path().to_path_buf()],
+        ..Default::default()
+    });
+    let validator = PathValidator::new(config);
+    assert!(!validator.is_denied(&upload_path));
+}
+
 #[tokio::test]
 async fn test_list_directory_sorts_directories_first() {
     let temp = TempDir::new().unwrap();

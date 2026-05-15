@@ -598,6 +598,18 @@ impl FileOperations {
             )
             .await?;
         } else {
+            let metadata = fs::metadata(&source)
+                .await
+                .map_err(|e| FileSystemError::IoError {
+                    message: e.to_string(),
+                })?;
+            if metadata.len() > self.config.max_write_size {
+                return Err(FileSystemError::FileTooLarge {
+                    path: path_utils::to_protocol_path(&source),
+                    size: metadata.len(),
+                    max_size: self.config.max_write_size,
+                });
+            }
             fs::copy(&source, &destination)
                 .await
                 .map_err(|e| FileSystemError::IoError {

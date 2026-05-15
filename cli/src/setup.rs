@@ -2,6 +2,7 @@
 //!
 //! Handles first-time setup and connection configuration.
 
+use crate::auth::{self, AuthCredential, PairingCredential};
 use crate::platform;
 use crate::shell_hook;
 use colored::Colorize;
@@ -22,22 +23,82 @@ pub enum ConnectionMode {
 /// Configuration stored for the CLI
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub config_version: u32,
+    pub server_id: String,
     pub device_id: String,
     pub device_name: String,
+    pub desktop_link_token: String,
     pub connection_mode: ConnectionMode,
     pub tailscale_ip: Option<String>,
     pub local_ip: Option<String>,
+    pub auth_version: u8,
+    pub credentials: Vec<AuthCredential>,
+    pub filesystem: FileSystemAccessConfig,
+}
+
+/// Configuration for mobile filesystem access.
+#[derive(Debug, Clone)]
+pub struct FileSystemAccessConfig {
+    /// Explicit roots approved for mobile browsing/editing.
+    pub allowed_roots: Vec<String>,
+    /// Whole-home access is intentionally opt-in.
+    pub whole_home_enabled: bool,
+    /// Destructive operations such as delete/rename/copy-overwrite are allowed.
+    pub destructive_operations: bool,
+}
+
+impl Default for FileSystemAccessConfig {
+    fn default() -> Self {
+        let cwd = std::env::current_dir().ok();
+        let home = dirs_next::home_dir();
+        let cwd_is_home = cwd.as_ref().is_some_and(|cwd| {
+            home.as_ref().is_some_and(|home| {
+                cwd.canonicalize().unwrap_or_else(|_| cwd.clone())
+                    == home.canonicalize().unwrap_or_else(|_| home.clone())
+            })
+        });
+        let allowed_roots = if cwd_is_home {
+            Vec::new()
+        } else {
+            cwd.and_then(|p| p.to_str().map(|s| s.to_string()))
+                .into_iter()
+                .collect()
+        };
+        Self {
+            allowed_roots,
+            whole_home_enabled: false,
+            destructive_operations: false,
+        }
+    }
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
+            config_version: 2,
+            server_id: uuid::Uuid::new_v4().to_string(),
             device_id: uuid::Uuid::new_v4().to_string(),
             device_name: get_hostname(),
+            desktop_link_token: auth::generate_nonce(),
             connection_mode: ConnectionMode::Local,
             tailscale_ip: None,
             local_ip: None,
+            auth_version: auth::AUTH_VERSION,
+            credentials: Vec::new(),
+            filesystem: FileSystemAccessConfig::default(),
         }
+    }
+}
+
+impl Config {
+    pub fn auth_configured(&self) -> bool {
+        self.credentials.iter().any(AuthCredential::is_active)
+    }
+
+    pub fn create_pairing_credential(&mut self, name: impl Into<String>) -> PairingCredential {
+        let pairing = auth::generate_pairing_credential(name);
+        self.credentials.push(pairing.credential.clone());
+        pairing
     }
 }
 
@@ -95,9 +156,32 @@ pub fn load_config() -> Option<Config> {
         .map(|s| s.to_string())
         .unwrap_or_else(get_hostname);
 
+    let credentials = json
+        .get("credentials")
+        .cloned()
+        .and_then(|v| serde_json::from_value::<Vec<AuthCredential>>(v).ok())
+        .unwrap_or_default();
+
+    let filesystem = parse_filesystem_config(json.get("filesystem"));
+
     let config = Config {
+        config_version: json
+            .get("config_version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as u32,
+        server_id: json
+            .get("server_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         device_id,
         device_name,
+        desktop_link_token: json
+            .get("desktop_link_token")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default(),
         connection_mode: mode,
         tailscale_ip: json
             .get("tailscale_ip")
@@ -107,9 +191,43 @@ pub fn load_config() -> Option<Config> {
             .get("local_ip")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
+        auth_version: json
+            .get("auth_version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(auth::AUTH_VERSION as u64) as u8,
+        credentials,
+        filesystem,
     };
 
     Some(config)
+}
+
+fn parse_filesystem_config(value: Option<&serde_json::Value>) -> FileSystemAccessConfig {
+    let mut config = FileSystemAccessConfig::default();
+    let mut allowed_roots_seen = false;
+    if let Some(value) = value {
+        if let Some(roots) = value.get("allowed_roots").and_then(|v| v.as_array()) {
+            allowed_roots_seen = true;
+            config.allowed_roots = roots
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .filter(|s| !s.trim().is_empty())
+                .collect();
+        }
+        if let Some(enabled) = value.get("whole_home_enabled").and_then(|v| v.as_bool()) {
+            config.whole_home_enabled = enabled;
+        }
+        if let Some(enabled) = value
+            .get("destructive_operations")
+            .and_then(|v| v.as_bool())
+        {
+            config.destructive_operations = enabled;
+        }
+    }
+    if !allowed_roots_seen && config.allowed_roots.is_empty() {
+        config.allowed_roots = FileSystemAccessConfig::default().allowed_roots;
+    }
+    config
 }
 
 /// Save configuration
@@ -117,6 +235,7 @@ pub fn save_config(config: &Config) -> io::Result<()> {
     let config_path = get_config_path();
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent)?;
+        harden_windows_acl(parent)?;
     }
 
     let mode_str = match &config.connection_mode {
@@ -126,14 +245,115 @@ pub fn save_config(config: &Config) -> io::Result<()> {
     };
 
     let json = serde_json::json!({
-        "device_id": config.device_id,
-        "device_name": config.device_name,
+        "config_version": 2,
+        "server_id": &config.server_id,
+        "device_id": &config.device_id,
+        "device_name": &config.device_name,
+        "desktop_link_token": &config.desktop_link_token,
         "connection_mode": mode_str,
-        "tailscale_ip": config.tailscale_ip,
-        "local_ip": config.local_ip,
+        "tailscale_ip": &config.tailscale_ip,
+        "local_ip": &config.local_ip,
+        "auth_version": config.auth_version,
+        "credentials": &config.credentials,
+        "filesystem": {
+            "allowed_roots": &config.filesystem.allowed_roots,
+            "whole_home_enabled": config.filesystem.whole_home_enabled,
+            "destructive_operations": config.filesystem.destructive_operations,
+        },
     });
 
-    std::fs::write(&config_path, serde_json::to_string_pretty(&json)?)?;
+    write_config_private(
+        &config_path,
+        serde_json::to_string_pretty(&json)?.as_bytes(),
+    )?;
+    Ok(())
+}
+
+pub fn ensure_desktop_link_token() -> io::Result<String> {
+    let mut config = load_config().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "MobileCLI config is missing; run `mobilecli setup` first",
+        )
+    })?;
+
+    if config.desktop_link_token.trim().is_empty() {
+        config.desktop_link_token = auth::generate_nonce();
+        save_config(&config)?;
+    }
+
+    Ok(config.desktop_link_token)
+}
+
+fn write_config_private(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::PermissionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        harden_windows_acl(path)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn harden_windows_acl(path: &std::path::Path) -> io::Result<()> {
+    let system_root = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    let icacls = system_root.join("System32").join("icacls.exe");
+    let username = match std::env::var("USERNAME") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "USERNAME is not set",
+            ))
+        }
+    };
+    let principal = match std::env::var("USERDOMAIN") {
+        Ok(domain) if !domain.trim().is_empty() => format!("{}\\{}", domain, username),
+        _ => username,
+    };
+    let grant = format!("{}:F", principal);
+    let status = Command::new(icacls)
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(grant)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            "icacls failed to harden config ACL",
+        ))
+    }
+}
+
+#[cfg(not(windows))]
+fn harden_windows_acl(_path: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -235,41 +455,18 @@ fn prompt_yn(message: &str, default: bool) -> bool {
 }
 
 /// Install Tailscale (Linux)
-///
-/// Security note: Downloads and executes the official Tailscale install script.
-/// User is prompted for confirmation before execution. For additional security,
-/// users can manually install via their package manager or verify the script at
-/// https://tailscale.com/install.sh before running.
 #[cfg(target_os = "linux")]
 fn install_tailscale_linux() -> io::Result<bool> {
     println!();
-    println!("{}", "Installing Tailscale...".cyan());
-    println!("This will download and run the official Tailscale installer.");
-    println!("Script URL: {}", "https://tailscale.com/install.sh".cyan());
+    println!("{}", "Tailscale installation is manual on Linux.".cyan());
+    println!("Install it with your distribution package manager or follow:");
+    println!("  {}", "https://tailscale.com/download/linux".cyan());
     println!();
     println!(
         "{}",
-        "Alternatively, install manually: https://tailscale.com/download/linux".dimmed()
+        "MobileCLI does not run curl | sh installers from setup.".dimmed()
     );
-    println!();
-
-    if !prompt_yn("Download and run installer?", true) {
-        return Ok(false);
-    }
-
-    // Download and run install script (user has confirmed)
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg("curl -fsSL https://tailscale.com/install.sh | sh")
-        .status()?;
-
-    if status.success() {
-        println!("{}", "✓ Tailscale installed successfully!".green());
-        Ok(true)
-    } else {
-        println!("{}", "✗ Tailscale installation failed".red());
-        Ok(false)
-    }
+    Ok(false)
 }
 
 /// Install Tailscale (macOS)
@@ -387,7 +584,7 @@ pub fn run_setup_wizard() -> io::Result<Config> {
             "1" => break 1,
             "2" => break 2,
             "3" => break 3,
-            "" => break 1, // Default to local
+            "" => break 2, // Default to Tailscale for remote-safe access
             _ => println!("{}", "Please enter 1, 2, or 3".yellow()),
         }
     };
@@ -428,7 +625,7 @@ pub fn run_setup_wizard() -> io::Result<Config> {
                 println!();
                 println!("{}", "Tailscale is not installed.".yellow());
 
-                if prompt_yn("Would you like to install Tailscale now?", true) {
+                if prompt_yn("Would you like to install Tailscale now?", false) {
                     #[cfg(target_os = "macos")]
                     let installed = install_tailscale_macos()?;
 
@@ -477,9 +674,6 @@ pub fn run_setup_wizard() -> io::Result<Config> {
                 println!();
                 println!("{}", "⚠ Tailscale not fully configured.".yellow());
                 println!("  Run 'tailscale up' to complete setup.");
-
-                // Fall back to local
-                config.local_ip = get_local_ip();
             }
         }
         3 => {
@@ -491,6 +685,19 @@ pub fn run_setup_wizard() -> io::Result<Config> {
             config.connection_mode = ConnectionMode::Custom(url);
         }
         _ => unreachable!(),
+    }
+
+    println!();
+    println!(
+        "{}",
+        "── Mobile Filesystem Safety ─────────────────────────────────".dimmed()
+    );
+    println!(
+        "{}",
+        "Mobile file browsing/editing is limited to configured roots. Delete and rename are off by default.".dimmed()
+    );
+    if prompt_yn("Allow destructive mobile file operations?", false) {
+        config.filesystem.destructive_operations = true;
     }
 
     // Save configuration
@@ -517,7 +724,7 @@ pub fn run_setup_wizard() -> io::Result<Config> {
     );
     println!();
 
-    if prompt_yn("Enable auto-launch?", true) {
+    if prompt_yn("Enable auto-launch?", false) {
         if shell_hook::install_quiet() {
             println!(
                 "{} Auto-launch enabled! New terminals will start mobilecli automatically.",
@@ -565,4 +772,24 @@ pub fn run_setup_wizard() -> io::Result<Config> {
     println!();
 
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_filesystem_config;
+
+    #[test]
+    fn explicit_empty_allowed_roots_stays_deny_all() {
+        let value = serde_json::json!({
+            "allowed_roots": [],
+            "whole_home_enabled": false,
+            "destructive_operations": false,
+        });
+
+        let config = parse_filesystem_config(Some(&value));
+
+        assert!(config.allowed_roots.is_empty());
+        assert!(!config.whole_home_enabled);
+        assert!(!config.destructive_operations);
+    }
 }

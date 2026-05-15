@@ -3,6 +3,7 @@
 //! Single WebSocket server that all terminal sessions stream to.
 //! Mobile connects once and sees all active sessions.
 
+use crate::auth::{self, AuthenticatedClient};
 use crate::detection::{
     detect_wait_event, strip_ansi_and_normalize, ApprovalModel, CliTracker, CliType, WaitType,
 };
@@ -17,7 +18,7 @@ use crate::tmux::sanitize_tmux_token;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
@@ -140,6 +141,8 @@ pub struct PushToken {
     pub token_type: String, // "expo" | "apns" | "fcm"
     #[allow(dead_code)]
     pub platform: String, // "ios" | "android"
+    pub credential_id: String,
+    pub mobile_installation_id: String,
 }
 
 /// Default scrollback buffer size (8MB).
@@ -169,6 +172,30 @@ const CLIENT_CAP_ATTACH_V2: u32 = 1 << 0;
 const TMUX_VIEWPORT_MIN_MAJOR: u32 = 3;
 const TMUX_VIEWPORT_DEFAULT_COUNT: u16 = 1;
 const TMUX_VIEWPORT_MAX_COUNT: u16 = 20;
+const FIRST_MESSAGE_TIMEOUT: Duration = Duration::from_secs(10);
+const FIRST_MESSAGE_MAX_BYTES: usize = 128 * 1024;
+
+#[derive(Debug, Clone)]
+struct AuthStartRequest {
+    credential_id: String,
+    client_nonce: String,
+    mobile_installation_id: String,
+    sender_id: Option<String>,
+    client_version: String,
+    client_capabilities: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AuthFailure {
+    code: &'static str,
+    message: &'static str,
+}
+
+impl AuthFailure {
+    const fn new(code: &'static str, message: &'static str) -> Self {
+        Self { code, message }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachProtocolMode {
@@ -286,6 +313,7 @@ pub struct DaemonState {
     pub next_attach_id: u64,
     pub mobile_clients: HashMap<SocketAddr, mpsc::Sender<Message>>,
     pub mobile_client_capabilities: HashMap<SocketAddr, u32>,
+    pub mobile_auth: HashMap<SocketAddr, AuthenticatedClient>,
     pub mobile_attach_ids: HashMap<SocketAddr, HashMap<String, u64>>,
     /// Mapping from logical mobile sender ID to current socket address.
     /// Used to evict stale/replaced websocket addresses on reconnect.
@@ -308,12 +336,13 @@ pub struct DaemonState {
     pub device_id: Option<String>,
     /// Device name (hostname)
     pub device_name: Option<String>,
+    /// Stable auth server identity.
+    pub server_id: Option<String>,
 }
 
 impl DaemonState {
     pub fn new(port: u16) -> Self {
         let (pty_broadcast, _) = broadcast::channel(256);
-        let file_system = std::sync::Arc::new(FileSystemService::new(FileSystemConfig::default()));
         let overhaul_flags = OverhaulFlags::from_env();
         let tmux_viewport_supported =
             detect_tmux_viewport_support(overhaul_flags.tmux_shared_viewport);
@@ -325,7 +354,19 @@ impl DaemonState {
             let _ = crate::setup::save_config(&cfg);
             cfg
         });
-        let (device_id, device_name) = (Some(cfg.device_id), Some(cfg.device_name));
+        if cfg.config_version < 2 {
+            tracing::warn!(
+                config_version = cfg.config_version,
+                "Loaded legacy MobileCLI config; mobile auth will remain locked until pairing creates credentials"
+            );
+        }
+        let file_system =
+            std::sync::Arc::new(FileSystemService::new(file_system_config_from_setup(&cfg)));
+        let (device_id, device_name, server_id) = (
+            Some(cfg.device_id),
+            Some(cfg.device_name),
+            Some(cfg.server_id),
+        );
 
         Self {
             sessions: HashMap::new(),
@@ -334,6 +375,7 @@ impl DaemonState {
             next_attach_id: 1,
             mobile_clients: HashMap::new(),
             mobile_client_capabilities: HashMap::new(),
+            mobile_auth: HashMap::new(),
             mobile_attach_ids: HashMap::new(),
             mobile_sender_addrs: HashMap::new(),
             pty_broadcast,
@@ -349,14 +391,101 @@ impl DaemonState {
             file_rate_limiters: HashMap::new(),
             device_id,
             device_name,
+            server_id,
         }
     }
+}
+
+fn file_system_config_from_setup(cfg: &crate::setup::Config) -> FileSystemConfig {
+    file_system_config_from_setup_and_projects(cfg, std::iter::empty::<&String>())
+}
+
+fn file_system_config_from_setup_and_projects<'a>(
+    cfg: &crate::setup::Config,
+    project_paths: impl IntoIterator<Item = &'a String>,
+) -> FileSystemConfig {
+    let mut fs_config = FileSystemConfig::default();
+    let mut roots: Vec<PathBuf> = cfg
+        .filesystem
+        .allowed_roots
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+    roots.extend(
+        project_paths
+            .into_iter()
+            .filter(|p| !p.trim().is_empty())
+            .filter(|p| is_safe_session_project_root(cfg, p))
+            .map(PathBuf::from),
+    );
+    if cfg.filesystem.whole_home_enabled {
+        if let Some(home) = dirs_next::home_dir() {
+            roots.push(home);
+        }
+    }
+    dedupe_roots(&mut roots);
+    if !roots.is_empty() {
+        fs_config.allowed_roots = roots;
+    }
+    fs_config
+}
+
+fn is_safe_session_project_root(cfg: &crate::setup::Config, path: &str) -> bool {
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
+        return false;
+    }
+    let Ok(canonical) = path.canonicalize() else {
+        return false;
+    };
+    if canonical.parent().is_none() {
+        return false;
+    }
+    if !cfg.filesystem.whole_home_enabled {
+        if let Some(home) = dirs_next::home_dir().and_then(|p| p.canonicalize().ok()) {
+            if canonical == home {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn dedupe_roots(roots: &mut Vec<PathBuf>) {
+    let mut seen = BTreeSet::new();
+    roots.retain(|root| {
+        let key = root
+            .canonicalize()
+            .unwrap_or_else(|_| root.clone())
+            .to_string_lossy()
+            .to_string();
+        seen.insert(key)
+    });
+}
+
+fn refresh_file_system_roots(st: &mut DaemonState) {
+    let Some(cfg) = crate::setup::load_config() else {
+        return;
+    };
+    let project_paths: Vec<String> = st
+        .sessions
+        .values()
+        .map(|session| session.project_path.clone())
+        .filter(|path| !path.trim().is_empty())
+        .collect();
+    st.file_system = std::sync::Arc::new(FileSystemService::new(
+        file_system_config_from_setup_and_projects(&cfg, project_paths.iter()),
+    ));
 }
 
 pub type SharedState = Arc<RwLock<DaemonState>>;
 
 /// Start the daemon (blocking - run in background)
 pub async fn run(port: u16) -> std::io::Result<()> {
+    if crate::setup::load_config().is_some() {
+        crate::setup::ensure_desktop_link_token()?;
+    }
+
     // Write PID file
     let pid_path = pid_file();
     if let Some(parent) = pid_path.parent() {
@@ -385,21 +514,19 @@ pub async fn run(port: u16) -> std::io::Result<()> {
     // Limit concurrent connections to prevent resource exhaustion
     let conn_limit = Arc::new(tokio::sync::Semaphore::new(64));
 
-    // Start WebSocket server on all interfaces (0.0.0.0)
-    // This is intentional - mobile clients need network access to connect.
-    // Security model: Access is controlled at the network level via:
-    // - Local network: Only devices on same WiFi can connect
-    // - Tailscale: Only authenticated Tailscale network members can connect
-    // Users explicitly choose their connection mode in setup wizard.
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-    tracing::info!("Daemon WebSocket server on port {}", port);
+    let listeners = bind_configured_listeners(port).await?;
+    tracing::info!(
+        listener_count = listeners.len(),
+        port,
+        "Daemon WebSocket listeners ready"
+    );
 
     // Run the main loop with platform-specific signal handling
     #[cfg(unix)]
-    run_server_loop_unix(listener, state, conn_limit).await;
+    run_server_loop_unix(listeners, state, conn_limit).await;
 
     #[cfg(not(unix))]
-    run_server_loop_ctrlc_only(listener, state, conn_limit).await;
+    run_server_loop_ctrlc_only(listeners, state, conn_limit).await;
 
     // Cleanup
     let _ = std::fs::remove_file(&pid_path);
@@ -407,10 +534,71 @@ pub async fn run(port: u16) -> std::io::Result<()> {
     Ok(())
 }
 
+async fn bind_configured_listeners(port: u16) -> std::io::Result<Vec<TcpListener>> {
+    let cfg = crate::setup::load_config().unwrap_or_default();
+    let mut addrs = BTreeSet::new();
+    addrs.insert(format!("127.0.0.1:{}", port));
+
+    if !cfg.auth_configured() {
+        tracing::warn!(
+            "No mobile credentials are configured; only loopback listener will be enabled"
+        );
+        return bind_listeners(addrs).await;
+    }
+
+    match &cfg.connection_mode {
+        crate::setup::ConnectionMode::Local => {
+            if let Some(ip) = crate::setup::get_local_ip().or(cfg.local_ip.clone()) {
+                addrs.insert(format!("{}:{}", ip, port));
+            }
+        }
+        crate::setup::ConnectionMode::Tailscale => {
+            let ts = crate::setup::check_tailscale();
+            if ts.logged_in {
+                if let Some(ip) = ts.ip.or(cfg.tailscale_ip.clone()) {
+                    addrs.insert(format!("{}:{}", ip, port));
+                }
+            } else {
+                tracing::warn!(
+                    "Tailscale mode selected but Tailscale is not connected; mobile listener is disabled"
+                );
+            }
+        }
+        crate::setup::ConnectionMode::Custom(url) => {
+            tracing::warn!(
+                url = %url,
+                "Custom connection mode does not imply all-interface binding; configure a local proxy to loopback or rerun setup for LAN/Tailscale"
+            );
+        }
+    }
+
+    bind_listeners(addrs).await
+}
+
+async fn bind_listeners(addrs: BTreeSet<String>) -> std::io::Result<Vec<TcpListener>> {
+    let mut listeners = Vec::new();
+    for addr in addrs {
+        match TcpListener::bind(&addr).await {
+            Ok(listener) => {
+                tracing::info!(addr = %addr, "Bound daemon listener");
+                listeners.push(listener);
+            }
+            Err(err) => {
+                tracing::warn!(addr = %addr, error = %err, "Failed to bind daemon listener");
+                if addr.starts_with("127.0.0.1:") {
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    Ok(listeners)
+}
+
 /// Server loop with Unix signal handling (SIGTERM + Ctrl+C)
 #[cfg(unix)]
 async fn run_server_loop_unix(
-    listener: TcpListener,
+    listeners: Vec<TcpListener>,
     state: SharedState,
     conn_limit: Arc<tokio::sync::Semaphore>,
 ) {
@@ -424,73 +612,76 @@ async fn run_server_loop_unix(
             sigterm_result.err()
         );
         // Fall back to generic loop with just Ctrl+C
-        run_server_loop_ctrlc_only(listener, state, conn_limit).await;
+        run_server_loop_ctrlc_only(listeners, state, conn_limit).await;
         return;
     }
     let mut sigterm = sigterm_result.unwrap();
+    let handles = spawn_accept_loops(listeners, state, conn_limit);
 
-    loop {
-        tokio::select! {
-            result = listener.accept() => {
-                if let Ok((stream, addr)) = result {
-                    let state = state.clone();
-                    let permit = conn_limit.clone().try_acquire_owned();
-                    match permit {
-                        Ok(permit) => {
-                            tokio::spawn(async move {
-                                let _permit = permit; // held until connection ends
-                                let _ = handle_connection(stream, addr, state).await;
-                            });
-                        }
-                        Err(_) => {
-                            tracing::warn!("Connection limit reached, rejecting {}", addr);
-                        }
-                    }
-                }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("Daemon shutting down (Ctrl+C)");
-                break;
-            }
-            _ = sigterm.recv() => {
-                tracing::info!("Daemon shutting down (SIGTERM)");
-                break;
-            }
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Daemon shutting down (Ctrl+C)");
         }
+        _ = sigterm.recv() => {
+            tracing::info!("Daemon shutting down (SIGTERM)");
+        }
+    }
+    for handle in handles {
+        handle.abort();
     }
 }
 
 /// Server loop with Ctrl+C only (fallback or non-Unix)
 async fn run_server_loop_ctrlc_only(
-    listener: TcpListener,
+    listeners: Vec<TcpListener>,
     state: SharedState,
     conn_limit: Arc<tokio::sync::Semaphore>,
 ) {
-    loop {
-        tokio::select! {
-            result = listener.accept() => {
-                if let Ok((stream, addr)) = result {
-                    let state = state.clone();
-                    let permit = conn_limit.clone().try_acquire_owned();
-                    match permit {
-                        Ok(permit) => {
-                            tokio::spawn(async move {
-                                let _permit = permit;
-                                let _ = handle_connection(stream, addr, state).await;
-                            });
+    let handles = spawn_accept_loops(listeners, state, conn_limit);
+    let _ = tokio::signal::ctrl_c().await;
+    tracing::info!("Daemon shutting down (Ctrl+C)");
+    for handle in handles {
+        handle.abort();
+    }
+}
+
+fn spawn_accept_loops(
+    listeners: Vec<TcpListener>,
+    state: SharedState,
+    conn_limit: Arc<tokio::sync::Semaphore>,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    listeners
+        .into_iter()
+        .map(|listener| {
+            let state = state.clone();
+            let conn_limit = conn_limit.clone();
+            tokio::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, addr)) => {
+                            let state = state.clone();
+                            let permit = conn_limit.clone().try_acquire_owned();
+                            match permit {
+                                Ok(permit) => {
+                                    tokio::spawn(async move {
+                                        let _permit = permit;
+                                        let _ = handle_connection(stream, addr, state).await;
+                                    });
+                                }
+                                Err(_) => {
+                                    tracing::warn!("Connection limit reached, rejecting {}", addr);
+                                }
+                            }
                         }
-                        Err(_) => {
-                            tracing::warn!("Connection limit reached, rejecting {}", addr);
+                        Err(err) => {
+                            tracing::warn!(error = %err, "Daemon listener accept failed");
+                            break;
                         }
                     }
                 }
-            }
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("Daemon shutting down (Ctrl+C)");
-                break;
-            }
-        }
-    }
+            })
+        })
+        .collect()
 }
 
 /// Handle WebSocket connection (could be mobile client or PTY session)
@@ -499,21 +690,32 @@ async fn handle_connection(
     addr: SocketAddr,
     state: SharedState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Uploads are sent base64-encoded over websocket. Keep headroom above the
-    // 50MB file cap to avoid protocol-level disconnects.
+    // Keep inbound messages bounded before authentication. Mobile attachments
+    // are capped to fit inside this after base64 encoding.
     let ws_config = WebSocketConfig {
-        max_message_size: Some(96 * 1024 * 1024),
-        max_frame_size: Some(96 * 1024 * 1024),
+        max_message_size: Some(24 * 1024 * 1024),
+        max_frame_size: Some(24 * 1024 * 1024),
         ..Default::default()
     };
     let ws = accept_async_with_config(stream, Some(ws_config)).await?;
-    let (tx, mut rx) = ws.split();
+    let (mut tx, mut rx) = ws.split();
 
-    // Wait for first message to determine client type
-    let first_msg = rx.next().await;
+    // Wait briefly for the first message to determine client type. Without
+    // this timeout, idle unauthenticated sockets can hold all connection slots.
+    let first_msg = match tokio::time::timeout(FIRST_MESSAGE_TIMEOUT, rx.next()).await {
+        Ok(value) => value,
+        Err(_) => {
+            let _ = tx.send(Message::Close(None)).await;
+            return Ok(());
+        }
+    };
 
     match first_msg {
         Some(Ok(Message::Text(text))) => {
+            if text.len() > FIRST_MESSAGE_MAX_BYTES {
+                send_auth_error(&mut tx, "message_too_large", "First message is too large").await?;
+                return Ok(());
+            }
             if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) {
                 if msg.get("type").and_then(|v| v.as_str()) == Some("register_pty") {
                     // This is a PTY session registering
@@ -524,25 +726,327 @@ async fn handle_connection(
                         );
                         return Ok(());
                     }
+                    if let Err(reason) = validate_pty_registration(&msg) {
+                        tracing::warn!(
+                            addr = %addr,
+                            reason = reason,
+                            "Rejecting unauthenticated PTY registration"
+                        );
+                        let _ = tx
+                            .send(Message::Text(
+                                serde_json::json!({
+                                    "type": "error",
+                                    "code": "pty_auth_required",
+                                    "message": "PTY registration auth failed"
+                                })
+                                .to_string(),
+                            ))
+                            .await;
+                        let _ = tx.send(Message::Close(None)).await;
+                        return Ok(());
+                    }
                     return handle_pty_session(msg, tx, rx, addr, state).await;
                 }
             }
-            // Assume it's a mobile client
-            handle_mobile_client(Some(text), tx, rx, addr, state).await
+            let auth_client = authenticate_mobile_client(text, &mut tx, &mut rx, addr).await?;
+            handle_mobile_client(tx, rx, addr, state, auth_client).await
         }
         _ => Ok(()),
     }
 }
 
+async fn send_auth_error(
+    tx: &mut futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<TcpStream>,
+        Message,
+    >,
+    code: &str,
+    message: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let msg = ServerMessage::Error {
+        code: code.to_string(),
+        message: message.to_string(),
+    };
+    let _ = tx.send(Message::Text(serde_json::to_string(&msg)?)).await;
+    let _ = tx.send(Message::Close(None)).await;
+    Ok(())
+}
+
+fn parse_auth_start_request(first_text: &str) -> Result<AuthStartRequest, AuthFailure> {
+    match serde_json::from_str::<ClientMessage>(first_text) {
+        Ok(ClientMessage::AuthStart {
+            auth_version,
+            credential_id,
+            client_nonce,
+            mobile_installation_id,
+            sender_id,
+            client_version,
+            client_capabilities,
+        }) => {
+            if auth_version != auth::AUTH_VERSION {
+                return Err(AuthFailure::new(
+                    "auth_unsupported",
+                    "Unsupported auth protocol version",
+                ));
+            }
+            Ok(AuthStartRequest {
+                credential_id,
+                client_nonce,
+                mobile_installation_id,
+                sender_id,
+                client_version,
+                client_capabilities,
+            })
+        }
+        _ => Err(AuthFailure::new(
+            "auth_required",
+            "MobileCLI daemon requires auth-v2 pairing. Run `mobilecli pair` and scan the QR code.",
+        )),
+    }
+}
+
+fn active_credential_index(
+    cfg: &crate::setup::Config,
+    credential_id: &str,
+) -> Result<usize, AuthFailure> {
+    cfg.credentials
+        .iter()
+        .position(|c| c.credential_id == credential_id && c.is_active())
+        .ok_or_else(|| AuthFailure::new("auth_invalid", "Unknown or revoked mobile credential"))
+}
+
+fn validate_auth_response_text(
+    response_text: &str,
+    cfg: &crate::setup::Config,
+    credential: &auth::AuthCredential,
+    start: &AuthStartRequest,
+    server_nonce: &str,
+) -> Result<AuthenticatedClient, AuthFailure> {
+    let response = match serde_json::from_str::<ClientMessage>(response_text) {
+        Ok(ClientMessage::AuthResponse {
+            credential_id,
+            client_nonce,
+            server_nonce,
+            mobile_installation_id,
+            proof,
+        }) => (
+            credential_id,
+            client_nonce,
+            server_nonce,
+            mobile_installation_id,
+            proof,
+        ),
+        _ => return Err(AuthFailure::new("auth_required", "Expected auth_response")),
+    };
+
+    let (
+        response_credential_id,
+        response_client_nonce,
+        response_server_nonce,
+        response_mobile_installation_id,
+        proof,
+    ) = response;
+
+    if response_credential_id != start.credential_id
+        || response_client_nonce != start.client_nonce
+        || response_server_nonce != server_nonce
+        || response_mobile_installation_id != start.mobile_installation_id
+    {
+        return Err(AuthFailure::new(
+            "auth_invalid",
+            "Auth response transcript mismatch",
+        ));
+    }
+
+    let transcript = auth::build_auth_transcript(
+        &cfg.server_id,
+        &start.credential_id,
+        &start.client_nonce,
+        server_nonce,
+        &start.mobile_installation_id,
+    );
+    if !auth::verify_proof(&credential.verifier, &transcript, &proof) {
+        return Err(AuthFailure::new(
+            "auth_invalid",
+            "Invalid mobile credential proof",
+        ));
+    }
+
+    Ok(AuthenticatedClient {
+        credential_id: start.credential_id.clone(),
+        mobile_installation_id: start.mobile_installation_id.clone(),
+        sender_id: start.sender_id.clone(),
+        client_version: start.client_version.clone(),
+        client_capabilities: start.client_capabilities,
+        scopes: credential.scopes.clone(),
+    })
+}
+
+fn validate_pty_registration(reg_msg: &serde_json::Value) -> Result<(), &'static str> {
+    let token = crate::setup::ensure_desktop_link_token().map_err(|_| "missing_local_secret")?;
+    validate_pty_registration_with_token(reg_msg, &token)
+}
+
+fn validate_pty_registration_with_token(
+    reg_msg: &serde_json::Value,
+    token: &str,
+) -> Result<(), &'static str> {
+    let version = reg_msg
+        .get("pty_auth_version")
+        .and_then(|v| v.as_u64())
+        .ok_or("missing_version")?;
+    if version != auth::LOCAL_PTY_AUTH_VERSION as u64 {
+        return Err("unsupported_version");
+    }
+
+    let proof = reg_msg
+        .get("pty_proof")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or("missing_proof")?;
+    if token.trim().is_empty() {
+        return Err("missing_local_secret");
+    }
+
+    let session_id = reg_msg
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("missing_session_id")?;
+    let name = reg_msg
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Terminal");
+    let command = reg_msg
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("shell");
+    let project_path = reg_msg
+        .get("project_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let runtime = reg_msg
+        .get("runtime")
+        .and_then(|v| v.as_str())
+        .unwrap_or("pty")
+        .to_lowercase();
+    let has_desktop = reg_msg
+        .get("desktop")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let transcript = auth::build_pty_registration_transcript(
+        session_id,
+        name,
+        command,
+        project_path,
+        &runtime,
+        has_desktop,
+    );
+
+    if auth::verify_local_pty_proof(token, &transcript, proof) {
+        Ok(())
+    } else {
+        Err("invalid_proof")
+    }
+}
+
+async fn authenticate_mobile_client(
+    first_text: String,
+    tx: &mut futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<TcpStream>,
+        Message,
+    >,
+    rx: &mut futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<TcpStream>>,
+    addr: SocketAddr,
+) -> Result<AuthenticatedClient, Box<dyn std::error::Error + Send + Sync>> {
+    let start = match parse_auth_start_request(&first_text) {
+        Ok(start) => start,
+        Err(failure) => {
+            send_auth_error(tx, failure.code, failure.message).await?;
+            return Err(failure.code.into());
+        }
+    };
+
+    let mut cfg = match crate::setup::load_config() {
+        Some(cfg) if cfg.auth_configured() => cfg,
+        _ => {
+            send_auth_error(
+                tx,
+                "auth_locked",
+                "No mobile credentials are configured. Run `mobilecli pair` to create one.",
+            )
+            .await?;
+            return Err("auth locked".into());
+        }
+    };
+
+    let index = match active_credential_index(&cfg, &start.credential_id) {
+        Ok(index) => index,
+        Err(failure) => {
+            send_auth_error(tx, failure.code, failure.message).await?;
+            return Err(failure.code.into());
+        }
+    };
+
+    let server_nonce = auth::generate_nonce();
+    let challenge = ServerMessage::AuthChallenge {
+        auth_version: auth::AUTH_VERSION,
+        server_id: cfg.server_id.clone(),
+        credential_id: start.credential_id.clone(),
+        server_nonce: server_nonce.clone(),
+    };
+    tx.send(Message::Text(serde_json::to_string(&challenge)?))
+        .await?;
+
+    let response = tokio::time::timeout(Duration::from_secs(10), rx.next()).await;
+    let response_text = match response {
+        Ok(Some(Ok(Message::Text(text)))) => text,
+        _ => {
+            send_auth_error(tx, "auth_required", "Timed out waiting for auth response").await?;
+            return Err("auth response timeout".into());
+        }
+    };
+
+    let credential = cfg.credentials[index].clone();
+    let auth_client =
+        match validate_auth_response_text(&response_text, &cfg, &credential, &start, &server_nonce)
+        {
+            Ok(client) => client,
+            Err(failure) => {
+                if failure.code == "auth_invalid" {
+                    tracing::warn!(
+                        addr = %addr,
+                        credential_id = %start.credential_id,
+                        "Rejected invalid mobile auth proof"
+                    );
+                }
+                send_auth_error(tx, failure.code, failure.message).await?;
+                return Err(failure.code.into());
+            }
+        };
+
+    cfg.credentials[index].last_used_at = Some(Utc::now().to_rfc3339());
+    if let Err(err) = crate::setup::save_config(&cfg) {
+        tracing::warn!(error = %err, "Failed to update credential last_used_at");
+    }
+
+    Ok(auth_client)
+}
+
 /// Handle mobile client connection
 async fn handle_mobile_client(
-    first_msg: Option<String>,
     mut tx: futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, Message>,
     mut rx: futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<TcpStream>>,
     addr: SocketAddr,
     state: SharedState,
+    auth_client: AuthenticatedClient,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tracing::info!("Mobile client connected: {}", addr);
+    tracing::info!(
+        addr = %addr,
+        credential_id = %auth_client.credential_id,
+        client_version = %auth_client.client_version,
+        "Authenticated mobile client connected"
+    );
 
     let (client_tx, mut client_rx) = mpsc::channel::<Message>(4096);
     let watch_tx = client_tx.clone();
@@ -551,6 +1055,24 @@ async fn handle_mobile_client(
     // Register client and get broadcast receiver
     let mut pty_rx = {
         let mut st = state.write().await;
+        if let Some(capabilities) = auth_client.client_capabilities {
+            st.mobile_client_capabilities.insert(addr, capabilities);
+        }
+        if let Some(sender_id) = auth_client
+            .sender_id
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            if let Some(previous_addr) = st.mobile_sender_addrs.insert(sender_id, addr) {
+                if previous_addr != addr {
+                    drop(st);
+                    evict_mobile_addr(&state, previous_addr).await;
+                    st = state.write().await;
+                }
+            }
+        }
+        st.mobile_auth.insert(addr, auth_client.clone());
         st.mobile_clients.insert(addr, client_tx);
         st.pty_broadcast.subscribe()
     };
@@ -584,7 +1106,10 @@ async fn handle_mobile_client(
 
             let fs = {
                 let st = watch_state.read().await;
-                if !st.mobile_clients.contains_key(&addr) {
+                let active_ids = active_credential_ids_on_disk();
+                if !st.mobile_clients.contains_key(&addr)
+                    || !is_mobile_client_active(&st, &addr, &active_ids)
+                {
                     break 'watch;
                 }
                 let watched = match st.file_watch_subscriptions.get(&addr) {
@@ -633,14 +1158,28 @@ async fn handle_mobile_client(
     });
 
     // Send welcome with device info
-    let (device_id, device_name) = {
+    let (device_id, device_name, server_id) = {
         let st = state.read().await;
-        (st.device_id.clone(), st.device_name.clone())
+        if let Some(cfg) = crate::setup::load_config() {
+            (
+                Some(cfg.device_id),
+                Some(cfg.device_name),
+                Some(cfg.server_id),
+            )
+        } else {
+            (
+                st.device_id.clone(),
+                st.device_name.clone(),
+                st.server_id.clone(),
+            )
+        }
     };
     let welcome = ServerMessage::Welcome {
         server_version: env!("CARGO_PKG_VERSION").to_string(),
         device_id,
         device_name,
+        server_id,
+        auth_version: Some(auth::AUTH_VERSION),
     };
     tx.send(Message::Text(serde_json::to_string(&welcome)?))
         .await?;
@@ -651,31 +1190,35 @@ async fn handle_mobile_client(
     // Send current waiting states for all sessions (for late-joining clients)
     send_waiting_states(&state, &mut tx).await?;
 
-    // Process first message if it was a client message
-    if let Some(text) = first_msg {
-        match serde_json::from_str::<ClientMessage>(&text) {
-            Ok(msg) => process_client_msg(msg, &state, &mut tx, addr).await?,
-            Err(e) => {
-                tracing::debug!("Ignoring unparsable client message from {}: {}", addr, e);
-            }
-        }
-    }
-
     loop {
         tokio::select! {
             // PTY output
             result = pty_rx.recv() => {
                 match result {
                     Ok((session_id, seq, data)) => {
-                        let (flags, capabilities, attach_id) = {
+                        let (flags, capabilities, attach_id, is_viewing, is_client_active) = {
                             let st = state.read().await;
+                            let active_ids = active_credential_ids_on_disk();
                             let caps = st.mobile_client_capabilities.get(&addr).copied().unwrap_or(0);
                             let attach_id = st
                                 .mobile_attach_ids
                                 .get(&addr)
                                 .and_then(|sessions| sessions.get(&session_id).copied());
-                            (st.overhaul_flags, caps, attach_id)
+                            let is_viewing = st
+                                .mobile_views
+                                .get(&addr)
+                                .is_some_and(|sessions| sessions.contains(&session_id));
+                            (
+                                st.overhaul_flags,
+                                caps,
+                                attach_id,
+                                is_viewing,
+                                is_mobile_client_active(&st, &addr, &active_ids),
+                            )
                         };
+                        if !is_client_active {
+                            break;
+                        }
 
                         let msg = if should_use_attach_v2(flags, capabilities) {
                             let Some(attach_id) = attach_id else {
@@ -689,6 +1232,9 @@ async fn handle_mobile_client(
                                 timestamp_ms: Utc::now().timestamp_millis().max(0) as u64,
                             }
                         } else {
+                            if !is_viewing {
+                                continue;
+                            }
                             ServerMessage::PtyBytes {
                                 session_id,
                                 data: BASE64.encode(&data),
@@ -706,6 +1252,14 @@ async fn handle_mobile_client(
 
             // Queued messages
             Some(msg) = client_rx.recv() => {
+                let is_client_active = {
+                    let st = state.read().await;
+                    let active_ids = active_credential_ids_on_disk();
+                    is_mobile_client_active(&st, &addr, &active_ids)
+                };
+                if !is_client_active {
+                    break;
+                }
                 if tx.send(msg).await.is_err() {
                     break;
                 }
@@ -812,6 +1366,7 @@ async fn handle_pty_session(
                 has_desktop_wrapper: has_desktop,
             },
         );
+        refresh_file_system_roots(&mut st);
         st.pty_broadcast.clone()
     };
 
@@ -931,7 +1486,8 @@ async fn handle_pty_session(
 
                                                     // Send push notifications (async to avoid blocking PTY)
                                                     let tokens = {
-                                                        let st = state.read().await;
+                                                        let mut st = state.write().await;
+                                                        retain_active_push_tokens(&mut st);
                                                         st.push_tokens.clone()
                                                     };
                                                     let session_id_clone = session_id.clone();
@@ -1080,14 +1636,18 @@ async fn handle_pty_session(
         if st.sessions.remove(&session_id).is_some() {
             st.tmux_viewport_controllers.remove(&session_id);
             clear_mobile_attach_for_session(&mut st, &session_id);
+            refresh_file_system_roots(&mut st);
             // Notify about session end
             let msg = ServerMessage::SessionEnded {
                 session_id: session_id.clone(),
                 exit_code,
             };
             let msg_str = serde_json::to_string(&msg)?;
-            for client in st.mobile_clients.values() {
-                let _ = client.try_send(Message::Text(msg_str.clone()));
+            let active_ids = active_credential_ids_on_disk();
+            for (addr, client) in &st.mobile_clients {
+                if is_mobile_client_active(&st, addr, &active_ids) {
+                    let _ = client.try_send(Message::Text(msg_str.clone()));
+                }
             }
             true
         } else {
@@ -1109,11 +1669,16 @@ async fn handle_pty_session(
 
 /// Validate command name - only allow known safe CLI commands
 fn is_allowed_command(command: &str) -> bool {
+    let path = std::path::Path::new(command);
+    if path.is_absolute() || command.contains('/') || command.contains('\\') {
+        return false;
+    }
     const ALLOWED_COMMANDS: &[&str] = &[
         "claude",
         "codex",
         "gemini",
         "opencode",
+        "shell",
         "bash",
         "zsh",
         "sh",
@@ -1134,6 +1699,36 @@ fn is_allowed_command(command: &str) -> bool {
     ALLOWED_COMMANDS.contains(&base)
 }
 
+fn normalize_mobile_spawn_request(
+    command: &str,
+    args: &[String],
+) -> Result<(String, Vec<String>), Box<dyn std::error::Error + Send + Sync>> {
+    if !args.is_empty() {
+        return Err(
+            "Mobile-spawn arguments are not accepted; choose a supported spawn profile".into(),
+        );
+    }
+    if !is_allowed_command(command) {
+        return Err(format!("Command '{}' is not in the allowed profile list", command).into());
+    }
+    let normalized = match command {
+        "claude" | "codex" | "gemini" | "opencode" => command.to_string(),
+        "shell" | "bash" | "sh" | "zsh" | "fish" | "nu" | "pwsh" | "powershell" => {
+            let default_shell = platform::default_shell();
+            let base = shell_base_name(&default_shell);
+            if is_allowed_command(&base) {
+                base
+            } else if cfg!(windows) {
+                "powershell".to_string()
+            } else {
+                "sh".to_string()
+            }
+        }
+        _ => return Err("Unsupported mobile spawn profile".into()),
+    };
+    Ok((normalized, Vec::new()))
+}
+
 /// Validate that a string is safe for shell interpolation
 /// Rejects newlines, null bytes, and other problematic characters
 fn is_shell_safe(s: &str) -> bool {
@@ -1145,6 +1740,7 @@ fn is_shell_safe(s: &str) -> bool {
 }
 
 /// POSIX-safe single-quote wrapper for shell tokens.
+#[cfg(not(windows))]
 fn shell_quote_posix(s: &str) -> String {
     if s.is_empty() {
         return "''".to_string();
@@ -1170,6 +1766,7 @@ fn shell_base_name(shell: &str) -> String {
         .to_lowercase()
 }
 
+#[cfg(not(windows))]
 fn shell_args_for_command(shell: &str, command: &str) -> Vec<String> {
     let base = shell_base_name(shell);
     let supports_login = matches!(
@@ -1189,12 +1786,14 @@ fn shell_args_for_command(shell: &str, command: &str) -> Vec<String> {
 
 /// Escape a string for embedding inside AppleScript double-quoted literals.
 /// Handles backslashes, double quotes, and strips newlines to prevent injection.
+#[cfg(not(windows))]
 fn escape_for_applescript(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace(['\n', '\r'], " ")
 }
 
+#[cfg(not(windows))]
 fn shell_command_line(shell: &str, args: &[String]) -> String {
     let mut parts = Vec::with_capacity(args.len() + 1);
     parts.push(shell_quote_posix(shell));
@@ -1242,6 +1841,7 @@ fn resolve_mobilecli_bin() -> String {
 }
 
 /// Build the shell command to run inside a terminal emulator.
+#[cfg(not(windows))]
 fn build_wrap_shell_command(
     mobilecli_bin: &str,
     session_name: &str,
@@ -1323,6 +1923,10 @@ async fn spawn_session_from_mobile(
     name: Option<&str>,
     working_dir: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (command, normalized_args) = normalize_mobile_spawn_request(command, args)?;
+    let command = command.as_str();
+    let args = normalized_args.as_slice();
+
     // Security: Validate command is in allowlist
     if !is_allowed_command(command) {
         return Err(format!("Command '{}' is not in the allowed list", command).into());
@@ -1342,7 +1946,7 @@ async fn spawn_session_from_mobile(
             return Err("Name contains unsafe characters".into());
         }
     }
-    if let Some(dir) = working_dir {
+    let effective_working_dir = if let Some(dir) = working_dir {
         if !is_shell_safe(dir) {
             return Err("Working directory contains unsafe characters".into());
         }
@@ -1354,182 +1958,237 @@ async fn spawn_session_from_mobile(
         if !path.is_dir() {
             return Err("Working directory does not exist or is not a directory".into());
         }
-    }
+        if !is_path_within_approved_roots(path) {
+            return Err("Working directory is outside approved filesystem roots".into());
+        }
+        Some(dir.to_string())
+    } else {
+        Some(default_mobile_spawn_working_dir()?)
+    };
+    let effective_working_dir = effective_working_dir.as_deref();
 
     #[cfg(windows)]
     {
-        return spawn_session_windows(command, args, name, working_dir);
+        return spawn_session_windows(command, args, name, effective_working_dir);
     }
 
-    // Try to detect terminal emulator (headless servers won't have one)
-    let terminal = detect_terminal_emulator().ok();
-
-    // Build the command to run inside the terminal
-    let session_name = name.unwrap_or(command);
-    let mobilecli_bin = resolve_mobilecli_bin();
-    let shell_candidate = platform::default_shell();
-    let shell = if std::path::Path::new(&shell_candidate).exists()
-        || which::which(&shell_candidate).is_ok()
+    #[cfg(not(windows))]
     {
-        shell_candidate
-    } else {
-        "/bin/sh".to_string()
-    };
-    // Default to home directory when no working_dir is specified.
-    // Without this, the spawned terminal inherits the daemon's CWD,
-    // which is wherever the daemon was launched from (often the project dir).
-    let home_dir_buf = dirs_next::home_dir();
-    let effective_working_dir: Option<&str> =
-        working_dir.or_else(|| home_dir_buf.as_ref().and_then(|p| p.to_str()));
+        // Try to detect terminal emulator (headless servers won't have one)
+        let terminal = detect_terminal_emulator().ok();
 
-    let wrap_cmd = build_wrap_shell_command(
-        &mobilecli_bin,
-        session_name,
-        command,
-        args,
-        effective_working_dir,
-    );
-    let shell_args = shell_args_for_command(&shell, &wrap_cmd);
+        // Build the command to run inside the terminal
+        let session_name = name.unwrap_or(command);
+        let mobilecli_bin = resolve_mobilecli_bin();
+        let shell_candidate = platform::default_shell();
+        let shell = if std::path::Path::new(&shell_candidate).exists()
+            || which::which(&shell_candidate).is_ok()
+        {
+            shell_candidate
+        } else {
+            "/bin/sh".to_string()
+        };
+        let wrap_cmd = build_wrap_shell_command(
+            &mobilecli_bin,
+            session_name,
+            command,
+            args,
+            effective_working_dir,
+        );
+        let shell_args = shell_args_for_command(&shell, &wrap_cmd);
 
-    let mut cmd = if let Some(ref terminal) = terminal {
-        tracing::info!("Spawning session: {} via {}", wrap_cmd, terminal.name);
+        let mut cmd = if let Some(ref terminal) = terminal {
+            tracing::info!("Spawning session: {} via {}", wrap_cmd, terminal.name);
 
-        // Build terminal command based on detected emulator
-        let mut c = std::process::Command::new(&terminal.binary);
+            // Build terminal command based on detected emulator
+            let mut c = std::process::Command::new(&terminal.binary);
 
-        match terminal.name.as_str() {
-            "kitty" => {
-                c.arg("--").arg(&shell).args(&shell_args);
-            }
-            "alacritty" => {
-                c.arg("-e").arg(&shell).args(&shell_args);
-            }
-            "gnome-terminal" | "tilix" => {
-                c.arg("--").arg(&shell).args(&shell_args);
-            }
-            "konsole" => {
-                // Konsole's -e consumes the rest of the command line
-                // Pass all args as a single coherent command to avoid quote issues
-                let full_cmd = format!("{} {}", shell, shell_args.join(" "));
-                c.arg("-e").arg("/bin/sh").arg("-c").arg(&full_cmd);
-            }
-            "xterm" => {
-                // In headless Xvfb environments, xterm needs explicit geometry
-                // and font settings to render correctly without a real display.
-                // -geometry: Set terminal size (160 columns x 50 rows is generous for modern apps)
-                // -fa: Use a standard monospace font to avoid font rendering issues
-                // -fg/-bg: Explicit foreground/background colors
-                c.args([
-                    "-geometry",
-                    "160x50",
-                    "-fa",
-                    "Monospace",
-                    "-fg",
-                    "white",
-                    "-bg",
-                    "black",
-                    "-e",
-                    &shell,
-                ])
-                .args(&shell_args);
-            }
-            "urxvt" => {
-                c.arg("-e").arg(&shell).args(&shell_args);
-            }
-            "wezterm" => {
-                c.args(["start", "--"]).arg(&shell).args(&shell_args);
-            }
-            "iterm" => {
-                // macOS iTerm2 - use osascript to open a new window
-                let shell_cmd = escape_for_applescript(&shell_command_line(&shell, &shell_args));
-                let script = format!(
-                    r#"tell application "iTerm"
+            match terminal.name.as_str() {
+                "kitty" => {
+                    c.arg("--").arg(&shell).args(&shell_args);
+                }
+                "alacritty" => {
+                    c.arg("-e").arg(&shell).args(&shell_args);
+                }
+                "gnome-terminal" | "tilix" => {
+                    c.arg("--").arg(&shell).args(&shell_args);
+                }
+                "konsole" => {
+                    // Konsole's -e consumes the rest of the command line
+                    // Pass all args as a single coherent command to avoid quote issues
+                    let full_cmd = format!("{} {}", shell, shell_args.join(" "));
+                    c.arg("-e").arg("/bin/sh").arg("-c").arg(&full_cmd);
+                }
+                "xterm" => {
+                    // In headless Xvfb environments, xterm needs explicit geometry
+                    // and font settings to render correctly without a real display.
+                    // -geometry: Set terminal size (160 columns x 50 rows is generous for modern apps)
+                    // -fa: Use a standard monospace font to avoid font rendering issues
+                    // -fg/-bg: Explicit foreground/background colors
+                    c.args([
+                        "-geometry",
+                        "160x50",
+                        "-fa",
+                        "Monospace",
+                        "-fg",
+                        "white",
+                        "-bg",
+                        "black",
+                        "-e",
+                        &shell,
+                    ])
+                    .args(&shell_args);
+                }
+                "urxvt" => {
+                    c.arg("-e").arg(&shell).args(&shell_args);
+                }
+                "wezterm" => {
+                    c.args(["start", "--"]).arg(&shell).args(&shell_args);
+                }
+                "iterm" => {
+                    // macOS iTerm2 - use osascript to open a new window
+                    let shell_cmd =
+                        escape_for_applescript(&shell_command_line(&shell, &shell_args));
+                    let script = format!(
+                        r#"tell application "iTerm"
                         create window with default profile
                         tell current session of current window
                             write text "{shell_cmd}"
                         end tell
                     end tell"#,
-                );
-                c = std::process::Command::new("osascript");
-                c.args(["-e", &script]);
-            }
-            "terminal" => {
-                // macOS Terminal.app
-                let shell_cmd = escape_for_applescript(&shell_command_line(&shell, &shell_args));
-                let script = format!(
-                    r#"tell application "Terminal"
+                    );
+                    c = std::process::Command::new("osascript");
+                    c.args(["-e", &script]);
+                }
+                "terminal" => {
+                    // macOS Terminal.app
+                    let shell_cmd =
+                        escape_for_applescript(&shell_command_line(&shell, &shell_args));
+                    let script = format!(
+                        r#"tell application "Terminal"
                         do script "{shell_cmd}"
                         activate
                     end tell"#,
-                );
-                c = std::process::Command::new("osascript");
-                c.args(["-e", &script]);
+                    );
+                    c = std::process::Command::new("osascript");
+                    c.args(["-e", &script]);
+                }
+                _ => {
+                    // Generic fallback: try -e flag
+                    c.arg("-e").arg(&shell).args(&shell_args);
+                }
             }
-            _ => {
-                // Generic fallback: try -e flag
-                c.arg("-e").arg(&shell).args(&shell_args);
-            }
-        }
-        c
-    } else {
-        // Headless mode: no terminal emulator available.
-        // Use tmux for session management if available, otherwise spawn directly.
-        // The mobilecli pty-wrap command creates its own PTY, so a terminal
-        // window is not required — the mobile app views output via WebSocket.
-        if which::which("tmux").is_ok() {
-            let tmux_name = format!(
-                "mcli-{}",
-                session_name.replace(|ch: char| !ch.is_alphanumeric() && ch != '-', "-")
-            );
-            let shell_cmd = shell_command_line(&shell, &shell_args);
-            tracing::info!("Spawning session headless (tmux): {}", wrap_cmd);
-            let mut c = std::process::Command::new("tmux");
-            c.args(["new-session", "-d", "-s", &tmux_name, &shell_cmd]);
             c
         } else {
-            // Direct spawn: mobilecli pty-wrap creates its own PTY
-            tracing::info!("Spawning session headless (direct): {}", wrap_cmd);
-            let mut c = std::process::Command::new(&shell);
-            c.args(&shell_args);
-            c
+            // Headless mode: no terminal emulator available.
+            // Use tmux for session management if available, otherwise spawn directly.
+            // The mobilecli pty-wrap command creates its own PTY, so a terminal
+            // window is not required — the mobile app views output via WebSocket.
+            if which::which("tmux").is_ok() {
+                let tmux_name = format!(
+                    "mcli-{}",
+                    session_name.replace(|ch: char| !ch.is_alphanumeric() && ch != '-', "-")
+                );
+                let shell_cmd = shell_command_line(&shell, &shell_args);
+                tracing::info!("Spawning session headless (tmux): {}", wrap_cmd);
+                let mut c = std::process::Command::new("tmux");
+                c.args(["new-session", "-d", "-s", &tmux_name, &shell_cmd]);
+                c
+            } else {
+                // Direct spawn: mobilecli pty-wrap creates its own PTY
+                tracing::info!("Spawning session headless (direct): {}", wrap_cmd);
+                let mut c = std::process::Command::new(&shell);
+                c.args(&shell_args);
+                c
+            }
+        };
+
+        // Set working directory (defaults to home dir when not specified by caller)
+        if let Some(dir) = effective_working_dir {
+            cmd.current_dir(dir);
         }
+
+        // Spawn detached
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            unsafe {
+                cmd.pre_exec(|| {
+                    // Create new session to detach from parent
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+
+        Ok(())
+    }
+}
+
+fn is_path_within_approved_roots(path: &std::path::Path) -> bool {
+    let Ok(canonical_path) = path.canonicalize() else {
+        return false;
     };
+    let Some(cfg) = crate::setup::load_config() else {
+        return false;
+    };
+    if cfg.filesystem.whole_home_enabled {
+        if let Some(home) = dirs_next::home_dir().and_then(|p| p.canonicalize().ok()) {
+            if canonical_path.starts_with(home) {
+                return true;
+            }
+        }
+    }
+    cfg.filesystem.allowed_roots.iter().any(|root| {
+        std::path::Path::new(root)
+            .canonicalize()
+            .is_ok_and(|canonical_root| canonical_path.starts_with(canonical_root))
+    })
+}
 
-    // Set working directory (defaults to home dir when not specified by caller)
-    if let Some(dir) = effective_working_dir {
-        cmd.current_dir(dir);
+fn default_mobile_spawn_working_dir() -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let cfg = crate::setup::load_config().ok_or("MobileCLI config is missing")?;
+
+    if let Some(root) = cfg.filesystem.allowed_roots.iter().find_map(|root| {
+        let path = std::path::Path::new(root);
+        if path.is_dir() && is_path_within_approved_roots(path) {
+            path.canonicalize()
+                .ok()
+                .and_then(|p| p.to_str().map(|s| s.to_string()))
+        } else {
+            None
+        }
+    }) {
+        return Ok(root);
     }
 
-    // Spawn detached
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                // Create new session to detach from parent
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+    if cfg.filesystem.whole_home_enabled {
+        if let Some(home) = dirs_next::home_dir().filter(|p| p.is_dir()) {
+            if is_path_within_approved_roots(&home) {
+                return Ok(home.to_string_lossy().to_string());
+            }
         }
     }
 
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-
-    Ok(())
+    Err("Mobile spawn requires an approved working directory".into())
 }
 
 /// Terminal emulator detection result
+#[cfg(not(windows))]
 struct TerminalInfo {
     name: String,
     binary: String,
 }
 
 /// Detect available terminal emulator
+#[cfg(not(windows))]
 fn detect_terminal_emulator() -> Result<TerminalInfo, Box<dyn std::error::Error + Send + Sync>> {
     // Check for common terminal emulators in order of preference
     let terminals = [
@@ -1616,7 +2275,39 @@ async fn process_client_msg(
     >,
     addr: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(scope) = required_scope_for_message(&msg) {
+        if !client_has_scope(state, addr, scope).await {
+            let err = ServerMessage::Error {
+                code: "forbidden".to_string(),
+                message: format!("Credential does not have required scope: {}", scope),
+            };
+            tx.send(Message::Text(serde_json::to_string(&err)?)).await?;
+            return Ok(());
+        }
+    }
+
+    if let Some(session_id) = session_control_target(&msg) {
+        if !client_is_subscribed_to_session(state, addr, session_id).await {
+            let err = ServerMessage::Error {
+                code: "session_not_subscribed".to_string(),
+                message: format!(
+                    "Session control requires an active subscription to session {}",
+                    session_id
+                ),
+            };
+            tx.send(Message::Text(serde_json::to_string(&err)?)).await?;
+            return Ok(());
+        }
+    }
+
     match msg {
+        ClientMessage::AuthStart { .. } | ClientMessage::AuthResponse { .. } => {
+            let err = ServerMessage::Error {
+                code: "already_authenticated".to_string(),
+                message: "Auth messages are only accepted during the handshake".to_string(),
+            };
+            tx.send(Message::Text(serde_json::to_string(&err)?)).await?;
+        }
         ClientMessage::Hello {
             client_version,
             sender_id,
@@ -2426,7 +3117,8 @@ async fn process_client_msg(
                         .unwrap_or_default();
 
                     if !viewport_state.following_live {
-                        if let Some(frame_bytes) = capture_tmux_viewport_simple(socket, name).await {
+                        if let Some(frame_bytes) = capture_tmux_viewport_simple(socket, name).await
+                        {
                             let mut payload = Vec::with_capacity(frame_bytes.len() + 16);
                             payload.extend_from_slice(b"\x1b[2J\x1b[H");
                             payload.extend_from_slice(&frame_bytes);
@@ -2477,15 +3169,19 @@ async fn process_client_msg(
 
                 // Update scroll offset and extract viewport chunk in one write lock.
                 let mut st = state.write().await;
-                let buf_len = st.sessions.get(&session_id)
-                    .map(|s| s.scrollback.len()).unwrap_or(0);
+                let buf_len = st
+                    .sessions
+                    .get(&session_id)
+                    .map(|s| s.scrollback.len())
+                    .unwrap_or(0);
 
                 if buf_len > 0 {
                     let max_offset = buf_len.saturating_sub(page_bytes);
 
                     // Update scroll offset based on action.
                     let current_offset = {
-                        let offset = st.pty_scroll_offsets
+                        let offset = st
+                            .pty_scroll_offsets
                             .entry(session_id.clone())
                             .or_insert(0usize);
                         match action {
@@ -2515,7 +3211,11 @@ async fn process_client_msg(
                     };
 
                     let history_size = buf_len / 80;
-                    let scroll_position = if following_live { 0 } else { current_offset / 80 };
+                    let scroll_position = if following_live {
+                        0
+                    } else {
+                        current_offset / 80
+                    };
                     drop(st);
 
                     // Send viewport frame if scrolled (not following live).
@@ -2604,6 +3304,7 @@ async fn process_client_msg(
                     for views in st.mobile_views.values_mut() {
                         views.remove(&session_id);
                     }
+                    refresh_file_system_roots(&mut st);
                     true
                 } else {
                     false
@@ -2625,8 +3326,11 @@ async fn process_client_msg(
                         exit_code: -1,
                     };
                     let end_str = serde_json::to_string(&end_msg)?;
-                    for client in st.mobile_clients.values() {
-                        let _ = client.try_send(Message::Text(end_str.clone()));
+                    let active_ids = active_credential_ids_on_disk();
+                    for (addr, client) in &st.mobile_clients {
+                        if is_mobile_client_active(&st, addr, &active_ids) {
+                            let _ = client.try_send(Message::Text(end_str.clone()));
+                        }
                     }
                 }
 
@@ -2649,19 +3353,58 @@ async fn process_client_msg(
             platform,
         } => {
             let mut st = state.write().await;
-            // Remove existing token with same value to avoid duplicates
-            st.push_tokens.retain(|t| t.token != token);
+            if !is_valid_push_token(&token_type, &token) {
+                let msg = ServerMessage::Error {
+                    code: "invalid_push_token".to_string(),
+                    message: "Unsupported or malformed push token".to_string(),
+                };
+                tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                return Ok(());
+            }
+            let Some(client) = st.mobile_auth.get(&addr).cloned() else {
+                let msg = ServerMessage::Error {
+                    code: "auth_required".to_string(),
+                    message: "Push token registration requires auth".to_string(),
+                };
+                tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                return Ok(());
+            };
+            // Replace this mobile installation's token and dedupe exact token values.
+            st.push_tokens.retain(|t| {
+                t.token != token
+                    && !(t.credential_id == client.credential_id
+                        && t.mobile_installation_id == client.mobile_installation_id)
+            });
+            let credential_token_count = st
+                .push_tokens
+                .iter()
+                .filter(|t| t.credential_id == client.credential_id)
+                .count();
+            if credential_token_count >= 3 {
+                let msg = ServerMessage::Error {
+                    code: "push_token_limit".to_string(),
+                    message: "Too many push tokens registered for this credential".to_string(),
+                };
+                tx.send(Message::Text(serde_json::to_string(&msg)?)).await?;
+                return Ok(());
+            }
             st.push_tokens.push(PushToken {
                 token: token.clone(),
                 token_type: token_type.clone(),
                 platform: platform.clone(),
+                credential_id: client.credential_id,
+                mobile_installation_id: client.mobile_installation_id,
             });
             tracing::info!("Registered push token ({}/{})", token_type, platform);
         }
         ClientMessage::UnregisterPushToken { token } => {
             let mut st = state.write().await;
+            let Some(client) = st.mobile_auth.get(&addr).cloned() else {
+                return Ok(());
+            };
             let before = st.push_tokens.len();
-            st.push_tokens.retain(|t| t.token != token);
+            st.push_tokens
+                .retain(|t| !(t.token == token && t.credential_id == client.credential_id));
             let after = st.push_tokens.len();
             tracing::info!(
                 "Unregistered push token (removed {})",
@@ -3066,6 +3809,20 @@ async fn process_client_msg(
             path,
             recursive,
         } => {
+            if !destructive_operations_enabled() {
+                send_fs_error(
+                    tx,
+                    request_id,
+                    "delete_path",
+                    &path,
+                    FileSystemError::PermissionDenied {
+                        path: path.clone(),
+                        reason: "Destructive filesystem operations are disabled".to_string(),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
             if let Err(retry_after_ms) = check_fs_rate_limit(state, addr).await {
                 send_fs_error(
                     tx,
@@ -3098,6 +3855,20 @@ async fn process_client_msg(
             old_path,
             new_path,
         } => {
+            if !destructive_operations_enabled() {
+                send_fs_error(
+                    tx,
+                    request_id,
+                    "rename_path",
+                    &old_path,
+                    FileSystemError::PermissionDenied {
+                        path: old_path.clone(),
+                        reason: "Destructive filesystem operations are disabled".to_string(),
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
             if let Err(retry_after_ms) = check_fs_rate_limit(state, addr).await {
                 send_fs_error(
                     tx,
@@ -3205,7 +3976,9 @@ async fn process_client_msg(
                 return Ok(());
             }
             let fs = { state.read().await.file_system.clone() };
-            let max_results = max_results.unwrap_or(fs.config().max_search_results);
+            let max_results = max_results
+                .unwrap_or(fs.config().max_search_results)
+                .min(fs.config().max_search_results);
             match fs
                 .search()
                 .search_files(
@@ -3362,7 +4135,7 @@ async fn process_client_msg(
                 return Ok(());
             }
             let fs = { state.read().await.file_system.clone() };
-            let home = dirs_next::home_dir().or_else(|| fs.config().allowed_roots.first().cloned());
+            let home = fs.config().allowed_roots.first().cloned();
             if let Some(path) = home {
                 let msg = ServerMessage::HomeDirectory {
                     request_id,
@@ -3406,6 +4179,146 @@ async fn process_client_msg(
         }
     }
     Ok(())
+}
+
+fn required_scope_for_message(msg: &ClientMessage) -> Option<&'static str> {
+    match msg {
+        ClientMessage::AuthStart { .. }
+        | ClientMessage::AuthResponse { .. }
+        | ClientMessage::Hello { .. }
+        | ClientMessage::Ping => None,
+        ClientMessage::GetSessions
+        | ClientMessage::Subscribe { .. }
+        | ClientMessage::Unsubscribe { .. }
+        | ClientMessage::GetSessionHistory { .. } => Some(auth::SCOPE_SESSION_READ),
+        ClientMessage::SendInput { .. }
+        | ClientMessage::PtyResize { .. }
+        | ClientMessage::TmuxViewport { .. }
+        | ClientMessage::RenameSession { .. }
+        | ClientMessage::CloseSession { .. }
+        | ClientMessage::ToolApproval { .. } => Some(auth::SCOPE_SESSION_CONTROL),
+        ClientMessage::SpawnSession { .. } => Some(auth::SCOPE_SESSION_SPAWN),
+        ClientMessage::RegisterPushToken { .. } | ClientMessage::UnregisterPushToken { .. } => {
+            Some(auth::SCOPE_PUSH_REGISTER)
+        }
+        ClientMessage::ListDirectory { .. }
+        | ClientMessage::ReadFile { .. }
+        | ClientMessage::ReadFileChunk { .. }
+        | ClientMessage::GetFileInfo { .. }
+        | ClientMessage::SearchFiles { .. }
+        | ClientMessage::GetHomeDirectory { .. }
+        | ClientMessage::GetAllowedRoots { .. } => Some(auth::SCOPE_FS_READ),
+        ClientMessage::WriteFile { .. }
+        | ClientMessage::CreateDirectory { .. }
+        | ClientMessage::RenamePath { .. }
+        | ClientMessage::CopyPath { .. } => Some(auth::SCOPE_FS_WRITE),
+        ClientMessage::DeletePath { .. } => Some(auth::SCOPE_FS_DELETE),
+        ClientMessage::WatchDirectory { .. } | ClientMessage::UnwatchDirectory { .. } => {
+            Some(auth::SCOPE_FS_WATCH)
+        }
+        ClientMessage::UploadFile { .. } => Some(auth::SCOPE_FS_UPLOAD),
+    }
+}
+
+fn session_control_target(msg: &ClientMessage) -> Option<&str> {
+    match msg {
+        ClientMessage::SendInput { session_id, .. }
+        | ClientMessage::PtyResize { session_id, .. }
+        | ClientMessage::TmuxViewport { session_id, .. }
+        | ClientMessage::RenameSession { session_id, .. }
+        | ClientMessage::CloseSession { session_id }
+        | ClientMessage::ToolApproval { session_id, .. } => Some(session_id.as_str()),
+        _ => None,
+    }
+}
+
+async fn client_has_scope(state: &SharedState, addr: SocketAddr, scope: &str) -> bool {
+    let client = state.read().await.mobile_auth.get(&addr).cloned();
+    let Some(client) = client else {
+        return false;
+    };
+    client.has_scope(scope) && is_credential_active_on_disk(&client.credential_id)
+}
+
+async fn client_is_subscribed_to_session(
+    state: &SharedState,
+    addr: SocketAddr,
+    session_id: &str,
+) -> bool {
+    state
+        .read()
+        .await
+        .mobile_views
+        .get(&addr)
+        .is_some_and(|views| views.contains(session_id))
+}
+
+fn is_credential_active_on_disk(credential_id: &str) -> bool {
+    crate::setup::load_config().is_some_and(|cfg| {
+        cfg.credentials
+            .iter()
+            .any(|credential| credential.credential_id == credential_id && credential.is_active())
+    })
+}
+
+fn retain_active_push_tokens(st: &mut DaemonState) {
+    let Some(cfg) = crate::setup::load_config() else {
+        st.push_tokens.clear();
+        return;
+    };
+    let active_ids: BTreeSet<String> = cfg
+        .credentials
+        .iter()
+        .filter(|credential| credential.is_active())
+        .map(|credential| credential.credential_id.clone())
+        .collect();
+    st.push_tokens
+        .retain(|token| active_ids.contains(&token.credential_id));
+}
+
+fn active_credential_ids_on_disk() -> BTreeSet<String> {
+    crate::setup::load_config()
+        .map(|cfg| {
+            cfg.credentials
+                .iter()
+                .filter(|credential| credential.is_active())
+                .map(|credential| credential.credential_id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn is_mobile_client_active(
+    st: &DaemonState,
+    addr: &SocketAddr,
+    active_ids: &BTreeSet<String>,
+) -> bool {
+    st.mobile_auth
+        .get(addr)
+        .is_some_and(|client| active_ids.contains(&client.credential_id))
+}
+
+fn is_valid_push_token(token_type: &str, token: &str) -> bool {
+    let token = token.trim();
+    if token.is_empty() || token.len() > 4096 || token.chars().any(char::is_whitespace) {
+        return false;
+    }
+    match token_type {
+        "expo" => {
+            ((token.starts_with("ExponentPushToken[") && token.ends_with(']'))
+                || (token.starts_with("ExpoPushToken[") && token.ends_with(']')))
+                && token.len() <= 256
+        }
+        "apns" => token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit()),
+        "fcm" => token.len() >= 20,
+        _ => false,
+    }
+}
+
+fn destructive_operations_enabled() -> bool {
+    crate::setup::load_config()
+        .map(|cfg| cfg.filesystem.destructive_operations)
+        .unwrap_or(false)
 }
 
 async fn send_fs_error(
@@ -3630,8 +4543,11 @@ async fn broadcast_sessions_update(state: &SharedState) {
         .collect();
     let msg = ServerMessage::Sessions { sessions: items };
     if let Ok(msg_str) = serde_json::to_string(&msg) {
-        for client in st.mobile_clients.values() {
-            let _ = client.try_send(Message::Text(msg_str.clone()));
+        let active_ids = active_credential_ids_on_disk();
+        for (addr, client) in &st.mobile_clients {
+            if is_mobile_client_active(&st, addr, &active_ids) {
+                let _ = client.try_send(Message::Text(msg_str.clone()));
+            }
         }
     }
 }
@@ -3679,8 +4595,11 @@ async fn broadcast_waiting_for_input(state: &SharedState, session_id: &str) {
         cli_type: session.cli_tracker.current().as_str().to_string(),
     };
     if let Ok(msg_str) = serde_json::to_string(&msg) {
-        for client in st.mobile_clients.values() {
-            let _ = client.try_send(Message::Text(msg_str.clone()));
+        let active_ids = active_credential_ids_on_disk();
+        for (addr, client) in &st.mobile_clients {
+            if is_mobile_client_active(&st, addr, &active_ids) {
+                let _ = client.try_send(Message::Text(msg_str.clone()));
+            }
         }
     }
 }
@@ -3693,8 +4612,11 @@ async fn broadcast_waiting_cleared(state: &SharedState, session_id: &str) {
         timestamp: Utc::now().to_rfc3339(),
     };
     if let Ok(msg_str) = serde_json::to_string(&msg) {
-        for client in st.mobile_clients.values() {
-            let _ = client.try_send(Message::Text(msg_str.clone()));
+        let active_ids = active_credential_ids_on_disk();
+        for (addr, client) in &st.mobile_clients {
+            if is_mobile_client_active(&st, addr, &active_ids) {
+                let _ = client.try_send(Message::Text(msg_str.clone()));
+            }
         }
     }
 }
@@ -3719,15 +4641,8 @@ async fn broadcast_pty_resized(
 
     let ack_clients: Vec<mpsc::Sender<Message>> = {
         let st = state.read().await;
-        st.mobile_views
-            .iter()
-            .filter_map(|(addr, views)| {
-                if !views.contains(session_id) {
-                    return None;
-                }
-                st.mobile_clients.get(addr).cloned()
-            })
-            .collect()
+        let active_ids = active_credential_ids_on_disk();
+        pty_resized_ack_clients(&st, session_id, &active_ids)
     };
 
     tracing::debug!(
@@ -3743,6 +4658,25 @@ async fn broadcast_pty_resized(
     for client in ack_clients {
         let _ = client.try_send(Message::Text(msg_str.clone()));
     }
+}
+
+fn pty_resized_ack_clients(
+    st: &DaemonState,
+    session_id: &str,
+    active_ids: &BTreeSet<String>,
+) -> Vec<mpsc::Sender<Message>> {
+    st.mobile_views
+        .iter()
+        .filter_map(|(addr, views)| {
+            if !views.contains(session_id) {
+                return None;
+            }
+            if !is_mobile_client_active(st, addr, active_ids) {
+                return None;
+            }
+            st.mobile_clients.get(addr).cloned()
+        })
+        .collect()
 }
 
 /// Send current waiting states to a newly connected mobile client.
@@ -4390,6 +5324,7 @@ async fn cleanup_client_state(state: &SharedState, addr: SocketAddr) {
             st.mobile_sender_addrs.remove(&sender_id);
         }
         st.mobile_client_capabilities.remove(&addr);
+        st.mobile_auth.remove(&addr);
         st.mobile_attach_ids.remove(&addr);
 
         let (sessions_to_restore, sessions_detached) = match st.mobile_views.remove(&addr) {
@@ -4551,25 +5486,413 @@ async fn send_push_notifications(tokens: &[PushToken], title: &str, body: &str, 
 #[cfg(test)]
 mod tests {
     use super::{
-        broadcast_pty_resized, build_upload_destination_path, capture_tmux_history,
-        clear_mobile_attach_for_session, is_noop_resize, is_stale_resize_epoch,
-        is_windows_reserved_device_name, resolve_resize_reason, sanitize_upload_file_name,
-        should_ignore_resize_without_viewers, should_ignore_restore_resize,
+        active_credential_index, build_upload_destination_path, capture_tmux_history,
+        clear_mobile_attach_for_session, file_system_config_from_setup_and_projects,
+        is_noop_resize, is_safe_session_project_root, is_stale_resize_epoch, is_valid_push_token,
+        is_windows_reserved_device_name, normalize_mobile_spawn_request, parse_auth_start_request,
+        pty_resized_ack_clients, resolve_resize_reason, sanitize_upload_file_name,
+        session_control_target, should_ignore_resize_without_viewers, should_ignore_restore_resize,
         should_mobile_enter_alt_screen, should_treat_as_tui_for_mobile, should_use_attach_v2,
         strip_terminal_report_sequences, strip_terminal_report_sequences_stateful,
-        update_alt_screen_state, AttachProtocolMode, DaemonState, OverhaulFlags, PtyResizeReason,
-        CLIENT_CAP_ATTACH_V2, DEFAULT_SCROLLBACK_MAX_BYTES, MAX_UPLOAD_FILE_NAME_BYTES,
+        update_alt_screen_state, validate_auth_response_text, validate_pty_registration_with_token,
+        AttachProtocolMode, AuthStartRequest, AuthenticatedClient, ClientMessage, DaemonState,
+        OverhaulFlags, PtyResizeReason, TmuxViewportAction, CLIENT_CAP_ATTACH_V2,
+        DEFAULT_SCROLLBACK_MAX_BYTES, MAX_UPLOAD_FILE_NAME_BYTES,
     };
-    use std::sync::Arc;
+    use crate::{auth, setup::Config};
+    use std::collections::BTreeSet;
     use tempfile::TempDir;
-    use tokio::sync::{mpsc, RwLock};
-    use tokio::time::{timeout, Duration};
+    use tokio::time::Duration;
     use tokio_tungstenite::tungstenite::Message;
+
+    fn test_config_with_credential() -> (Config, auth::PairingCredential) {
+        let mut cfg = Config {
+            server_id: "server-id".to_string(),
+            ..Config::default()
+        };
+        let pairing = cfg.create_pairing_credential("test phone");
+        (cfg, pairing)
+    }
+
+    fn auth_start_message(credential_id: &str, auth_version: u8) -> String {
+        serde_json::to_string(&ClientMessage::AuthStart {
+            auth_version,
+            credential_id: credential_id.to_string(),
+            client_nonce: "client-nonce".to_string(),
+            mobile_installation_id: "mobile-installation".to_string(),
+            sender_id: Some("sender-id".to_string()),
+            client_version: "mobile-test".to_string(),
+            client_capabilities: Some(7),
+        })
+        .expect("auth start json")
+    }
+
+    fn auth_start_request(credential_id: &str) -> AuthStartRequest {
+        AuthStartRequest {
+            credential_id: credential_id.to_string(),
+            client_nonce: "client-nonce".to_string(),
+            mobile_installation_id: "mobile-installation".to_string(),
+            sender_id: Some("sender-id".to_string()),
+            client_version: "mobile-test".to_string(),
+            client_capabilities: Some(7),
+        }
+    }
+
+    fn auth_response_message(
+        cfg: &Config,
+        credential: &auth::AuthCredential,
+        start: &AuthStartRequest,
+        server_nonce: &str,
+    ) -> String {
+        let transcript = auth::build_auth_transcript(
+            &cfg.server_id,
+            &start.credential_id,
+            &start.client_nonce,
+            server_nonce,
+            &start.mobile_installation_id,
+        );
+        let proof =
+            auth::proof_from_verifier(&credential.verifier, &transcript).expect("valid proof");
+        serde_json::to_string(&ClientMessage::AuthResponse {
+            credential_id: start.credential_id.clone(),
+            client_nonce: start.client_nonce.clone(),
+            server_nonce: server_nonce.to_string(),
+            mobile_installation_id: start.mobile_installation_id.clone(),
+            proof,
+        })
+        .expect("auth response json")
+    }
+
+    #[test]
+    fn auth_start_rejects_legacy_or_malformed_first_messages() {
+        let legacy_hello = serde_json::json!({
+            "type": "hello",
+            "client_version": "legacy"
+        })
+        .to_string();
+        assert_eq!(
+            parse_auth_start_request(&legacy_hello).unwrap_err().code,
+            "auth_required"
+        );
+
+        assert_eq!(
+            parse_auth_start_request("not-json").unwrap_err().code,
+            "auth_required"
+        );
+    }
+
+    #[test]
+    fn auth_start_rejects_unsupported_versions_before_config_lookup() {
+        let (cfg, _) = test_config_with_credential();
+        let start = auth_start_message(&cfg.credentials[0].credential_id, auth::AUTH_VERSION - 1);
+
+        let failure = parse_auth_start_request(&start).unwrap_err();
+
+        assert_eq!(failure.code, "auth_unsupported");
+    }
+
+    #[test]
+    fn auth_start_accepts_auth_v2_fields() {
+        let (cfg, _) = test_config_with_credential();
+        let start = parse_auth_start_request(&auth_start_message(
+            &cfg.credentials[0].credential_id,
+            auth::AUTH_VERSION,
+        ))
+        .expect("auth start");
+
+        assert_eq!(start.credential_id, cfg.credentials[0].credential_id);
+        assert_eq!(start.client_nonce, "client-nonce");
+        assert_eq!(start.mobile_installation_id, "mobile-installation");
+        assert_eq!(start.sender_id.as_deref(), Some("sender-id"));
+        assert_eq!(start.client_version, "mobile-test");
+        assert_eq!(start.client_capabilities, Some(7));
+    }
+
+    #[test]
+    fn active_credential_lookup_rejects_unknown_and_revoked_credentials() {
+        let (mut cfg, pairing) = test_config_with_credential();
+        assert_eq!(
+            active_credential_index(&cfg, &pairing.credential.credential_id),
+            Ok(0)
+        );
+
+        assert_eq!(
+            active_credential_index(&cfg, "missing").unwrap_err().code,
+            "auth_invalid"
+        );
+
+        cfg.credentials[0].revoke();
+        assert_eq!(
+            active_credential_index(&cfg, &pairing.credential.credential_id)
+                .unwrap_err()
+                .code,
+            "auth_invalid"
+        );
+    }
+
+    #[test]
+    fn auth_response_rejects_transcript_mismatch() {
+        let (cfg, pairing) = test_config_with_credential();
+        let mut start = auth_start_request(&pairing.credential.credential_id);
+        let response = auth_response_message(&cfg, &pairing.credential, &start, "server-nonce");
+        start.client_nonce = "different-client-nonce".to_string();
+
+        let failure = validate_auth_response_text(
+            &response,
+            &cfg,
+            &pairing.credential,
+            &start,
+            "server-nonce",
+        )
+        .unwrap_err();
+
+        assert_eq!(failure.code, "auth_invalid");
+        assert_eq!(failure.message, "Auth response transcript mismatch");
+    }
+
+    #[test]
+    fn auth_response_rejects_invalid_proof() {
+        let (cfg, pairing) = test_config_with_credential();
+        let start = auth_start_request(&pairing.credential.credential_id);
+        let response = serde_json::to_string(&ClientMessage::AuthResponse {
+            credential_id: start.credential_id.clone(),
+            client_nonce: start.client_nonce.clone(),
+            server_nonce: "server-nonce".to_string(),
+            mobile_installation_id: start.mobile_installation_id.clone(),
+            proof: "not-a-valid-proof".to_string(),
+        })
+        .expect("auth response json");
+
+        let failure = validate_auth_response_text(
+            &response,
+            &cfg,
+            &pairing.credential,
+            &start,
+            "server-nonce",
+        )
+        .unwrap_err();
+
+        assert_eq!(failure.code, "auth_invalid");
+        assert_eq!(failure.message, "Invalid mobile credential proof");
+    }
+
+    #[test]
+    fn auth_response_accepts_bound_proof_and_preserves_client_identity() {
+        let (cfg, pairing) = test_config_with_credential();
+        let start = auth_start_request(&pairing.credential.credential_id);
+        let response = auth_response_message(&cfg, &pairing.credential, &start, "server-nonce");
+
+        let client = validate_auth_response_text(
+            &response,
+            &cfg,
+            &pairing.credential,
+            &start,
+            "server-nonce",
+        )
+        .expect("authenticated client");
+
+        assert_eq!(client.credential_id, pairing.credential.credential_id);
+        assert_eq!(client.mobile_installation_id, "mobile-installation");
+        assert_eq!(client.sender_id.as_deref(), Some("sender-id"));
+        assert_eq!(client.client_version, "mobile-test");
+        assert_eq!(client.client_capabilities, Some(7));
+        assert_eq!(client.scopes, pairing.credential.scopes);
+    }
+
+    fn pty_registration_message(token: &str) -> serde_json::Value {
+        let session_id = "session-1";
+        let name = "Claude";
+        let command = "claude";
+        let project_path = "/tmp/project";
+        let runtime = "pty";
+        let desktop = true;
+        let transcript = auth::build_pty_registration_transcript(
+            session_id,
+            name,
+            command,
+            project_path,
+            runtime,
+            desktop,
+        );
+        let proof = auth::local_pty_proof_from_token(token, &transcript);
+        serde_json::json!({
+            "type": "register_pty",
+            "pty_auth_version": auth::LOCAL_PTY_AUTH_VERSION,
+            "pty_proof": proof,
+            "session_id": session_id,
+            "name": name,
+            "command": command,
+            "project_path": project_path,
+            "runtime": runtime,
+            "desktop": desktop,
+        })
+    }
+
+    #[test]
+    fn pty_registration_requires_auth_fields() {
+        let token = auth::generate_nonce();
+        let mut msg = pty_registration_message(&token);
+
+        msg.as_object_mut()
+            .expect("object")
+            .remove("pty_auth_version");
+        assert_eq!(
+            validate_pty_registration_with_token(&msg, &token),
+            Err("missing_version")
+        );
+
+        let mut msg = pty_registration_message(&token);
+        msg.as_object_mut().expect("object").remove("pty_proof");
+        assert_eq!(
+            validate_pty_registration_with_token(&msg, &token),
+            Err("missing_proof")
+        );
+    }
+
+    #[test]
+    fn pty_registration_rejects_bad_or_tampered_proofs() {
+        let token = auth::generate_nonce();
+        let mut msg = pty_registration_message(&token);
+        msg["pty_proof"] = serde_json::Value::String("bad-proof".to_string());
+        assert_eq!(
+            validate_pty_registration_with_token(&msg, &token),
+            Err("invalid_proof")
+        );
+
+        let mut msg = pty_registration_message(&token);
+        msg["project_path"] = serde_json::Value::String("/".to_string());
+        assert_eq!(
+            validate_pty_registration_with_token(&msg, &token),
+            Err("invalid_proof")
+        );
+    }
+
+    #[test]
+    fn pty_registration_accepts_bound_local_proof() {
+        let token = auth::generate_nonce();
+        let msg = pty_registration_message(&token);
+
+        assert_eq!(validate_pty_registration_with_token(&msg, &token), Ok(()));
+    }
+
+    #[test]
+    fn session_project_roots_reject_home_and_filesystem_root_by_default() {
+        let cfg = Config::default();
+        let temp = TempDir::new().expect("tempdir");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).expect("project dir");
+
+        assert!(is_safe_session_project_root(
+            &cfg,
+            &project.to_string_lossy()
+        ));
+
+        let root = project
+            .ancestors()
+            .last()
+            .expect("filesystem root")
+            .to_path_buf();
+        assert!(!is_safe_session_project_root(&cfg, &root.to_string_lossy()));
+
+        if let Some(home) = dirs_next::home_dir().filter(|p| p.is_dir()) {
+            assert!(!is_safe_session_project_root(&cfg, &home.to_string_lossy()));
+        }
+    }
+
+    #[test]
+    fn filesystem_roots_include_safe_session_projects_only() {
+        let mut cfg = Config::default();
+        cfg.filesystem.allowed_roots = Vec::new();
+        cfg.filesystem.whole_home_enabled = false;
+
+        let temp = TempDir::new().expect("tempdir");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).expect("project dir");
+        let root = project
+            .ancestors()
+            .last()
+            .expect("filesystem root")
+            .to_string_lossy()
+            .to_string();
+        let project = project.to_string_lossy().to_string();
+        let paths = [root, project.clone()];
+
+        let fs_config = file_system_config_from_setup_and_projects(&cfg, paths.iter());
+
+        assert_eq!(fs_config.allowed_roots.len(), 1);
+        assert_eq!(
+            fs_config.allowed_roots[0],
+            std::path::PathBuf::from(project)
+        );
+    }
 
     #[test]
     fn default_scrollback_is_large_enough_for_frame_clis() {
-        assert_eq!(DEFAULT_SCROLLBACK_MAX_BYTES, 8 * 1024 * 1024);
-        assert!(DEFAULT_SCROLLBACK_MAX_BYTES > 64 * 1024);
+        let default_scrollback = DEFAULT_SCROLLBACK_MAX_BYTES;
+        assert_eq!(default_scrollback, 8 * 1024 * 1024);
+        assert!(default_scrollback > 64 * 1024);
+    }
+
+    #[test]
+    fn session_control_target_only_marks_mutating_session_messages() {
+        assert_eq!(
+            session_control_target(&ClientMessage::SendInput {
+                session_id: "s1".to_string(),
+                text: "x".to_string(),
+                raw: false,
+                client_msg_id: None,
+            }),
+            Some("s1")
+        );
+        assert_eq!(
+            session_control_target(&ClientMessage::PtyResize {
+                session_id: "s2".to_string(),
+                cols: 80,
+                rows: 24,
+                epoch: None,
+                reason: Some(PtyResizeReason::AttachInit),
+            }),
+            Some("s2")
+        );
+        assert_eq!(
+            session_control_target(&ClientMessage::TmuxViewport {
+                session_id: "s3".to_string(),
+                action: TmuxViewportAction::Follow,
+                count: None,
+            }),
+            Some("s3")
+        );
+        assert_eq!(session_control_target(&ClientMessage::GetSessions), None);
+        assert_eq!(
+            session_control_target(&ClientMessage::GetSessionHistory {
+                session_id: "s4".to_string(),
+                max_bytes: None,
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn push_token_validation_is_format_aware() {
+        assert!(is_valid_push_token(
+            "expo",
+            "ExponentPushToken[abcdefghijklmnopqrstuvwxyz]"
+        ));
+        assert!(is_valid_push_token(
+            "expo",
+            "ExpoPushToken[abcdefghijklmnopqrstuvwxyz]"
+        ));
+        assert!(is_valid_push_token(
+            "apns",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
+        assert!(is_valid_push_token("fcm", "abc123abc123abc123abc123"));
+
+        assert!(!is_valid_push_token("expo", "plain-token"));
+        assert!(!is_valid_push_token("apns", "not-hex"));
+        assert!(!is_valid_push_token("fcm", "short"));
+        assert!(!is_valid_push_token("unknown", "ExpoPushToken[abc]"));
+        assert!(!is_valid_push_token("expo", "ExpoPushToken[has space]"));
     }
 
     #[test]
@@ -4736,6 +6059,27 @@ mod tests {
         assert!(components.contains(&"uploads".to_string()));
         let last = components.last().map(String::as_str).unwrap_or_default();
         assert!(last.ends_with("-image.png"));
+    }
+
+    #[test]
+    fn mobile_spawn_rejects_paths_and_interpreter_args() {
+        assert!(normalize_mobile_spawn_request("/tmp/bash", &[]).is_err());
+        assert!(normalize_mobile_spawn_request("bash", &["-c".to_string()]).is_err());
+        assert!(normalize_mobile_spawn_request("python", &["-c".to_string()]).is_err());
+        assert!(normalize_mobile_spawn_request("node", &["-e".to_string()]).is_err());
+        assert!(normalize_mobile_spawn_request("powershell", &["-Command".to_string()]).is_err());
+    }
+
+    #[test]
+    fn mobile_spawn_allows_supported_profiles_without_client_args() {
+        assert_eq!(
+            normalize_mobile_spawn_request("claude", &[]).expect("claude profile"),
+            ("claude".to_string(), Vec::<String>::new())
+        );
+        assert_eq!(
+            normalize_mobile_spawn_request("codex", &[]).expect("codex profile"),
+            ("codex".to_string(), Vec::<String>::new())
+        );
     }
 
     #[tokio::test]
@@ -4923,68 +6267,76 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn pty_resized_broadcasts_ack_only() {
-        let state = Arc::new(RwLock::new(DaemonState::new(9847)));
-        let addr: std::net::SocketAddr = "127.0.0.1:40001".parse().expect("socket addr");
+    #[test]
+    fn pty_resize_ack_targets_active_viewers_only() {
+        let mut state = DaemonState::new(9847);
+        let active_addr: std::net::SocketAddr =
+            "127.0.0.1:40001".parse().expect("active socket addr");
+        let revoked_addr: std::net::SocketAddr =
+            "127.0.0.1:40002".parse().expect("revoked socket addr");
+        let idle_addr: std::net::SocketAddr = "127.0.0.1:40003".parse().expect("idle socket addr");
         let session_id = "test-session".to_string();
 
-        let (client_tx, mut client_rx) = mpsc::channel::<Message>(32);
+        let (active_tx, mut active_rx) = tokio::sync::mpsc::channel::<Message>(8);
+        let (revoked_tx, mut revoked_rx) = tokio::sync::mpsc::channel::<Message>(8);
+        let (idle_tx, mut idle_rx) = tokio::sync::mpsc::channel::<Message>(8);
 
-        {
-            let mut st = state.write().await;
-            st.mobile_clients.insert(addr, client_tx);
-            st.mobile_views
-                .entry(addr)
-                .or_default()
-                .insert(session_id.clone());
-            st.session_view_counts.insert(session_id.clone(), 1);
-        }
+        state.mobile_clients.insert(active_addr, active_tx);
+        state.mobile_clients.insert(revoked_addr, revoked_tx);
+        state.mobile_clients.insert(idle_addr, idle_tx);
+        state
+            .mobile_views
+            .entry(active_addr)
+            .or_default()
+            .insert(session_id.clone());
+        state
+            .mobile_views
+            .entry(revoked_addr)
+            .or_default()
+            .insert(session_id.clone());
+        state.mobile_auth.insert(
+            active_addr,
+            AuthenticatedClient {
+                credential_id: "active-credential".to_string(),
+                mobile_installation_id: "mobile-a".to_string(),
+                sender_id: None,
+                client_version: "test".to_string(),
+                client_capabilities: None,
+                scopes: vec![],
+            },
+        );
+        state.mobile_auth.insert(
+            revoked_addr,
+            AuthenticatedClient {
+                credential_id: "revoked-credential".to_string(),
+                mobile_installation_id: "mobile-b".to_string(),
+                sender_id: None,
+                client_version: "test".to_string(),
+                client_capabilities: None,
+                scopes: vec![],
+            },
+        );
+        state.mobile_auth.insert(
+            idle_addr,
+            AuthenticatedClient {
+                credential_id: "active-credential".to_string(),
+                mobile_installation_id: "mobile-c".to_string(),
+                sender_id: None,
+                client_version: "test".to_string(),
+                client_capabilities: None,
+                scopes: vec![],
+            },
+        );
 
-        broadcast_pty_resized(&state, &session_id, 95, 27, Some(1)).await;
+        let active_ids = BTreeSet::from(["active-credential".to_string()]);
+        let clients = pty_resized_ack_clients(&state, &session_id, &active_ids);
+        assert_eq!(clients.len(), 1);
 
-        let mut first_ack = 0usize;
-        let mut first_replay = 0usize;
-        loop {
-            match timeout(Duration::from_millis(50), client_rx.recv()).await {
-                Ok(Some(Message::Text(text))) => {
-                    let msg: serde_json::Value =
-                        serde_json::from_str(text.as_ref()).expect("valid json");
-                    match msg.get("type").and_then(|t| t.as_str()) {
-                        Some("pty_resized") => first_ack += 1,
-                        Some("pty_bytes") => first_replay += 1,
-                        _ => {}
-                    }
-                }
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => break,
-            }
-        }
-
-        assert_eq!(first_ack, 1);
-        assert_eq!(first_replay, 0);
-
-        broadcast_pty_resized(&state, &session_id, 96, 27, Some(2)).await;
-
-        let mut second_ack = 0usize;
-        let mut second_replay = 0usize;
-        loop {
-            match timeout(Duration::from_millis(50), client_rx.recv()).await {
-                Ok(Some(Message::Text(text))) => {
-                    let msg: serde_json::Value =
-                        serde_json::from_str(text.as_ref()).expect("valid json");
-                    match msg.get("type").and_then(|t| t.as_str()) {
-                        Some("pty_resized") => second_ack += 1,
-                        Some("pty_bytes") => second_replay += 1,
-                        _ => {}
-                    }
-                }
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => break,
-            }
-        }
-
-        assert_eq!(second_ack, 1);
-        assert_eq!(second_replay, 0);
+        clients[0]
+            .try_send(Message::Text("ack".into()))
+            .expect("send ack");
+        assert!(active_rx.try_recv().is_ok());
+        assert!(revoked_rx.try_recv().is_err());
+        assert!(idle_rx.try_recv().is_err());
     }
 }
