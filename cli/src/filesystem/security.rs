@@ -122,15 +122,22 @@ impl PathValidator {
         let relative = path
             .strip_prefix(&existing_ancestor)
             .unwrap_or_else(|_| Path::new(""));
-        // When the full target path already exists, `relative` is empty. Joining an empty
-        // segment can append a trailing slash on file paths (`/file/`) which later causes
-        // ENOTDIR on write/rename operations. Keep the canonical path as-is in that case.
+        // Preserve the caller's absolute path for the actual operation. On Windows,
+        // canonicalize() can rewrite paths to 8.3 short names (for example RUNNER~1),
+        // which breaks user-configured glob patterns that use the normal spelling.
+        // The canonical ancestor is still used for jail enforcement above.
         let resolved = if relative.as_os_str().is_empty() {
+            existing_ancestor.clone()
+        } else {
+            existing_ancestor.join(relative)
+        };
+        let canonical_resolved = if relative.as_os_str().is_empty() {
             canonical_ancestor.clone()
         } else {
             canonical_ancestor.join(relative)
         };
 
+        self.ensure_not_denied(&canonical_resolved)?;
         self.ensure_not_denied(&resolved)?;
 
         Ok(resolved)

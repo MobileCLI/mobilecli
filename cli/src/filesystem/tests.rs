@@ -122,7 +122,7 @@ async fn test_write_file_fails_when_parent_is_file() {
     assert!(result.is_err());
     match result.unwrap_err() {
         crate::protocol::FileSystemError::NotADirectory { path } => {
-            assert_eq!(path, file_path.to_string_lossy());
+            assert_eq!(path, super::path_utils::to_protocol_path(&file_path));
         }
         e => panic!("Expected NotADirectory error, got: {:?}", e),
     }
