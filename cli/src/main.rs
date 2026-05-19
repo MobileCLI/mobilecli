@@ -130,12 +130,19 @@ async fn main() -> ExitCode {
         colored::control::set_virtual_terminal(true).ok();
     }
 
-    // Initialize tracing
+    // Initialize tracing.
+    //
+    // Default to warn so the foreground UX (bare `mobilecli`, `mobilecli claude`,
+    // etc.) does not flash a wall of info-level logs at session start that then
+    // get wiped by tmux's alternate screen. Operators can opt back into verbose
+    // logs with `RUST_LOG=mobilecli=info` or `RUST_LOG=mobilecli=debug`. The
+    // background daemon process inherits this default but its own stderr is
+    // redirected to ~/.mobilecli/daemon.log, so its log volume is unchanged from
+    // the user's perspective.
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("mobilecli=warn"));
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("mobilecli=info".parse().unwrap()),
-        )
+        .with_env_filter(env_filter)
         .with_target(false)
         .init();
 
@@ -253,7 +260,8 @@ async fn main() -> ExitCode {
     }
 
     // Determine what command to run
-    let (command, args) = if run_args.args.is_empty() {
+    let bare_invocation = run_args.args.is_empty();
+    let (command, args) = if bare_invocation {
         // Use cross-platform shell detection
         let shell = platform::default_shell();
         (shell, vec![])
@@ -262,6 +270,24 @@ async fn main() -> ExitCode {
         let command = args.remove(0);
         (command, args)
     };
+
+    // For bare `mobilecli` invocations from an interactive terminal, surface a
+    // one-line discoverability hint pointing at `mobilecli help`. The hint is
+    // printed before the session starts and is intentionally short so it does
+    // not crowd the "Connected!" banner that follows from pty_wrapper.
+    if bare_invocation && !run_args.quiet {
+        use std::io::IsTerminal;
+        if std::io::stdout().is_terminal() {
+            println!(
+                "{} Tip: run {} to see commands like {}, {}, {}.",
+                "→".dimmed(),
+                "`mobilecli help`".cyan(),
+                "claude".cyan(),
+                "codex".cyan(),
+                "pair".cyan()
+            );
+        }
+    }
 
     // Generate session name
     let session_name = run_args.session_name.unwrap_or_else(|| {

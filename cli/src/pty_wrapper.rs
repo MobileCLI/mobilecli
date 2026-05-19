@@ -184,6 +184,27 @@ fn request_terminal_resize(cols: u16, rows: u16) {
     set_stdout_winsize(cols, rows);
 }
 
+/// Set the host terminal window title via OSC 0. Pass an empty string to clear.
+///
+/// Skipped when stdout is not a TTY to avoid leaking escape sequences into
+/// pipes/logs. OSC 0 (`\x1b]0;<title>\x07`) sets both the icon name and the
+/// window title and is supported by every mainstream terminal emulator we
+/// target. Title characters that could themselves terminate the sequence (BEL,
+/// ESC, control bytes) are stripped to avoid corrupting downstream output.
+fn set_host_terminal_title(title: &str) {
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    let sanitized: String = title
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(120)
+        .collect();
+    let mut stdout = std::io::stdout();
+    let _ = write!(stdout, "\x1b]0;{}\x07", sanitized);
+    let _ = stdout.flush();
+}
+
 fn tmux_base_command(socket_name: &str) -> Command {
     let mut cmd = Command::new("tmux");
     // Use platform-appropriate null device
@@ -654,6 +675,14 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
             format!("[runtime:{}]", runtime_mode.as_str()).dimmed()
         );
     }
+
+    // Set the host terminal window title to advertise the linked state.
+    // OSC 0 sets both icon name and window title; survives tmux alt-screen
+    // because tmux's `set-titles` defaults to off (and we leave it off), so
+    // the host emulator retains whatever title was last set on its stdout.
+    // The next shell prompt after session end (or our explicit reset below)
+    // restores a normal title.
+    set_host_terminal_title(&format!("📱 MobileCLI · {}", config.session_name));
 
     // Create PTY
     let pty_system = native_pty_system();
@@ -1176,6 +1205,11 @@ pub async fn run_wrapped(config: WrapConfig) -> Result<i32, WrapError> {
     // left by TUI applications that may not have exited cleanly.
     print!("\x1bc");
     let _ = std::io::Write::flush(&mut std::io::stdout());
+
+    // Clear the MobileCLI window title set at session start. We emit an empty
+    // OSC 0 string; the next shell prompt (PROMPT_COMMAND/precmd) will set a
+    // normal title on its own.
+    set_host_terminal_title("");
 
     // Print exit message
     println!();
