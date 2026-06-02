@@ -200,6 +200,6 @@ install() {
 
 # Run installation when executed directly. Tests can source this file to exercise
 # checksum helpers without downloading or installing.
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
     install
 fi
