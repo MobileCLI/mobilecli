@@ -35,10 +35,7 @@ pub fn run(args: UninstallArgs) -> Result<(), Box<dyn std::error::Error>> {
     let config_dir = platform::config_dir();
     let binary = std::env::current_exe().ok();
 
-    println!(
-        "{}",
-        "This will remove MobileCLI from your system:".bold()
-    );
+    println!("{}", "This will remove MobileCLI from your system:".bold());
     println!("  • Stop the background daemon");
     println!("  • Remove daemon autostart (login service)");
     println!("  • Remove the shell auto-launch hook from your shell config");
@@ -51,7 +48,10 @@ pub fn run(args: UninstallArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     if !args.keep_binary {
         if let Some(ref exe) = binary {
-            println!("  • Remove the binary at {}", exe.display().to_string().cyan());
+            println!(
+                "  • Remove the binary at {}",
+                exe.display().to_string().cyan()
+            );
         }
     }
     println!();
@@ -115,7 +115,10 @@ pub fn run(args: UninstallArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!();
-    println!("{}", "MobileCLI has been uninstalled. Thanks for trying it!".green());
+    println!(
+        "{}",
+        "MobileCLI has been uninstalled. Thanks for trying it!".green()
+    );
     Ok(())
 }
 
