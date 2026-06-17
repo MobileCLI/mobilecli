@@ -42,6 +42,9 @@ jobs:
       - name: Verify installer script
         run: bash -n install.sh
 
+      - name: Verify uninstaller script
+        run: bash -n uninstall.sh
+
       - name: Test installer checksum verification
         run: bash scripts/test-installer-checksum.sh
 
