@@ -23,6 +23,7 @@ mod session;
 mod setup;
 mod shell_hook;
 mod tmux;
+mod uninstall;
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
@@ -109,6 +110,9 @@ enum Commands {
         #[command(subcommand)]
         command: shell_hook::ShellHookCommand,
     },
+
+    /// Remove MobileCLI: stop the daemon, remove autostart, shell hook, config, and binary
+    Uninstall(uninstall::UninstallArgs),
 }
 
 #[derive(Subcommand)]
@@ -225,6 +229,13 @@ async fn main() -> ExitCode {
                 Ok(_) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("{}: {}", "Shell hook error".red().bold(), e);
+                    ExitCode::FAILURE
+                }
+            },
+            Commands::Uninstall(uninstall_args) => match uninstall::run(uninstall_args.clone()) {
+                Ok(_) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("{}: {}", "Uninstall error".red().bold(), e);
                     ExitCode::FAILURE
                 }
             },

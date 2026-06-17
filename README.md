@@ -236,6 +236,7 @@ Setup and management:
   mobilecli credentials revoke <id>   Revoke one paired mobile credential
   mobilecli status                    Show daemon status, active sessions, connections
   mobilecli stop                      Stop the daemon
+  mobilecli uninstall                 Remove MobileCLI completely (daemon, autostart, hook, config, binary)
 
 Daemon lifecycle:
   mobilecli daemon [--port PORT]      Start daemon manually (default port: 9847)
@@ -273,6 +274,22 @@ This adds a one-liner to your `.bashrc`, `.zshrc`, `config.fish`, or PowerShell 
 
 ```bash
 MOBILECLI_NO_AUTO_LAUNCH=1 bash
+```
+
+### Uninstall
+
+To remove MobileCLI completely, run the built-in uninstaller:
+
+```bash
+mobilecli uninstall
+```
+
+This stops the daemon, removes daemon autostart (systemd / launchd / Task Scheduler), strips the shell auto-launch hook from your shell config, deletes the config directory (`~/.mobilecli`, including paired credentials), and removes the binary. Use `--keep-config` to preserve `~/.mobilecli`, `--keep-binary` to leave the binary in place, and `-y`/`--yes` to skip the confirmation prompt.
+
+If the binary is missing or broken, you can run the standalone uninstall script instead, which delegates to `mobilecli uninstall` when available and otherwise performs the same cleanup manually:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/MobileCLI/mobilecli/main/uninstall.sh | bash
 ```
 
 <br/>
@@ -384,6 +401,7 @@ MobileCLI/
 │       ├── setup.rs            # Interactive setup wizard + QR code
 │       ├── shell_hook.rs       # Shell auto-launch integration
 │       ├── autostart.rs        # OS-level daemon autostart
+│       ├── uninstall.rs        # Native uninstaller (reverses install + setup)
 │       ├── link.rs             # Session attachment (tmux-style)
 │       ├── session.rs          # Session metadata structures
 │       ├── platform.rs         # Cross-platform utilities
@@ -391,6 +409,7 @@ MobileCLI/
 ├── mobile/                     # React Native app (separate git repo)
 ├── website/                    # Marketing site (Astro + Tailwind)
 ├── install.sh                  # One-line installer script
+├── uninstall.sh                # One-line uninstaller script
 ├── .github/workflows/          # CI, release packaging, Claude Code review
 └── docs/                       # Architecture docs + screenshots
 ```
